@@ -1,0 +1,20 @@
+[Unit]
+Description=AWG Cascade Multi — Telegram bot
+After=network-online.target awg-cascade-watchdog.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=awgbot
+Group=awgbot
+WorkingDirectory=/opt/awg-cascade-bot
+ExecStart=/opt/awg-cascade-bot/venv/bin/python /opt/awg-cascade-bot/bot.py
+Restart=always
+RestartSec=5
+
+# Логи в journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

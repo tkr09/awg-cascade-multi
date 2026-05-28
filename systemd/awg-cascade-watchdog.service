@@ -1,0 +1,19 @@
+[Unit]
+Description=AWG Cascade Multi — Watchdog (handshake/ping monitor + ECMP)
+After=network-online.target awg-quick@awg0.service awg-cascade-iptables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/awg-cascade-watchdog.sh
+Restart=always
+RestartSec=10
+StandardOutput=null
+StandardError=null
+
+# Жёсткий kill — у нас trap внутри обрабатывает SIGTERM
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

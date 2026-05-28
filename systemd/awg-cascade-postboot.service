@@ -1,0 +1,13 @@
+[Unit]
+Description=AWG Cascade Multi — Postboot verify
+After=network-online.target awg-cascade-watchdog.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Ждём 90с после network-online чтобы все туннели успели подняться
+ExecStart=/bin/bash -c 'sleep 90 && /usr/local/sbin/awg-cascade-watchdog-postboot.sh'
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
