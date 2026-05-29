@@ -38,12 +38,20 @@ PSK=$(awg genpsk)
 
 SERVER_PUB=$(awg show awg0 public-key)
 
-# H-параметры из awg0.conf
-H1=$(grep "^H1 =" "$WG_CONF" | head -1 | sed 's/H1 = //')
-H2=$(grep "^H2 =" "$WG_CONF" | head -1 | sed 's/H2 = //')
-H3=$(grep "^H3 =" "$WG_CONF" | head -1 | sed 's/H3 = //')
-H4=$(grep "^H4 =" "$WG_CONF" | head -1 | sed 's/H4 = //')
-JUNK_I1='<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>'
+# Все obfuscation params из awg0.conf — чтобы клиент получил ТОЧНО ТЕ ЖЕ
+# значения что у сервера (иначе handshake не пройдёт в v2.0).
+JC=$(grep   "^Jc "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+JMIN=$(grep "^Jmin " "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+JMAX=$(grep "^Jmax " "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+S1=$(grep   "^S1 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+S2=$(grep   "^S2 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+S3=$(grep   "^S3 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+S4=$(grep   "^S4 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+H1=$(grep   "^H1 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+H2=$(grep   "^H2 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+H3=$(grep   "^H3 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+H4=$(grep   "^H4 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
+I1=$(grep   "^I1 "   "$WG_CONF" | head -1 | awk -F' = ' '{print $2}')
 
 # 1. Добавить peer в runtime через awg set (PSK через временный файл, /dev/stdin не работает в sudo)
 PSK_FILE=$(mktemp)
@@ -73,18 +81,18 @@ PrivateKey = $PRIVKEY
 Address = ${PEER_IP}/32
 MTU = 1340
 DNS = 1.1.1.1, 8.8.8.8
-Jc = 5
-Jmin = 10
-Jmax = 50
-S1 = 68
-S2 = 140
-S3 = 14
-S4 = 9
+Jc = $JC
+Jmin = $JMIN
+Jmax = $JMAX
+S1 = $S1
+S2 = $S2
+S3 = $S3
+S4 = $S4
 H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
-I1 = $JUNK_I1
+I1 = $I1
 
 [Peer]
 PublicKey = $SERVER_PUB
