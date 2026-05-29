@@ -658,12 +658,20 @@ ok "setup-exit.sh доступен как /usr/local/sbin/awg-cascade-setup-exit
 # ═════════════════════════════════════════════════════════════════════════════
 header "8c. Telegram бот (Python aiogram)"
 
-mkdir -p "$BOT_DIR"
+mkdir -p "$BOT_DIR" "$BOT_DIR/scripts"
 cp -r "$REPO_DIR/bot/." "$BOT_DIR/"
 # Сносим __pycache__ на случай если он попал из репо
 find "$BOT_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
 ok "Bot файлы скопированы в $BOT_DIR"
+
+# Bot при провижне exit'а SCP-ит эти 3 скрипта на новый сервер. Без них
+# add-exit не работает.
+install -m 755 "$REPO_DIR/setup-exit.sh"                  "$BOT_DIR/scripts/setup-exit.sh"
+install -m 755 "$REPO_DIR/awg2-params.sh"                 "$BOT_DIR/scripts/awg2-params.sh"
+install -m 755 "$REPO_DIR/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"
+ok "Exit-provisioning скрипты в $BOT_DIR/scripts/ (setup-exit, awg2-params, warp)"
+
+chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
 
 # Python venv + зависимости
 if [ ! -d "$BOT_DIR/venv" ]; then
