@@ -109,7 +109,19 @@ if ! command -v awg &>/dev/null; then
     apt-get install -y -qq amneziawg amneziawg-dkms amneziawg-tools >/dev/null
 fi
 
-apt-get install -y -qq iptables-persistent curl jq >/dev/null
+apt-get install -y -qq iptables-persistent curl jq \
+    unattended-upgrades apt-listchanges >/dev/null
+
+# Включаем unattended-upgrades для security patches
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+sed -i 's|//Unattended-Upgrade::Automatic-Reboot ".*";|Unattended-Upgrade::Automatic-Reboot "false";|' \
+    /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null || true
+systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 
 modprobe amneziawg || err "Модуль amneziawg не загружается"
 ok "amneziawg готов"

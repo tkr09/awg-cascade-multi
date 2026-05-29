@@ -163,8 +163,21 @@ apt-get update -qq
 
 info "Базовые утилиты..."
 apt-get install -y -qq software-properties-common curl jq qrencode iptables-persistent \
-    python3 python3-venv python3-pip git ca-certificates dnsutils >/dev/null
+    python3 python3-venv python3-pip git ca-certificates dnsutils \
+    unattended-upgrades apt-listchanges >/dev/null
 ok "Базовые пакеты"
+
+# Включаем unattended-upgrades для security patches
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+sed -i 's|//Unattended-Upgrade::Automatic-Reboot ".*";|Unattended-Upgrade::Automatic-Reboot "false";|' \
+    /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null || true
+systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+ok "unattended-upgrades включён"
 
 # AmneziaWG PPA + kernel module + tools
 if ! command -v awg &>/dev/null; then
