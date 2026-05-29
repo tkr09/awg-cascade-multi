@@ -687,18 +687,39 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
     await state.clear()
 
     flag = name_to_flag(name)
-    status_text = f"⏳ {flag} <b>{name}</b> — провижу exit ({ip})...\n\n"
+    status_header = f"⏳ {flag} <b>{name}</b> — провижу exit ({ip})...\n\n"
+
+    # Persistent tracker сообщение: создаём один раз, потом edit_message_text по
+    # message_id. Это надёжнее чем edit_text на разных Message объектах
+    # (которые могут устареть/быть невалидны для edit).
+    bot = message.bot
+    chat_id = message.chat.id
+    tracker = await bot.send_message(
+        chat_id, status_header + "🔄 starting...", parse_mode="HTML",
+    )
+    tracker_msg_id = tracker.message_id
+
+    last_text = None  # для подавления "message is not modified"
 
     async def update_status(extra: str) -> None:
-        text = status_text + extra
+        nonlocal last_text
+        text = status_header + extra
+        if text == last_text:
+            return  # без edit — Telegram отвергнет
+        last_text = text
         try:
-            if edit_target is not None:
-                await edit_target.edit_text(text, parse_mode="HTML")
-            else:
-                await message.edit_text(text, parse_mode="HTML") if hasattr(message, "edit_text") \
-                    else await message.answer(text, parse_mode="HTML")
-        except Exception:
-            await message.answer(text, parse_mode="HTML")
+            await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=tracker_msg_id,
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            LOG.warning("update_status edit failed (%s) — sending new message", e)
+            try:
+                await bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception:
+                pass
 
     # 1. Если есть пароль — копируем pubkey
     if password:
@@ -845,14 +866,14 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
         f"Через ~5 сек watchdog подхватит и добавит в ECMP."
     )
 
-    # Возврат в список
-    await asyncio.sleep(2)
+    # Финальное отдельное сообщение со списком (не edit чтобы tracker остался виден)
+    await asyncio.sleep(1)
     try:
-        if edit_target is not None:
-            await edit_target.edit_text(
-                f"✅ {flag2} <b>{name}</b> добавлен.",
-                parse_mode="HTML",
-                reply_markup=exits_kb(state_load()),
-            )
+        await bot.send_message(
+            chat_id,
+            f"✅ {flag2} <b>{name}</b> добавлен. К списку:",
+            parse_mode="HTML",
+            reply_markup=exits_kb(state_load()),
+        )
     except Exception:
         pass
