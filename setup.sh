@@ -597,10 +597,96 @@ systemctl daemon-reload
 systemctl enable awg-cascade-iptables.service >/dev/null
 ok "awg-cascade-iptables.service зарегистрирован"
 
-# Watchdog/postboot/bot units — заглушки (наполним когда напишем сами скрипты/бот)
-# Пока просто создаём пустые stub'ы чтобы было видно что они есть
-touch /usr/local/sbin/awg-cascade-watchdog.sh
-chmod +x /usr/local/sbin/awg-cascade-watchdog.sh
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 8b: deploy watchdog + helper scripts
+# ═════════════════════════════════════════════════════════════════════════════
+header "8b. Deploy watchdog + helper-скрипты"
+
+# REPO_DIR — куда install.sh положил исходники. Если setup.sh запустили
+# напрямую (не через install.sh) — берём dirname текущего скрипта.
+REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+[ -d "$REPO_DIR/watchdog" ] || err "Не найдена директория $REPO_DIR/watchdog. Запусти через install.sh или из корня репо."
+[ -d "$REPO_DIR/bot" ]      || err "Не найдена директория $REPO_DIR/bot"
+[ -d "$REPO_DIR/systemd" ]  || err "Не найдена директория $REPO_DIR/systemd"
+
+# Копируем все helper-скрипты в /usr/local/sbin (перетирая stub'ы и старые версии)
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog.sh          /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog-postboot.sh /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-iprule.sh            /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-add-ru.sh       /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-remove.sh       /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-rotate.sh       /usr/local/sbin/
+ok "Helper-скрипты установлены в /usr/local/sbin/"
+
+# Заодно положим setup-exit.sh — пригодится когда будем поднимать новый exit
+install -m 755 "$REPO_DIR/setup-exit.sh" /usr/local/sbin/awg-cascade-setup-exit.sh
+ok "setup-exit.sh доступен как /usr/local/sbin/awg-cascade-setup-exit.sh"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 8c: deploy Telegram bot + venv
+# ═════════════════════════════════════════════════════════════════════════════
+header "8c. Telegram бот (Python aiogram)"
+
+mkdir -p "$BOT_DIR"
+cp -r "$REPO_DIR/bot/." "$BOT_DIR/"
+# Сносим __pycache__ на случай если он попал из репо
+find "$BOT_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
+ok "Bot файлы скопированы в $BOT_DIR"
+
+# Python venv + зависимости
+if [ ! -d "$BOT_DIR/venv" ]; then
+    info "Создаю venv и ставлю зависимости (aiogram, asyncssh, qrcode)..."
+    sudo -u "$BOT_USER" python3 -m venv "$BOT_DIR/venv"
+    sudo -u "$BOT_USER" "$BOT_DIR/venv/bin/pip" install --quiet --upgrade pip
+    sudo -u "$BOT_USER" "$BOT_DIR/venv/bin/pip" install --quiet -r "$BOT_DIR/requirements.txt"
+    ok "venv готов: $BOT_DIR/venv"
+else
+    info "venv уже есть, обновляю зависимости..."
+    sudo -u "$BOT_USER" "$BOT_DIR/venv/bin/pip" install --quiet --upgrade -r "$BOT_DIR/requirements.txt"
+    ok "venv обновлён"
+fi
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 8d: systemd units (watchdog, postboot, bot) + старт
+# ═════════════════════════════════════════════════════════════════════════════
+header "8d. systemd units + запуск"
+
+install -m 644 "$REPO_DIR/systemd/awg-cascade-watchdog.service" /etc/systemd/system/
+install -m 644 "$REPO_DIR/systemd/awg-cascade-postboot.service" /etc/systemd/system/
+install -m 644 "$REPO_DIR/systemd/awg-cascade-bot.service"      /etc/systemd/system/
+
+# Logrotate (мог быть уже создан inline в Phase 2 — перетрём shipped версией если есть)
+if [ -f "$REPO_DIR/systemd/awg-cascade.logrotate" ]; then
+    install -m 644 "$REPO_DIR/systemd/awg-cascade.logrotate" /etc/logrotate.d/awg-cascade
+fi
+
+systemctl daemon-reload
+
+# Watchdog — постоянный сервис
+systemctl enable --now awg-cascade-watchdog.service >/dev/null 2>&1
+sleep 1
+if systemctl is-active --quiet awg-cascade-watchdog.service; then
+    ok "awg-cascade-watchdog.service запущен"
+else
+    warn "Watchdog не стартанул, проверь: journalctl -u awg-cascade-watchdog -n 30"
+fi
+
+# Postboot — oneshot, сработает на следующем reboot (сейчас не запускаем)
+systemctl enable awg-cascade-postboot.service >/dev/null 2>&1
+ok "awg-cascade-postboot.service зарегистрирован (oneshot на boot)"
+
+# Bot — постоянный сервис
+systemctl enable --now awg-cascade-bot.service >/dev/null 2>&1
+sleep 2
+if systemctl is-active --quiet awg-cascade-bot.service; then
+    ok "awg-cascade-bot.service запущен"
+else
+    warn "Bot не стартанул, проверь: journalctl -u awg-cascade-bot -n 30"
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 9: финал — выводим QR первого peer'а
@@ -628,20 +714,23 @@ header "Что дальше"
 
 cat << NEXT
 ${GREEN}awg0 запущен${NC} — подключайся первым peer'ом ($FIRST_PEER).
+${GREEN}Watchdog активен${NC} — мониторит handshake/ping exits и держит ECMP.
+${GREEN}Telegram бот активен${NC} — напиши ему /start в Telegram чтобы открыть меню.
 
-${YELLOW}Бот и watchdog ещё не активны${NC} — будут установлены отдельными скриптами:
-  • Watchdog: будет мониторить exits и управлять ECMP-маршрутом
-  • Telegram бот: для добавления exits, peers, WARP управления
-  • Postboot verify: проверка после ребута
+${YELLOW}ВАЖНО:${NC} сейчас работает только клиент↔RU. ${RED}Без exits трафик каскад выйти не может
+(kill-switch активен)${NC}. Чтобы клиенты получили доступ в интернет — добавь exit:
+  бот → 🌐 Exits → ➕ Add exit (введи IP + root пароль чистого Ubuntu).
 
-Сейчас работает только клиент↔RU. ${RED}Без exits трафик кейс выйти не может (kill-switch активен).${NC}
-Чтобы клиенты получили доступ в интернет — нужно добавить хотя бы один exit.
+Полезные команды на RU:
+  ${BOLD}awg show${NC}                              статус awg0
+  ${BOLD}cat $STATE_FILE${NC}             state каскада (JSON)
+  ${BOLD}systemctl status awg-cascade-bot${NC}      бот
+  ${BOLD}systemctl status awg-cascade-watchdog${NC} watchdog
+  ${BOLD}journalctl -u awg-cascade-bot -f${NC}      логи бота вживую
+  ${BOLD}tail -f /var/log/awg-cascade-watchdog.log${NC} логи watchdog'а
 
-Полезные команды:
-  ${BOLD}awg show${NC}                      статус awg0
-  ${BOLD}cat $STATE_FILE${NC}     state каскада
-  ${BOLD}journalctl -u awg-quick@awg0${NC}  логи awg0
-  ${BOLD}iptables -L FORWARD -v -n${NC}     правила kill-switch
+Обновление до новой версии репо:
+  ${BOLD}cd /opt/awg-cascade-src && git pull && bash setup.sh${NC}
 NEXT
 
 echo ""
