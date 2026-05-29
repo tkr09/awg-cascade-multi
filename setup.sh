@@ -158,10 +158,34 @@ header "2. Установка пакетов"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# На fresh Ubuntu cloud-init запускает unattended-upgrades сразу после boot.
+# Это держит /var/lib/dpkg/lock-frontend 5-10 минут и валит setup.sh
+# с "Could not get lock". Гасим apt-сервисы перед нашими apt-операциями.
+info "Останавливаю cloud-init apt-сервисы (если работают)..."
+systemctl stop unattended-upgrades.service \
+               apt-daily.service apt-daily-upgrade.service \
+               apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+pkill -9 unattended-upgr 2>/dev/null || true
+
+# Ждём пока ВСЕ apt-локи освободятся (если что-то ещё держит после kill)
+wait_apt_lock() {
+    local max=600 elapsed=0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; do
+        if [ $elapsed -ge $max ]; then
+            err "apt lock не освободился за 10 минут (что-то странное на сервере)"
+        fi
+        [ $((elapsed % 30)) -eq 0 ] && info "apt lock занят, жду... (${elapsed}s/$max)"
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+}
+wait_apt_lock
+
 info "apt update..."
 apt-get update -qq
 
 info "Базовые утилиты..."
+wait_apt_lock
 apt-get install -y -qq software-properties-common curl jq qrencode iptables-persistent \
     python3 python3-venv python3-pip git ca-certificates dnsutils \
     unattended-upgrades apt-listchanges >/dev/null
@@ -196,11 +220,15 @@ ok "logrotate для awg-cascade-watchdog.log (weekly, 4 weeks)"
 
 # AmneziaWG PPA + kernel module + tools
 if ! command -v awg &>/dev/null; then
+    wait_apt_lock
     info "Добавляю Amnezia PPA..."
     add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1
+    wait_apt_lock
     apt-get update -qq
     info "Устанавливаю amneziawg + amneziawg-dkms (компиляция модуля)..."
+    wait_apt_lock
     apt-get install -y -qq linux-headers-$(uname -r) >/dev/null
+    wait_apt_lock
     apt-get install -y -qq amneziawg amneziawg-dkms >/dev/null
 fi
 

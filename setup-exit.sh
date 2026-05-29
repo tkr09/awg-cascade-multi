@@ -99,16 +99,45 @@ info "EXIT_INDEX=$EXIT_INDEX  port=$EXIT_PORT  tunnel=$TUNNEL_NET"
 header "Установка пакетов"
 
 export DEBIAN_FRONTEND=noninteractive
+
+# На fresh Ubuntu cloud-init запускает unattended-upgrades сразу после boot.
+# Это держит /var/lib/dpkg/lock-frontend 5-10 минут и валит setup-exit.sh
+# с "Could not get lock". Гасим apt-сервисы перед нашими apt-операциями.
+systemctl stop unattended-upgrades.service \
+               apt-daily.service apt-daily-upgrade.service \
+               apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+pkill -9 unattended-upgr 2>/dev/null || true
+
+# Ждём пока ВСЕ apt-локи освободятся (если что-то ещё держит после kill)
+wait_apt_lock() {
+    local max=600 elapsed=0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; do
+        if [ $elapsed -ge $max ]; then
+            err "apt lock не освободился за 10 минут (что-то странное на сервере)"
+        fi
+        [ $((elapsed % 30)) -eq 0 ] && info "apt lock занят, жду... (${elapsed}s/$max)"
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+}
+wait_apt_lock
+
 apt-get update -qq
 
 if ! command -v awg &>/dev/null; then
+    wait_apt_lock
     apt-get install -y -qq software-properties-common >/dev/null
+    wait_apt_lock
     add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1
+    wait_apt_lock
     apt-get update -qq
+    wait_apt_lock
     apt-get install -y -qq linux-headers-$(uname -r) >/dev/null
+    wait_apt_lock
     apt-get install -y -qq amneziawg amneziawg-dkms amneziawg-tools >/dev/null
 fi
 
+wait_apt_lock
 apt-get install -y -qq iptables-persistent curl jq \
     unattended-upgrades apt-listchanges >/dev/null
 
