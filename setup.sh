@@ -526,6 +526,15 @@ EOF
     ok "state.json создан (пустой, без exits)"
 fi
 
+# Lock-файл должен быть world-writable — и bot (awgbot uid 999) и helper
+# скрипты (root) должны мочь его открыть R/W для flock. Если кто-то первым
+# создаст root-owned 644 — другой пользователь не сможет open() и получит
+# PermissionError. Pre-создаём 0666 owned by awgbot.
+touch "$CONFIG_DIR/state.lock"
+chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/state.lock"
+chmod 666 "$CONFIG_DIR/state.lock"
+ok "state.lock pre-created с 0666 (shared между bot и root)"
+
 # Config-файл бота
 cat > "$CONFIG_FILE" <<EOF
 # AWG Cascade Multi — config (загружается ботом и скриптами)
