@@ -9,8 +9,8 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from common import (admin_only, cfg, fmt_age, name_to_flag, ping_bar,
-                    state_load, status_icon)
+from common import (admin_only, cfg, fmt_age, name_to_flag, peers_list,
+                    ping_bar, state_load, status_icon)
 
 LOG = logging.getLogger("awg.main_menu")
 router = Router(name="main_menu")
@@ -23,7 +23,7 @@ def main_kb(state: dict) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🌍 Exits ({up}/{total} up)", callback_data="exits:list")],
-        [InlineKeyboardButton(text="👤 Peers (клиенты)",          callback_data="peers:list")],
+        [InlineKeyboardButton(text=f"👤 Peers ({len(peers_list())})", callback_data="peers:list")],
         [
             InlineKeyboardButton(text="📊 Полный статус", callback_data="status:full"),
             InlineKeyboardButton(text="🔄 Refresh",       callback_data="main"),
