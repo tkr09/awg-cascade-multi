@@ -466,7 +466,25 @@ ip rule add fwmark 0x1 lookup 100 priority 1000
 ip rule add uidrange \$BOT_UID-\$BOT_UID lookup 100 priority 1001
 RULEEOF
 chmod +x /usr/local/sbin/awg-cascade-iprule.sh
-ok "ip rule: SSH→eth0 (998), clients→ECMP (1000), bot→ECMP (1001)"
+
+# systemd-юнит — применяет ip rules после network-online (иначе они теряются после ребута)
+cat > /etc/systemd/system/awg-cascade-iprule.service <<EOF
+[Unit]
+Description=AWG Cascade ip rules (fwmark + uidrange policy routing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awg-cascade-iprule.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload >/dev/null 2>&1
+systemctl enable awg-cascade-iprule.service >/dev/null 2>&1
+ok "ip rule: SSH→eth0 (998), clients→ECMP (1000), bot→ECMP (1001) + systemd persist"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 7: state.json + helper-скрипты
