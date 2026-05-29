@@ -383,12 +383,18 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
         e.pop("warp_exit_geo", None)
     state_save(state)
 
+    # UI update: оборачиваем в try/except — если Telegram сейчас недоступен
+    # (cascade flap во время WARP toggle), state уже сохранён выше, главное
+    # не разрушить состояние бота.
     if rc != 0:
-        await call.message.edit_text(
-            f"❌ Не удалось переключить WARP:\n<pre>{html_escape((err or out)[:500])}</pre>",
-            parse_mode="HTML",
-            reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
-        )
+        try:
+            await call.message.edit_text(
+                f"❌ Не удалось переключить WARP:\n<pre>{html_escape((err or out)[:500])}</pre>",
+                parse_mode="HTML",
+                reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
+            )
+        except Exception as ex:
+            LOG.warning("WARP toggle UI update failed: %s", ex)
         return
 
     suffix = ""
@@ -396,11 +402,16 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
         suffix = f"\n\n🌐 WARP exit IP: <code>{exit_warp_ip}</code>"
         if e.get("warp_exit_geo"):
             suffix += f"\n🌍 <code>{html_escape(e['warp_exit_geo'])}</code>"
-    await call.message.edit_text(
-        f"{flag} <b>{e['name']}</b>: WARP → <b>{new_warp.upper()}</b>{suffix}",
-        parse_mode="HTML",
-        reply_markup=exit_menu_kb(iface, new_warp),
-    )
+    try:
+        await call.message.edit_text(
+            f"{flag} <b>{e['name']}</b>: WARP → <b>{new_warp.upper()}</b>{suffix}",
+            parse_mode="HTML",
+            reply_markup=exit_menu_kb(iface, new_warp),
+        )
+    except Exception as ex:
+        # Cascade в этот момент мог моргнуть (включение/выключение WARP меняет
+        # роутинг). state уже сохранён, UI обновится при следующем нажатии 🔄.
+        LOG.warning("WARP toggle UI update failed (state saved OK): %s", ex)
 
 
 # ─── Rotate exit (anti-DPI) ──────────────────────────────────────────────────
