@@ -1,0 +1,20 @@
+/var/log/awg-cascade-watchdog.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    notifempty
+    missingok
+    create 0644 root root
+    copytruncate
+}
+
+/etc/awg-cascade-exit/warp.log {
+    monthly
+    rotate 3
+    compress
+    notifempty
+    missingok
+    create 0644 root root
+    copytruncate
+}

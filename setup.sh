@@ -179,6 +179,21 @@ sed -i 's|//Unattended-Upgrade::Automatic-Reboot ".*";|Unattended-Upgrade::Autom
 systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 ok "unattended-upgrades включён"
 
+# logrotate для watchdog.log — иначе залогируется до сотен МБ
+cat > /etc/logrotate.d/awg-cascade <<EOF
+/var/log/awg-cascade-watchdog.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    notifempty
+    missingok
+    create 0644 root root
+    copytruncate
+}
+EOF
+ok "logrotate для awg-cascade-watchdog.log (weekly, 4 weeks)"
+
 # AmneziaWG PPA + kernel module + tools
 if ! command -v awg &>/dev/null; then
     info "Добавляю Amnezia PPA..."
