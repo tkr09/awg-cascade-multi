@@ -358,6 +358,47 @@ async def awg_show_peers(iface: str = "awg0") -> dict[str, dict]:
     return result
 
 
+async def safe_edit_text(message, text: str, *, retries: int = 3,
+                         backoffs: tuple[float, ...] = (1.0, 2.0, 4.0),
+                         **edit_kwargs) -> bool:
+    """
+    Edit message с retry-loop для устойчивости к Telegram timeouts.
+
+    Telegram API через cascade может временно дропнуть connection (особенно
+    во время WARP toggle / rotate когда роутинг моргает). Простой edit_text
+    кидает TelegramNetworkError → handler крашится, UI зависает.
+
+    Эта обёртка:
+    - Подавляет "message is not modified" (это не ошибка)
+    - Retry'ит TelegramNetworkError с exp backoff
+    - Возвращает True если успешно, False если все попытки исчерпаны
+    """
+    from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            await message.edit_text(text, **edit_kwargs)
+            return True
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return True
+            LOG.warning("safe_edit_text bad request: %s", e)
+            return False
+        except TelegramNetworkError as e:
+            last_exc = e
+            if attempt < retries - 1:
+                pause = backoffs[min(attempt, len(backoffs) - 1)]
+                LOG.warning("safe_edit_text network error #%d (%s) — retry in %.0fs",
+                           attempt + 1, str(e)[:80], pause)
+                await asyncio.sleep(pause)
+        except Exception as e:
+            LOG.warning("safe_edit_text unexpected: %s", e)
+            return False
+    LOG.warning("safe_edit_text exhausted %d retries: %s",
+                retries, str(last_exc)[:80] if last_exc else "")
+    return False
+
+
 def html_escape(text: str) -> str:
     """Escape для Telegram HTML — иначе <b 0x...> ломает парсер."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

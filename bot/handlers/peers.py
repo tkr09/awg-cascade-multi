@@ -18,8 +18,8 @@ from aiogram.types import (BufferedInputFile, CallbackQuery,
 
 from common import (PEERS_DIR, admin_only, awg_show_peers, cfg, fmt_age,
                     fmt_bytes, format_geo, geoip_lookup, html_escape,
-                    name_to_flag, peer_update, peers_list, state_load,
-                    sudo_run)
+                    name_to_flag, peer_update, peers_list, safe_edit_text,
+                    state_load, sudo_run)
 
 LOG = logging.getLogger("awg.peers")
 router = Router(name="peers")
@@ -423,8 +423,8 @@ async def cb_peer_rotate(call: CallbackQuery) -> None:
 async def cb_peer_rotate_yes(call: CallbackQuery) -> None:
     await call.answer("⏳ Rotating…")
     name = call.data[len("peer:rotate-yes:"):]
-    await call.message.edit_text(
-        f"⏳ <b>Rotating {name}…</b>", parse_mode="HTML",
+    await safe_edit_text(
+        call.message, f"⏳ <b>Rotating {name}…</b>", parse_mode="HTML",
     )
 
     out, err, rc = await sudo_run(

@@ -17,8 +17,9 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
 from common import (admin_only, cfg, fmt_age, format_geo, geoip_lookup,
-                    html_escape, name_to_flag, ping_bar, ssh_copy_id, ssh_exec,
-                    state_load, state_save, status_icon, sudo_run, SSH_KEY)
+                    html_escape, name_to_flag, ping_bar, safe_edit_text,
+                    ssh_copy_id, ssh_exec, state_load, state_save, status_icon,
+                    sudo_run, SSH_KEY)
 
 LOG = logging.getLogger("awg.exits")
 router = Router(name="exits")
@@ -383,18 +384,16 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
         e.pop("warp_exit_geo", None)
     state_save(state)
 
-    # UI update: оборачиваем в try/except — если Telegram сейчас недоступен
-    # (cascade flap во время WARP toggle), state уже сохранён выше, главное
-    # не разрушить состояние бота.
+    # UI update через safe_edit_text — retry 3x с backoff 1/2/4 сек.
+    # Cascade моргает при WARP toggle (роуты на exit перестраиваются),
+    # Telegram может дропнуть connection — retry'имся. State уже сохранён выше.
     if rc != 0:
-        try:
-            await call.message.edit_text(
-                f"❌ Не удалось переключить WARP:\n<pre>{html_escape((err or out)[:500])}</pre>",
-                parse_mode="HTML",
-                reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
-            )
-        except Exception as ex:
-            LOG.warning("WARP toggle UI update failed: %s", ex)
+        await safe_edit_text(
+            call.message,
+            f"❌ Не удалось переключить WARP:\n<pre>{html_escape((err or out)[:500])}</pre>",
+            parse_mode="HTML",
+            reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
+        )
         return
 
     suffix = ""
@@ -402,16 +401,12 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
         suffix = f"\n\n🌐 WARP exit IP: <code>{exit_warp_ip}</code>"
         if e.get("warp_exit_geo"):
             suffix += f"\n🌍 <code>{html_escape(e['warp_exit_geo'])}</code>"
-    try:
-        await call.message.edit_text(
-            f"{flag} <b>{e['name']}</b>: WARP → <b>{new_warp.upper()}</b>{suffix}",
-            parse_mode="HTML",
-            reply_markup=exit_menu_kb(iface, new_warp),
-        )
-    except Exception as ex:
-        # Cascade в этот момент мог моргнуть (включение/выключение WARP меняет
-        # роутинг). state уже сохранён, UI обновится при следующем нажатии 🔄.
-        LOG.warning("WARP toggle UI update failed (state saved OK): %s", ex)
+    await safe_edit_text(
+        call.message,
+        f"{flag} <b>{e['name']}</b>: WARP → <b>{new_warp.upper()}</b>{suffix}",
+        parse_mode="HTML",
+        reply_markup=exit_menu_kb(iface, new_warp),
+    )
 
 
 # ─── Rotate exit (anti-DPI) ──────────────────────────────────────────────────
@@ -466,7 +461,8 @@ async def cb_exit_rotate_go(call: CallbackQuery) -> None:
         "/usr/local/sbin/awg-cascade-exit-rotate.sh", iface, mode, timeout=45,
     )
     if rc != 0:
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             f"❌ Rotate failed:\n<pre>{html_escape((err or out)[:600])}</pre>",
             parse_mode="HTML",
             reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
@@ -476,7 +472,8 @@ async def cb_exit_rotate_go(call: CallbackQuery) -> None:
     try:
         result = json.loads(out)
     except json.JSONDecodeError:
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             f"❌ Не-JSON ответ:\n<pre>{html_escape(out[:500])}</pre>",
             parse_mode="HTML",
             reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
@@ -484,7 +481,8 @@ async def cb_exit_rotate_go(call: CallbackQuery) -> None:
         return
 
     if not result.get("ok"):
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             f"❌ {result.get('error', 'unknown')}",
             parse_mode="HTML",
             reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
@@ -493,14 +491,14 @@ async def cb_exit_rotate_go(call: CallbackQuery) -> None:
 
     hs_ok = result.get("handshake_ok", False)
     changes = ", ".join(result.get("changes", []))
-    hs_icon = "✅" if hs_ok else "⚠️"
 
     # Свежий state
     new_state = state_load()
     new_e = _get_exit(new_state, iface)
     status_text = await _render_status_after_rotate(new_e, mode, changes, hs_ok)
 
-    await call.message.edit_text(
+    await safe_edit_text(
+        call.message,
         status_text, parse_mode="HTML",
         reply_markup=exit_menu_kb(iface, new_e.get("warp_state", "off")),
     )
@@ -713,24 +711,33 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
     last_text = None  # для подавления "message is not modified"
 
     async def update_status(extra: str) -> None:
+        """Edit tracker message с retry-loop. State не зависит от UI — main flow продолжается."""
         nonlocal last_text
+        from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
         text = status_header + extra
         if text == last_text:
-            return  # без edit — Telegram отвергнет
+            return  # без edit — Telegram отвергнет "not modified"
         last_text = text
-        try:
-            await bot.edit_message_text(
-                text=text,
-                chat_id=chat_id,
-                message_id=tracker_msg_id,
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            LOG.warning("update_status edit failed (%s) — sending new message", e)
+        for attempt in range(3):
             try:
-                await bot.send_message(chat_id, text, parse_mode="HTML")
-            except Exception:
-                pass
+                await bot.edit_message_text(
+                    text=text, chat_id=chat_id, message_id=tracker_msg_id,
+                    parse_mode="HTML",
+                )
+                return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e).lower():
+                    return
+                LOG.warning("update_status bad request: %s", e)
+                return
+            except TelegramNetworkError as e:
+                if attempt < 2:
+                    await asyncio.sleep((1, 2, 4)[attempt])
+                else:
+                    LOG.warning("update_status retries exhausted: %s", e)
+            except Exception as e:
+                LOG.warning("update_status unexpected: %s", e)
+                return
 
     # 1. Если есть пароль — копируем pubkey
     if password:
