@@ -80,8 +80,9 @@ def peer_menu_kb(name: str) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📝 Заметка",    callback_data=f"peer:note:{name}"),
-            InlineKeyboardButton(text="🗑 Удалить",    callback_data=f"peer:rm:{name}"),
+            InlineKeyboardButton(text="🔁 Rotate",     callback_data=f"peer:rotate:{name}"),
         ],
+        [InlineKeyboardButton(text="🗑 Удалить",       callback_data=f"peer:rm:{name}")],
         [InlineKeyboardButton(text="◀️ К списку",     callback_data="peers:list")],
     ])
 
@@ -389,6 +390,73 @@ async def fsm_peer_name(message: Message, state: FSMContext) -> None:
     )
     await message.answer(
         f"<b>{name}.conf:</b>\n<pre>{html_escape(client_conf)}</pre>",
+        parse_mode="HTML",
+        reply_markup=_close_kb,
+    )
+
+
+# ─── Rotate peer keys ────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("peer:rotate:"))
+@admin_only
+async def cb_peer_rotate(call: CallbackQuery) -> None:
+    await call.answer()
+    name = call.data[len("peer:rotate:"):]
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"⚠️ Rotate {name}", callback_data=f"peer:rotate-yes:{name}"),
+        InlineKeyboardButton(text="❌ Отмена",         callback_data=f"peer:menu:{name}"),
+    ]])
+    await call.message.edit_text(
+        f"<b>🔁 Rotate keys: {name}</b>\n\n"
+        f"Сейчас:\n"
+        f"• Создадутся новые priv/pub ключи и PSK для этого peer'а\n"
+        f"• Старая конфигурация на устройстве перестанет работать <b>немедленно</b>\n"
+        f"• Бот выдаст новый QR — переимпортируй в amnezia-client\n"
+        f"• Другие peer'ы не затрагиваются\n\n"
+        f"Зачем: подозрение на утечку именно этого конфига (например, потерял телефон).",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("peer:rotate-yes:"))
+@admin_only
+async def cb_peer_rotate_yes(call: CallbackQuery) -> None:
+    await call.answer("⏳ Rotating…")
+    name = call.data[len("peer:rotate-yes:"):]
+    await call.message.edit_text(
+        f"⏳ <b>Rotating {name}…</b>", parse_mode="HTML",
+    )
+
+    out, err, rc = await sudo_run(
+        "/usr/local/sbin/awg-cascade-peer-rotate.sh", name, timeout=15,
+    )
+    if rc != 0:
+        await call.message.answer(
+            f"❌ Rotate failed:\n<pre>{html_escape((err or out)[:500])}</pre>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError:
+        await call.message.answer(f"❌ Не-JSON:\n<pre>{html_escape(out[:500])}</pre>", parse_mode="HTML")
+        return
+
+    if not result.get("ok"):
+        await call.message.answer(f"❌ {result.get('error', 'unknown')}")
+        return
+
+    conf = result["conf"]
+    png = _make_qr_png(conf)
+    await call.message.answer_photo(
+        BufferedInputFile(png, filename=f"{name}.png"),
+        caption=f"✅ <b>{name}</b> rotated.\nПересканируй в amnezia-client.",
+        parse_mode="HTML",
+        reply_markup=_close_kb,
+    )
+    await call.message.answer(
+        f"<b>{name}.conf:</b>\n<pre>{html_escape(conf)}</pre>",
         parse_mode="HTML",
         reply_markup=_close_kb,
     )

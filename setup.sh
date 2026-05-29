@@ -57,14 +57,9 @@ CONFIG_FILE=$CONFIG_DIR/config
 LOG_FILE=/var/log/awg-cascade.log
 BOT_USER=awgbot
 
-# AmneziaWG Default preset
-JC_VAL=5; JMIN_VAL=10; JMAX_VAL=50
-S1_VAL=68; S2_VAL=140; S3_VAL=14; S4_VAL=9
-
-# I1 = Junk packet (DNS-ответ маскировка под запрос к iCloud.com)
-# Это стандартный Default preset amnezia-client для обхода DPI.
-# I2-I5 не используются (можно добавить дополнительные decoy-пакеты при желании).
-JUNK_I1="<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"
+# AmneziaWG v2.0 параметры — генерируем через awg2-params.sh (sourced ниже).
+# Каждая установка получает уникальные H-ranges + случайные S1-S4.
+# Совместимо с amnezia-client v2.0 (формат idential to реальному client config).
 
 # ─── Баннер ───────────────────────────────────────────────────────────────────
 clear
@@ -260,32 +255,33 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 header "5. AmneziaWG awg0 + первый peer"
 
-# Генерируем случайные H1-H4 (уникальная сигнатура установки)
-gen_h() { od -An -N4 -tu4 /dev/urandom | tr -d ' ' | awk '{print ($1 % 2147483640) + 5}'; }
+# Генерируем v2.0 параметры (S1-S4 random + H1-H4 ranged monotonic + I1)
 SERVER_PRIVKEY=$(awg genkey)
 SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | awg pubkey)
 
-# H1-H4 уникальные для этой установки
-if [ ! -f "$CONFIG_DIR/h_params" ]; then
-    H1=$(gen_h); H2=$(gen_h); H3=$(gen_h); H4=$(gen_h)
-    # Гарантируем что они разные
-    while [ "$H1" = "$H2" ] || [ "$H1" = "$H3" ] || [ "$H1" = "$H4" ] \
-       || [ "$H2" = "$H3" ] || [ "$H2" = "$H4" ] || [ "$H3" = "$H4" ]; do
-        H1=$(gen_h); H2=$(gen_h); H3=$(gen_h); H4=$(gen_h)
-    done
-    cat > "$CONFIG_DIR/h_params" <<EOF
-H1=$H1
-H2=$H2
-H3=$H3
-H4=$H4
+# H1-H4 + S1-S4 + I1 уникальные для этой установки. Если уже сохранены — берём
+# те же (чтобы peer-конфиги остались валидными между переустановками setup.sh).
+if [ ! -f "$CONFIG_DIR/awg2_params" ]; then
+    . "$(dirname "$0")/awg2-params.sh"
+    cat > "$CONFIG_DIR/awg2_params" <<EOF
+S1=$S1
+S2=$S2
+S3=$S3
+S4=$S4
+H1='$H1'
+H2='$H2'
+H3='$H3'
+H4='$H4'
+I1='$I1'
 EOF
-    chmod 600 "$CONFIG_DIR/h_params"
-    chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/h_params"
-    ok "Сгенерированы H1-H4: $H1 $H2 $H3 $H4"
+    chmod 600 "$CONFIG_DIR/awg2_params"
+    chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/awg2_params"
+    ok "Сгенерированы v2.0 params: S=$S1/$S2/$S3/$S4  H1=$H1"
 else
-    . "$CONFIG_DIR/h_params"
-    ok "H-параметры подгружены из $CONFIG_DIR/h_params"
+    . "$CONFIG_DIR/awg2_params"
+    ok "v2.0 params подгружены из $CONFIG_DIR/awg2_params"
 fi
+JC_VAL=5; JMIN_VAL=10; JMAX_VAL=50
 
 # Первый peer
 if [ -z "$FIRST_PEER" ]; then
@@ -310,15 +306,15 @@ PrivateKey = $SERVER_PRIVKEY
 Jc = $JC_VAL
 Jmin = $JMIN_VAL
 Jmax = $JMAX_VAL
-S1 = $S1_VAL
-S2 = $S2_VAL
-S3 = $S3_VAL
-S4 = $S4_VAL
+S1 = $S1
+S2 = $S2
+S3 = $S3
+S4 = $S4
 H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
-I1 = $JUNK_I1
+I1 = $I1
 
 [Peer]
 # $FIRST_PEER
@@ -340,15 +336,15 @@ DNS = 1.1.1.1, 8.8.8.8
 Jc = $JC_VAL
 Jmin = $JMIN_VAL
 Jmax = $JMAX_VAL
-S1 = $S1_VAL
-S2 = $S2_VAL
-S3 = $S3_VAL
-S4 = $S4_VAL
+S1 = $S1
+S2 = $S2
+S3 = $S3
+S4 = $S4
 H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
-I1 = $JUNK_I1
+I1 = $I1
 
 [Peer]
 PublicKey = $SERVER_PUBKEY

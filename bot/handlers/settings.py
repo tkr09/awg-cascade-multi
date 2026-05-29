@@ -1,5 +1,6 @@
 """
-Settings (заглушка — позже расширим).
+Settings (read-only сейчас).
+Rotate keys — per-peer и per-exit, см. handlers/peers.py и handlers/exits.py.
 """
 from __future__ import annotations
 
@@ -31,8 +32,8 @@ async def cb_settings(call: CallbackQuery) -> None:
         f"<b>state.json:</b>\n"
         f"  exits: <code>{len(state.get('exits', []))}</code>\n"
         f"  last_update: <code>{state.get('last_update', '?')}</code>\n\n"
-        f"<i>Полное редактирование настроек — позже. "
-        f"Сейчас правь <code>/etc/awg-cascade/config</code> руками + перезапусти бот.</i>"
+        f"<i>Rotate keys per-peer: в меню peer'а.\n"
+        f"Rotate keys per-exit: в меню exit'а.</i>"
     )
     await call.message.edit_text(
         text, parse_mode="HTML",

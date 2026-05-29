@@ -33,8 +33,14 @@ H1=$(echo "$ARGS" | jq -r .exit_info.h_params.H1)
 H2=$(echo "$ARGS" | jq -r .exit_info.h_params.H2)
 H3=$(echo "$ARGS" | jq -r .exit_info.h_params.H3)
 H4=$(echo "$ARGS" | jq -r .exit_info.h_params.H4)
+# v2.0 (schema 2): берём S1-S4 и I1 от exit-стороны. Если поля отсутствуют
+# (старый exit на schema 1) — fallback на v1.5 defaults.
+S1=$(echo "$ARGS" | jq -r '.exit_info.s_params.S1 // 68')
+S2=$(echo "$ARGS" | jq -r '.exit_info.s_params.S2 // 140')
+S3=$(echo "$ARGS" | jq -r '.exit_info.s_params.S3 // 14')
+S4=$(echo "$ARGS" | jq -r '.exit_info.s_params.S4 // 9')
+I1=$(echo "$ARGS" | jq -r '.exit_info.i_params.I1 // "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"')
 WARP_STATE=$(echo "$ARGS" | jq -r '.exit_info.warp_state // "off"')
-JUNK_I1='<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>'
 
 IFACE="awg${EXIT_INDEX}"
 
@@ -57,15 +63,15 @@ MTU = 1420
 Jc = 5
 Jmin = 10
 Jmax = 50
-S1 = 68
-S2 = 140
-S3 = 14
-S4 = 9
+S1 = $S1
+S2 = $S2
+S3 = $S3
+S4 = $S4
 H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
-I1 = $JUNK_I1
+I1 = $I1
 
 [Peer]
 PublicKey = $EXIT_PUBKEY

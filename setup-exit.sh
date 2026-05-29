@@ -45,10 +45,9 @@ CONFIG_DIR=/etc/awg-cascade-exit
 STATE_FILE=$CONFIG_DIR/info.json
 BOT_USER=awgbot
 
-# AmneziaWG Default obfuscation params (должны совпадать с RU)
+# AmneziaWG v2.0 params generator (S1-S4 random, H1-H4 monotonic ranges, I1 fixed)
+# Загружается ниже из /tmp/awg2-params.sh который бот залил вместе с setup-exit.sh.
 JC_VAL=5; JMIN_VAL=10; JMAX_VAL=50
-S1_VAL=68; S2_VAL=140; S3_VAL=14; S4_VAL=9
-JUNK_I1="<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 1: параметры
@@ -172,23 +171,31 @@ else
     ok "Сгенерированы новые ключи exit'а"
 fi
 
-# H1-H4 уникальные на exit-сторону (только сервер<->RU, клиенты их не видят)
-if [ ! -f "$CONFIG_DIR/h_params" ]; then
-    gen_h() { od -An -N4 -tu4 /dev/urandom | tr -d ' ' | awk '{print ($1 % 2147483640) + 5}'; }
-    H1=$(gen_h); H2=$(gen_h); H3=$(gen_h); H4=$(gen_h)
-    while [ "$H1" = "$H2" ] || [ "$H1" = "$H3" ] || [ "$H1" = "$H4" ] \
-       || [ "$H2" = "$H3" ] || [ "$H2" = "$H4" ] || [ "$H3" = "$H4" ]; do
-        H1=$(gen_h); H2=$(gen_h); H3=$(gen_h); H4=$(gen_h)
+# v2.0 параметры (S1-S4 random, H1-H4 monotonic ranges, I1 DNS-iCloud).
+# Если уже сохранены — берём существующие (постоянство при reinstall).
+if [ ! -f "$CONFIG_DIR/awg2_params" ]; then
+    # Ищем awg2-params.sh в /tmp (положил бот) или рядом со setup-exit.sh
+    AWG2_PARAMS_FILE=""
+    for cand in /tmp/awg2-params.sh "$(dirname "$0")/awg2-params.sh"; do
+        [ -f "$cand" ] && AWG2_PARAMS_FILE="$cand" && break
     done
-    cat > "$CONFIG_DIR/h_params" <<EOF
-H1=$H1
-H2=$H2
-H3=$H3
-H4=$H4
+    [ -z "$AWG2_PARAMS_FILE" ] && err "awg2-params.sh не найден (положи в /tmp/ или рядом с setup-exit.sh)"
+
+    . "$AWG2_PARAMS_FILE"
+    cat > "$CONFIG_DIR/awg2_params" <<EOF
+S1=$S1
+S2=$S2
+S3=$S3
+S4=$S4
+H1='$H1'
+H2='$H2'
+H3='$H3'
+H4='$H4'
+I1='$I1'
 EOF
-    chmod 600 "$CONFIG_DIR/h_params"
+    chmod 600 "$CONFIG_DIR/awg2_params"
 fi
-. "$CONFIG_DIR/h_params"
+. "$CONFIG_DIR/awg2_params"
 
 MAIN_IFACE=$(ip route show default 0.0.0.0/0 | head -1 | awk '/dev/ {for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
 [ -z "$MAIN_IFACE" ] && MAIN_IFACE="eth0"
@@ -205,15 +212,15 @@ PrivateKey = $EXIT_PRIVKEY
 Jc = $JC_VAL
 Jmin = $JMIN_VAL
 Jmax = $JMAX_VAL
-S1 = $S1_VAL
-S2 = $S2_VAL
-S3 = $S3_VAL
-S4 = $S4_VAL
+S1 = $S1
+S2 = $S2
+S3 = $S3
+S4 = $S4
 H1 = $H1
 H2 = $H2
 H3 = $H3
 H4 = $H4
-I1 = $JUNK_I1
+I1 = $I1
 
 # Forwarding rules — MASQUERADE на main interface
 PostUp   = iptables -A FORWARD -i %i -j ACCEPT
@@ -275,22 +282,32 @@ iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 # Phase 7: info JSON (для бота / RU-стороны)
 # ═════════════════════════════════════════════════════════════════════════════
 
-cat > "$STATE_FILE" <<EOF
-{
-  "schema": 1,
-  "exit_index": $EXIT_INDEX,
-  "exit_public_ip": "$(curl -fsS --max-time 5 -4 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')",
-  "exit_pubkey": "$EXIT_PUBKEY",
-  "exit_port": $EXIT_PORT,
-  "exit_tunnel_ip": "$EXIT_TUNNEL_IP",
-  "ru_tunnel_ip": "$RU_TUNNEL_IP",
-  "tunnel_net": "$TUNNEL_NET",
-  "main_iface": "$MAIN_IFACE",
-  "h_params": {"H1": $H1, "H2": $H2, "H3": $H3, "H4": $H4},
-  "warp_state": "off",
-  "installed_at": "$(date -Iseconds)"
-}
-EOF
+# H1-H4 теперь строки-диапазоны ("min-max"), а S1-S4 и I1 — отдельно.
+# Schema 2 = v2.0 AmneziaWG (ranged headers + random padding).
+PUBLIC_IP=$(curl -fsS --max-time 5 -4 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+
+jq -n \
+    --argjson idx    "$EXIT_INDEX" \
+    --arg pip        "$PUBLIC_IP" \
+    --arg pub        "$EXIT_PUBKEY" \
+    --argjson port   "$EXIT_PORT" \
+    --arg etip       "$EXIT_TUNNEL_IP" \
+    --arg rtip       "$RU_TUNNEL_IP" \
+    --arg net        "$TUNNEL_NET" \
+    --arg iface      "$MAIN_IFACE" \
+    --arg h1         "$H1" --arg h2 "$H2" --arg h3 "$H3" --arg h4 "$H4" \
+    --argjson s1     "$S1" --argjson s2 "$S2" --argjson s3 "$S3" --argjson s4 "$S4" \
+    --arg i1         "$I1" \
+    --arg t          "$(date -Iseconds)" \
+    '{
+        schema: 2,
+        exit_index: $idx, exit_public_ip: $pip, exit_pubkey: $pub, exit_port: $port,
+        exit_tunnel_ip: $etip, ru_tunnel_ip: $rtip, tunnel_net: $net, main_iface: $iface,
+        h_params: {H1: $h1, H2: $h2, H3: $h3, H4: $h4},
+        s_params: {S1: $s1, S2: $s2, S3: $s3, S4: $s4},
+        i_params: {I1: $i1},
+        warp_state: "off", installed_at: $t
+    }' > "$STATE_FILE"
 chmod 644 "$STATE_FILE"
 
 # Вывод JSON на stdout (бот парсит)
