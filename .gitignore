@@ -1,13 +1,10 @@
-# Local debug/scratch
-backfill_geo.py
-update_pl_peer.sh
 *.tmp
 *.bak
-.DS_Store
-Thumbs.db
-__pycache__/
 *.pyc
 *.pyo
+__pycache__/
+.DS_Store
+Thumbs.db
 .idea/
 .vscode/
 venv/
