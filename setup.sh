@@ -456,11 +456,13 @@ ip rule add uidrange $BOT_UID-$BOT_UID lookup 100 priority 1001
 # Скрипт чтобы это пережило ребут
 cat > /usr/local/sbin/awg-cascade-iprule.sh <<RULEEOF
 #!/bin/bash
+# Idempotent: удаляем по priority (все правила в этих "слотах"), потом ставим.
 BOT_UID=\$(id -u $BOT_USER 2>/dev/null || echo 999)
-ip rule del fwmark 0x1 lookup 100 2>/dev/null
-ip rule del fwmark 0x2 lookup 100 2>/dev/null
-ip rule del uidrange \$BOT_UID-\$BOT_UID 2>/dev/null
-ip rule del ipproto tcp dport 22 uidrange \$BOT_UID-\$BOT_UID 2>/dev/null
+for prio in 998 1000 1001; do
+    while ip rule show priority \$prio 2>/dev/null | grep -q "^\$prio:"; do
+        ip rule del priority \$prio 2>/dev/null || break
+    done
+done
 ip rule add ipproto tcp dport 22 uidrange \$BOT_UID-\$BOT_UID lookup main priority 998
 ip rule add fwmark 0x1 lookup 100 priority 1000
 ip rule add uidrange \$BOT_UID-\$BOT_UID lookup 100 priority 1001

@@ -378,7 +378,10 @@ while true; do
         fi
     done < <(jq -c '.exits[]' "$STATE")
 
-    $status_changed && apply_route
+    # apply_route в каждом тике (а не только при status change) — это
+    # копеечно (ip route replace идемпотентен) и защищает от случаев когда
+    # таблица 100 опустела из-за restart awg-quick@awgN или ручного down/up.
+    apply_route
 
     # Применяем per-peer pinned маршруты (раз в тик — копеечно)
     apply_peer_routing
