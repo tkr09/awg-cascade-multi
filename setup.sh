@@ -431,6 +431,13 @@ iptables -t mangle -A PREROUTING -i awg0 -m comment --comment "awg-cascade" -j M
 # Условие ! -o awg0 = масквардим всё что уходит НЕ к клиенту (то есть на любой awgN).
 iptables -t nat -A POSTROUTING -s $CLIENT_NET ! -o awg0 -m comment --comment "awg-cascade-masq" -j MASQUERADE
 
+# MASQUERADE для tunnel-side трафика (RU bot + любой локальный с src=10.99.*.*).
+# Зачем: Linux ECMP per-flow hash меняет out-interface, но source IP всегда
+# берётся с первого nexthop. Если ECMP кинул на awg2 а src остался =10.99.1.2 —
+# exit отвергает (AllowedIPs=10.99.<N>.2/32). MASQUERADE подменяет src на
+# IP актуального out-interface, exit принимает.
+iptables -t nat -A POSTROUTING -s 10.99.0.0/16 -o awg+ -m comment --comment "awg-cascade-tunnel-masq" -j MASQUERADE
+
 # --- filter FORWARD: kill-switch ---
 # Клиентский трафик может выйти ТОЛЬКО через awg+ (awg1..awgN)
 # Если ECMP-таблица пуста (все exits down) → нет nexthop'а → drop
