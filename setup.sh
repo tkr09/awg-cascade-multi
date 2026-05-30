@@ -257,19 +257,17 @@ else
     ok "Пользователь $BOT_USER уже существует"
 fi
 
-# Sudoers: ограниченный набор команд
+# Sudoers. Wildcard на awg-cascade-*.sh — чтобы не ловить рассинхрон имён
+# (бот зовёт exit-add-ru.sh / exit-rotate.sh / peer-rotate.sh — их легко забыть
+# перечислить поимённо). Это выделенный appliance с нашим доверенным кодом бота,
+# поэтому даём широкий systemctl/ip — бот и так управляет WG/iptables/routing.
+# Команда без аргументов в sudoers = разрешён любой набор аргументов.
 cat > /etc/sudoers.d/$BOT_USER <<SUDOEOF
 # AWG Cascade Multi — bot privileges
 $BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg, /usr/bin/awg-quick, /usr/bin/wg-quick
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart awg-quick@*
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart awg-cascade-watchdog
-$BOT_USER ALL=(root) NOPASSWD: /sbin/ip route, /sbin/ip rule, /sbin/ip link
-$BOT_USER ALL=(root) NOPASSWD: /sbin/iptables, /sbin/ip6tables
-$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-route.sh
-$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-add.sh
-$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-remove.sh
-$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-add.sh
-$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-remove.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl
+$BOT_USER ALL=(root) NOPASSWD: /sbin/ip, /sbin/iptables, /sbin/ip6tables
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-*.sh
 SUDOEOF
 chmod 440 /etc/sudoers.d/$BOT_USER
 visudo -c -f /etc/sudoers.d/$BOT_USER >/dev/null || err "sudoers syntax error"
