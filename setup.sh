@@ -187,7 +187,7 @@ apt-get update -qq
 info "Базовые утилиты..."
 wait_apt_lock
 apt-get install -y -qq software-properties-common curl jq qrencode iptables-persistent \
-    python3 python3-venv python3-pip git ca-certificates dnsutils \
+    python3 python3-venv python3-pip git ca-certificates dnsutils sshpass \
     unattended-upgrades apt-listchanges >/dev/null
 ok "Базовые пакеты"
 
@@ -647,6 +647,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-add-ru.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-rotate.sh       /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-bootstrap-exit.sh    /usr/local/sbin/
 ok "Helper-скрипты установлены в /usr/local/sbin/"
 
 # Заодно положим setup-exit.sh — пригодится когда будем поднимать новый exit
@@ -746,6 +747,47 @@ info "Endpoint: ${BOLD}$RU_PUBLIC_IP:$AWG0_PORT${NC}"
 info "Server pubkey: ${BOLD}$SERVER_PUBKEY${NC}"
 echo ""
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 10: bootstrap первого exit (опционально, интерактивно)
+# ═════════════════════════════════════════════════════════════════════════════
+# Нужно чтобы разорвать chicken-and-egg: бот в РФ не может выйти к Telegram пока
+# нет ни одного exit. Подключаем первый exit прямо из CLI (бот сейчас может быть
+# недоступен). Дальше остальные exits добавляются уже через UI бота.
+header "10. Подключить первый exit (опционально)"
+
+cat <<INTRO
+Сейчас kill-switch активен — клиенты без интернета, и ${BOLD}бот может не отвечать${NC}
+в Telegram (если этот RU в сети где Telegram заблокирован, egress идёт через exit).
+
+Если у тебя уже есть рабочий exit (свежий Ubuntu ИЛИ exit от другого RU —
+скрипт сам определит и создаст изолированный интерфейс) — подключи его сейчас.
+
+Пропустить (добавить позже через бота) — просто нажми Enter.
+INTRO
+echo ""
+
+prompt "IP первого exit-сервера (Enter — пропустить): "; read_tty BOOTSTRAP_EXIT_IP
+if [ -n "$BOOTSTRAP_EXIT_IP" ]; then
+    prompt "Имя exit'а (например NL-1): "; read_tty BOOTSTRAP_EXIT_NAME
+    prompt "Root пароль exit-сервера: "
+    if [ -r /dev/tty ] && [ -z "$BATCH" ]; then
+        read -rs BOOTSTRAP_EXIT_PASS </dev/tty; echo ""
+    else
+        read -r BOOTSTRAP_EXIT_PASS || true
+    fi
+
+    if [ -n "$BOOTSTRAP_EXIT_NAME" ] && [ -n "$BOOTSTRAP_EXIT_PASS" ]; then
+        EXIT_PASSWORD="$BOOTSTRAP_EXIT_PASS" \
+            /usr/local/sbin/awg-cascade-bootstrap-exit.sh \
+            "$BOOTSTRAP_EXIT_IP" "$BOOTSTRAP_EXIT_NAME" \
+            || warn "Bootstrap exit'а не удался — добавишь позже через бота или повтори: awg-cascade-bootstrap-exit.sh"
+    else
+        warn "Имя или пароль пустые — пропускаю bootstrap exit'а"
+    fi
+else
+    info "Exit не подключён. Добавь позже: ${BOLD}awg-cascade-bootstrap-exit.sh${NC} или через бота."
+fi
+
 header "Что дальше"
 
 cat << NEXT
@@ -753,9 +795,10 @@ ${GREEN}awg0 запущен${NC} — подключайся первым peer'о
 ${GREEN}Watchdog активен${NC} — мониторит handshake/ping exits и держит ECMP.
 ${GREEN}Telegram бот активен${NC} — напиши ему /start в Telegram чтобы открыть меню.
 
-${YELLOW}ВАЖНО:${NC} сейчас работает только клиент↔RU. ${RED}Без exits трафик каскад выйти не может
-(kill-switch активен)${NC}. Чтобы клиенты получили доступ в интернет — добавь exit:
-  бот → 🌐 Exits → ➕ Add exit (введи IP + root пароль чистого Ubuntu).
+${YELLOW}ВАЖНО:${NC} если exit ещё не подключён — ${RED}kill-switch активен${NC}, клиенты без
+интернета. Подключи exit одним из способов:
+  • CLI (если бот недоступен): ${BOLD}awg-cascade-bootstrap-exit.sh${NC}
+  • бот → 🌐 Exits → ➕ Add exit (IP + root пароль; fresh Ubuntu ИЛИ exit от другого RU).
 
 Полезные команды на RU:
   ${BOLD}awg show${NC}                              статус awg0

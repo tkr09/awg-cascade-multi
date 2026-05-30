@@ -91,11 +91,39 @@ RU_TUNNEL_IP="10.99.${EXIT_INDEX}.2"
 # WARP опционально
 WARP_ENABLE="${WARP_ENABLE:-0}"
 
-info "EXIT_INDEX=$EXIT_INDEX  port=$EXIT_PORT  tunnel=$TUNNEL_NET"
+# ─── SHARED_MODE detection ────────────────────────────────────────────────────
+# Если на сервере уже стоит amneziawg и есть primary awg-in.conf — значит этот
+# exit уже принадлежит другому RU. Тогда мы НЕ переустанавливаем пакеты, НЕ
+# трогаем awg-in, а создаём дополнительный изолированный интерфейс awg-in-<N>
+# с собственным портом 51920+N и tunnel 10.99.<100+N>.0/30.
+SHARED_MODE=0
+IFACE_NAME="awg-in"
+if command -v awg >/dev/null 2>&1 && [ -f /etc/amnezia/amneziawg/awg-in.conf ]; then
+    SHARED_MODE=1
+    # Найти свободный slot 2..99
+    SHARED_N=2
+    while [ -f "$WG_DIR/awg-in-$SHARED_N.conf" ] || ip link show "awg-in-$SHARED_N" &>/dev/null; do
+        SHARED_N=$((SHARED_N + 1))
+        [ $SHARED_N -gt 99 ] && err "Нет свободных awg-in-<N> slots (заняты 2..99)"
+    done
+    IFACE_NAME="awg-in-$SHARED_N"
+    EXIT_PORT=$((51920 + SHARED_N))
+    TUNNEL_OCTET=$((100 + SHARED_N))
+    TUNNEL_NET="10.99.${TUNNEL_OCTET}.0/30"
+    EXIT_TUNNEL_IP="10.99.${TUNNEL_OCTET}.1"
+    RU_TUNNEL_IP="10.99.${TUNNEL_OCTET}.2"
+    warn "SHARED MODE — exit уже занят другим RU."
+    info "Создаю изолированный интерфейс $IFACE_NAME на порту $EXIT_PORT, tunnel $TUNNEL_NET"
+fi
+
+info "EXIT_INDEX=$EXIT_INDEX  iface=$IFACE_NAME  port=$EXIT_PORT  tunnel=$TUNNEL_NET  shared=$SHARED_MODE"
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Phase 2: пакеты
+# Phase 2: пакеты (skip в SHARED_MODE — всё уже установлено primary RU)
 # ═════════════════════════════════════════════════════════════════════════════
+if [ "$SHARED_MODE" = "1" ]; then
+    ok "Skip Phase 2 (пакеты): amneziawg уже установлен"
+else
 header "Установка пакетов"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -154,6 +182,7 @@ systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 
 modprobe amneziawg || err "Модуль amneziawg не загружается"
 ok "amneziawg готов"
+fi  # end Phase 2 (skip в SHARED_MODE)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 3: awgbot user (только если бот будет SSH'ить сюда)
@@ -198,23 +227,34 @@ header "AmneziaWG awg-in"
 mkdir -p "$CONFIG_DIR" "$WG_DIR"
 chmod 700 "$CONFIG_DIR" "$WG_DIR"
 
-# Если уже есть конфиг — не перетираем
-if [ -f "$CONFIG_DIR/private.key" ]; then
-    EXIT_PRIVKEY=$(cat "$CONFIG_DIR/private.key")
+# Per-interface файлы. В SHARED_MODE — суффикс по имени интерфейса, чтобы
+# не затереть ключи/параметры primary awg-in (он принадлежит другому RU).
+KEY_PRIV="$CONFIG_DIR/private.key"
+KEY_PUB="$CONFIG_DIR/public.key"
+PARAMS_FILE="$CONFIG_DIR/awg2_params"
+if [ "$SHARED_MODE" = "1" ]; then
+    KEY_PRIV="$CONFIG_DIR/private-$IFACE_NAME.key"
+    KEY_PUB="$CONFIG_DIR/public-$IFACE_NAME.key"
+    PARAMS_FILE="$CONFIG_DIR/awg2_params-$IFACE_NAME"
+fi
+
+# Если уже есть ключ для этого интерфейса — не перетираем
+if [ -f "$KEY_PRIV" ]; then
+    EXIT_PRIVKEY=$(cat "$KEY_PRIV")
     EXIT_PUBKEY=$(echo "$EXIT_PRIVKEY" | awg pubkey)
-    ok "Используем существующие ключи exit'а"
+    ok "Используем существующие ключи для $IFACE_NAME"
 else
     EXIT_PRIVKEY=$(awg genkey)
     EXIT_PUBKEY=$(echo "$EXIT_PRIVKEY" | awg pubkey)
-    echo "$EXIT_PRIVKEY" > "$CONFIG_DIR/private.key"
-    echo "$EXIT_PUBKEY"  > "$CONFIG_DIR/public.key"
-    chmod 600 "$CONFIG_DIR/private.key"
-    ok "Сгенерированы новые ключи exit'а"
+    echo "$EXIT_PRIVKEY" > "$KEY_PRIV"
+    echo "$EXIT_PUBKEY"  > "$KEY_PUB"
+    chmod 600 "$KEY_PRIV"
+    ok "Сгенерированы новые ключи для $IFACE_NAME"
 fi
 
 # v2.0 параметры (S1-S4 random, H1-H4 monotonic ranges, I1 DNS-iCloud).
-# Если уже сохранены — берём существующие (постоянство при reinstall).
-if [ ! -f "$CONFIG_DIR/awg2_params" ]; then
+# Если уже сохранены для этого интерфейса — берём существующие (постоянство).
+if [ ! -f "$PARAMS_FILE" ]; then
     # Ищем awg2-params.sh в /tmp (положил бот) или рядом со setup-exit.sh
     AWG2_PARAMS_FILE=""
     for cand in /tmp/awg2-params.sh "$(dirname "$0")/awg2-params.sh"; do
@@ -223,7 +263,7 @@ if [ ! -f "$CONFIG_DIR/awg2_params" ]; then
     [ -z "$AWG2_PARAMS_FILE" ] && err "awg2-params.sh не найден (положи в /tmp/ или рядом с setup-exit.sh)"
 
     . "$AWG2_PARAMS_FILE"
-    cat > "$CONFIG_DIR/awg2_params" <<EOF
+    cat > "$PARAMS_FILE" <<EOF
 S1=$S1
 S2=$S2
 S3=$S3
@@ -234,9 +274,9 @@ H3='$H3'
 H4='$H4'
 I1='$I1'
 EOF
-    chmod 600 "$CONFIG_DIR/awg2_params"
+    chmod 600 "$PARAMS_FILE"
 fi
-. "$CONFIG_DIR/awg2_params"
+. "$PARAMS_FILE"
 
 MAIN_IFACE=$(ip route show default 0.0.0.0/0 | head -1 | awk '/dev/ {for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
 [ -z "$MAIN_IFACE" ] && MAIN_IFACE="eth0"
@@ -245,7 +285,17 @@ MAIN_IFACE=$(ip route show default 0.0.0.0/0 | head -1 | awk '/dev/ {for(i=1;i<=
 PSK_LINE=""
 [ -n "$RU_PSK" ] && PSK_LINE="PresharedKey = $RU_PSK"
 
-cat > $WG_DIR/awg-in.conf <<EOF
+# MASQUERADE: в shared-режиме скопируем по source tunnel-net (не blanket),
+# чтобы не дублировать blanket-правило primary awg-in.
+if [ "$SHARED_MODE" = "1" ]; then
+    MASQ_UP="iptables -t nat -A POSTROUTING -s $TUNNEL_NET -o $MAIN_IFACE -j MASQUERADE"
+    MASQ_DOWN="iptables -t nat -D POSTROUTING -s $TUNNEL_NET -o $MAIN_IFACE -j MASQUERADE"
+else
+    MASQ_UP="iptables -t nat -A POSTROUTING -o $MAIN_IFACE -j MASQUERADE"
+    MASQ_DOWN="iptables -t nat -D POSTROUTING -o $MAIN_IFACE -j MASQUERADE"
+fi
+
+cat > $WG_DIR/$IFACE_NAME.conf <<EOF
 [Interface]
 Address = $EXIT_TUNNEL_IP/30
 ListenPort = $EXIT_PORT
@@ -266,11 +316,11 @@ I1 = $I1
 # Forwarding rules — MASQUERADE на main interface
 PostUp   = iptables -A FORWARD -i %i -j ACCEPT
 PostUp   = iptables -A FORWARD -o %i -j ACCEPT
-PostUp   = iptables -t nat -A POSTROUTING -o $MAIN_IFACE -j MASQUERADE
+PostUp   = $MASQ_UP
 PostUp   = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -D FORWARD -i %i -j ACCEPT
 PostDown = iptables -D FORWARD -o %i -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o $MAIN_IFACE -j MASQUERADE
+PostDown = $MASQ_DOWN
 PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
 [Peer]
@@ -280,8 +330,8 @@ $PSK_LINE
 AllowedIPs = $RU_TUNNEL_IP/32
 PersistentKeepalive = 25
 EOF
-chmod 600 $WG_DIR/awg-in.conf
-ok "$WG_DIR/awg-in.conf создан"
+chmod 600 $WG_DIR/$IFACE_NAME.conf
+ok "$WG_DIR/$IFACE_NAME.conf создан"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 6: systemd up
@@ -305,16 +355,16 @@ mkdir -p $CONFIG_DIR
 chown $BOT_USER:$BOT_USER $CONFIG_DIR
 chmod 755 $CONFIG_DIR
 
-header "Запуск awg-quick@awg-in"
+header "Запуск awg-quick@$IFACE_NAME"
 
-systemctl enable awg-quick@awg-in >/dev/null 2>&1
-systemctl restart awg-quick@awg-in
+systemctl enable "awg-quick@$IFACE_NAME" >/dev/null 2>&1
+systemctl restart "awg-quick@$IFACE_NAME"
 sleep 1
-systemctl is-active --quiet awg-quick@awg-in || {
-    journalctl -u awg-quick@awg-in -n 20 --no-pager >&2
-    err "awg-quick@awg-in не запустился"
+systemctl is-active --quiet "awg-quick@$IFACE_NAME" || {
+    journalctl -u "awg-quick@$IFACE_NAME" -n 20 --no-pager >&2
+    err "awg-quick@$IFACE_NAME не запустился"
 }
-ok "awg-in активен на $EXIT_PORT/udp"
+ok "$IFACE_NAME активен на $EXIT_PORT/udp"
 
 # Persist iptables
 iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
@@ -322,6 +372,9 @@ iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 7: info JSON (для бота / RU-стороны)
 # ═════════════════════════════════════════════════════════════════════════════
+
+# В SHARED_MODE пишем info в per-interface файл, чтобы не затереть primary info.json
+[ "$SHARED_MODE" = "1" ] && STATE_FILE="$CONFIG_DIR/info-$IFACE_NAME.json"
 
 # H1-H4 теперь строки-диапазоны ("min-max"), а S1-S4 и I1 — отдельно.
 # Schema 2 = v2.0 AmneziaWG (ranged headers + random padding).
@@ -336,6 +389,8 @@ jq -n \
     --arg rtip       "$RU_TUNNEL_IP" \
     --arg net        "$TUNNEL_NET" \
     --arg iface      "$MAIN_IFACE" \
+    --arg exitiface  "$IFACE_NAME" \
+    --argjson shared "$SHARED_MODE" \
     --arg h1         "$H1" --arg h2 "$H2" --arg h3 "$H3" --arg h4 "$H4" \
     --argjson s1     "$S1" --argjson s2 "$S2" --argjson s3 "$S3" --argjson s4 "$S4" \
     --arg i1         "$I1" \
@@ -344,6 +399,7 @@ jq -n \
         schema: 2,
         exit_index: $idx, exit_public_ip: $pip, exit_pubkey: $pub, exit_port: $port,
         exit_tunnel_ip: $etip, ru_tunnel_ip: $rtip, tunnel_net: $net, main_iface: $iface,
+        exit_iface: $exitiface, shared_mode: $shared,
         h_params: {H1: $h1, H2: $h2, H3: $h3, H4: $h4},
         s_params: {S1: $s1, S2: $s2, S3: $s3, S4: $s4},
         i_params: {I1: $i1},
