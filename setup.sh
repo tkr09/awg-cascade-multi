@@ -201,8 +201,34 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-sed -i 's|//Unattended-Upgrade::Automatic-Reboot ".*";|Unattended-Upgrade::Automatic-Reboot "false";|' \
-    /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null || true
+# Авто-ребут для применения kernel-обновлений. Opt-in через env AUTO_REBOOT=1
+# (по умолчанию ВЫКЛ — ручной контроль). Срабатывает только при reboot-required.
+# Минута рандомится в пределах часа AUTO_REBOOT_HOUR (default 05), чтобы серверы
+# каскада не ребутились в одну минуту (иначе все exits лягут разом).
+configure_auto_reboot() {
+    local uu=/etc/apt/apt.conf.d/50unattended-upgrades
+    [ -f "$uu" ] || return 0
+    if [ "${AUTO_REBOOT:-0}" = "1" ]; then
+        local h="${AUTO_REBOOT_HOUR:-05}" m
+        m=$(printf '%02d' $((RANDOM % 60)))
+        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"true";|' "$uu"
+        if grep -q 'Automatic-Reboot-Time' "$uu"; then
+            sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-Time \).*;|\1"'"$h:$m"'";|' "$uu"
+        else
+            echo "Unattended-Upgrade::Automatic-Reboot-Time \"$h:$m\";" >> "$uu"
+        fi
+        if grep -q 'Automatic-Reboot-WithUsers' "$uu"; then
+            sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-WithUsers \).*;|\1"true";|' "$uu"
+        else
+            echo 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";' >> "$uu"
+        fi
+        ok "Авто-ребут ВКЛ: окно $h:$m (только при kernel-обновлении)"
+    else
+        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"false";|' "$uu"
+        ok "Авто-ребут ВЫКЛ (ручной контроль ребутов; вкл: AUTO_REBOOT=1)"
+    fi
+}
+configure_auto_reboot
 systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 ok "unattended-upgrades включён"
 

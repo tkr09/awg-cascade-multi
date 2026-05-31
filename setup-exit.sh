@@ -189,8 +189,27 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-sed -i 's|//Unattended-Upgrade::Automatic-Reboot ".*";|Unattended-Upgrade::Automatic-Reboot "false";|' \
-    /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null || true
+# Авто-ребут для kernel-обновлений. Opt-in через env AUTO_REBOOT=1 (default ВЫКЛ).
+# Срабатывает только при reboot-required. Минута рандомится в пределах часа
+# AUTO_REBOOT_HOUR (default 05) — чтобы exits каскада не ребутились разом.
+uu=/etc/apt/apt.conf.d/50unattended-upgrades
+if [ -f "$uu" ]; then
+    if [ "${AUTO_REBOOT:-0}" = "1" ]; then
+        rb_h="${AUTO_REBOOT_HOUR:-05}"; rb_m=$(printf '%02d' $((RANDOM % 60)))
+        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"true";|' "$uu"
+        if grep -q 'Automatic-Reboot-Time' "$uu"; then
+            sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-Time \).*;|\1"'"$rb_h:$rb_m"'";|' "$uu"
+        else
+            echo "Unattended-Upgrade::Automatic-Reboot-Time \"$rb_h:$rb_m\";" >> "$uu"
+        fi
+        grep -q 'Automatic-Reboot-WithUsers' "$uu" \
+            && sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-WithUsers \).*;|\1"true";|' "$uu" \
+            || echo 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";' >> "$uu"
+        ok "Авто-ребут ВКЛ: окно $rb_h:$rb_m (только при kernel-обновлении)"
+    else
+        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"false";|' "$uu"
+    fi
+fi
 systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 
 modprobe amneziawg || err "Модуль amneziawg не загружается"
