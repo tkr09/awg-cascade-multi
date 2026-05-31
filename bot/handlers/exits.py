@@ -354,9 +354,12 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
 
     # Вызываем helper-скрипт по SSH на exit. Timeout=120 — первая установка
     # качает wgcf и регистрирует WARP-аккаунт.
+    # Передаём имя интерфейса НА EXIT'е (awg-in / awg-in-N) — helper метит
+    # только этот iface, чтобы на shared-exit не задеть WARP другого RU.
     op = "on" if action == "warp_on" else "off"
+    exit_iface = e.get("exit_iface", "awg-in")
     out, err, rc = await ssh_exec(
-        e["ip"], f"sudo /usr/local/sbin/awg-cascade-exit-warp.sh {op}",
+        e["ip"], f"sudo /usr/local/sbin/awg-cascade-exit-warp.sh {op} {exit_iface}",
         username="root", key_path=SSH_KEY, timeout=120,
     )
 

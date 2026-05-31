@@ -41,6 +41,9 @@ S3=$(echo "$ARGS" | jq -r '.exit_info.s_params.S3 // 14')
 S4=$(echo "$ARGS" | jq -r '.exit_info.s_params.S4 // 9')
 I1=$(echo "$ARGS" | jq -r '.exit_info.i_params.I1 // "<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>"')
 WARP_STATE=$(echo "$ARGS" | jq -r '.exit_info.warp_state // "off"')
+# Имя интерфейса НА EXIT'е (awg-in для fresh, awg-in-N для shared). Нужно боту
+# для interface-aware WARP-тоггла, чтобы не задеть чужой RU на shared-exit.
+EXIT_IFACE=$(echo "$ARGS" | jq -r '.exit_info.exit_iface // "awg-in"')
 
 IFACE="awg${EXIT_INDEX}"
 
@@ -103,11 +106,12 @@ FLOCK=/etc/awg-cascade/state.lock
         --arg tip         "$EXIT_TUNNEL_IP" \
         --arg rtip        "$RU_TUNNEL_IP" \
         --arg iface       "$IFACE" \
+        --arg eiface      "$EXIT_IFACE" \
         --arg warp        "$WARP_STATE" \
         '{
             name: $name, index: $idx, ip: $ip, port: $port,
             exit_pubkey: $pub, exit_tunnel_ip: $tip, ru_tunnel_ip: $rtip,
-            interface: $iface, enabled: true, status: "up",
+            interface: $iface, exit_iface: $eiface, enabled: true, status: "up",
             ping_avg: null, ping_loss: null, ping_ring: [],
             weight: 10, warp_state: $warp, note: "",
             added_at: now|todate
