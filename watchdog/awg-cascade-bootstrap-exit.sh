@@ -79,7 +79,7 @@ info "Локальный интерфейс будет awg${NEXT_IDX}"
 # 4. Запускаем setup-exit.sh на exit. Он сам определит fresh/SHARED и вернёт JSON.
 info "Провижу exit (это может занять до 10 мин на свежем сервере)..."
 EXIT_RAW=$(sshx "chmod +x /root/setup-exit.sh && \
-    BATCH=1 TERM=xterm EXIT_INDEX=$NEXT_IDX \
+    BATCH=1 TERM=xterm EXIT_INDEX=$NEXT_IDX RU_TUNNEL_OCTET=$((100 + NEXT_IDX)) \
     RU_PUBLIC_IP='$RU_PUBLIC_IP' RU_PUBKEY='$RU_PUBKEY' RU_PSK='$RU_PSK' \
     bash /root/setup-exit.sh") || err "setup-exit.sh упал на exit (см. вывод выше)"
 

@@ -181,6 +181,9 @@ wait_apt_lock() {
 }
 wait_apt_lock
 
+# Восстановление после прерванной установки (dpkg half-configured). Идемпотентно.
+dpkg --configure -a 2>/dev/null || true
+
 info "apt update..."
 apt-get update -qq
 

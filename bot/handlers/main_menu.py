@@ -10,7 +10,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from common import (admin_only, cfg, fmt_age, name_to_flag, peers_list,
-                    ping_bar, state_load, status_icon)
+                    ping_bar, safe_edit_text, state_load, status_icon)
 
 LOG = logging.getLogger("awg.main_menu")
 router = Router(name="main_menu")
@@ -93,7 +93,7 @@ async def cmd_status(message: Message) -> None:
 async def cb_main(call: CallbackQuery) -> None:
     await call.answer()
     state = state_load()
-    await call.message.edit_text(render_main(state), parse_mode="HTML", reply_markup=main_kb(state))
+    await safe_edit_text(call.message, render_main(state), parse_mode="HTML", reply_markup=main_kb(state))
 
 
 @router.callback_query(F.data == "close")
@@ -159,4 +159,4 @@ async def cb_status_full(call: CallbackQuery) -> None:
         InlineKeyboardButton(text="🔄 Refresh", callback_data="status:full"),
         InlineKeyboardButton(text="🏠 Меню",    callback_data="main"),
     ]])
-    await call.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+    await safe_edit_text(call.message, "\n".join(lines), parse_mode="HTML", reply_markup=kb)

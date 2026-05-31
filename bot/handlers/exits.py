@@ -550,6 +550,14 @@ async def cb_exit_rm(call: CallbackQuery) -> None:
 async def cb_exit_rm_yes(call: CallbackQuery) -> None:
     await call.answer("⏳")
     iface = call.data[len("exit:rm-yes:"):]
+
+    # Захватываем ip + exit_iface ДО удаления (exit-remove.sh сотрёт из state).
+    st = state_load()
+    e = _get_exit(st, iface)
+    exit_ip = e.get("ip") if e else None
+    exit_iface = e.get("exit_iface", "awg-in") if e else "awg-in"
+
+    # 1. RU-side: down awgN, rm conf/keys, убрать из state, пересобрать ECMP.
     out, err, rc = await sudo_run(
         "/usr/local/sbin/awg-cascade-exit-remove.sh", iface, timeout=20,
     )
@@ -561,8 +569,36 @@ async def cb_exit_rm_yes(call: CallbackQuery) -> None:
                 InlineKeyboardButton(text="◀️ К списку", callback_data="exits:list")]]),
         )
         return
+
+    # 2. Exit-side cleanup ТОЛЬКО для shared-интерфейса awg-in-N (N>=2).
+    #    Primary awg-in (чужого RU) НИКОГДА не трогаем. Best-effort: если exit
+    #    недоступен — удаление на RU всё равно состоялось.
+    exit_cleanup = ""
+    if exit_ip and re.match(r"^awg-in-[2-9][0-9]?$", exit_iface):
+        teardown = (
+            f"/usr/local/sbin/awg-cascade-exit-warp.sh uninstall {exit_iface} >/dev/null 2>&1; "
+            f"systemctl disable --now awg-quick@{exit_iface} >/dev/null 2>&1; "
+            f"ip link del {exit_iface} 2>/dev/null; "
+            f"rm -f /etc/amnezia/amneziawg/{exit_iface}.conf "
+            f"/etc/awg-cascade-exit/info-{exit_iface}.json "
+            f"/etc/awg-cascade-exit/awg2_params-{exit_iface} "
+            f"/etc/awg-cascade-exit/private-{exit_iface}.key "
+            f"/etc/awg-cascade-exit/public-{exit_iface}.key; "
+            f"echo CLEANUP_OK"
+        )
+        try:
+            o2, e2, rc2 = await ssh_exec(
+                exit_ip, teardown, username="root", key_path=SSH_KEY, timeout=30,
+            )
+            exit_cleanup = (f"\n🧹 На exit убран <code>{exit_iface}</code>"
+                            if rc2 == 0 and "CLEANUP_OK" in o2
+                            else f"\n⚠️ Exit-cleanup не удался (убери <code>{exit_iface}</code> вручную)")
+        except Exception as ex:
+            exit_cleanup = (f"\n⚠️ Exit недоступен — <code>{exit_iface}</code> "
+                            f"остался на сервере: {html_escape(str(ex))[:120]}")
+
     await call.message.edit_text(
-        f"🗑 Exit <b>{iface}</b> удалён.",
+        f"🗑 Exit <b>{iface}</b> удалён.{exit_cleanup}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🌍 К списку", callback_data="exits:list"),
@@ -809,6 +845,9 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
                 f"chmod +x /root/setup-exit.sh && "
                 f"BATCH=1 "
                 f"EXIT_INDEX={EXIT_INDEX} "
+                # Предпочитаемый tunnel-октет для SHARED-режима = 100+EXIT_INDEX.
+                # Уникален среди интерфейсов этого RU → нет коллизии awgN Address.
+                f"RU_TUNNEL_OCTET={100 + EXIT_INDEX} "
                 f"RU_PUBLIC_IP={cfg().ru_public_ip} "
                 f"RU_PUBKEY='{ru_pubkey}' "
                 f"RU_PSK='{ru_psk}' "

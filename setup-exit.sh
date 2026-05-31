@@ -108,7 +108,16 @@ if command -v awg >/dev/null 2>&1 && [ -f /etc/amnezia/amneziawg/awg-in.conf ]; 
     done
     IFACE_NAME="awg-in-$SHARED_N"
     EXIT_PORT=$((51920 + SHARED_N))
-    TUNNEL_OCTET=$((100 + SHARED_N))
+    # Tunnel /30 octet. КЛЮЧЕВОЕ: октет ДОЛЖЕН быть уникален на стороне RU
+    # (иначе у RU несколько awgN с одинаковым Address). Поэтому RU передаёт
+    # предпочитаемый октет = 100 + его EXIT_INDEX (уникален среди интерфейсов RU).
+    # На стороне exit сканируем вверх от предпочитаемого до первого свободного
+    # (на случай если другой RU уже занял этот октет на этом же exit).
+    TUNNEL_OCTET="${RU_TUNNEL_OCTET:-$((100 + SHARED_N))}"
+    while ip -br addr show 2>/dev/null | grep -qE "[[:space:]]10\.99\.${TUNNEL_OCTET}\."; do
+        TUNNEL_OCTET=$((TUNNEL_OCTET + 1))
+        [ "$TUNNEL_OCTET" -gt 250 ] && err "Нет свободных tunnel-октетов 10.99.X на exit"
+    done
     TUNNEL_NET="10.99.${TUNNEL_OCTET}.0/30"
     EXIT_TUNNEL_IP="10.99.${TUNNEL_OCTET}.1"
     RU_TUNNEL_IP="10.99.${TUNNEL_OCTET}.2"
@@ -149,6 +158,10 @@ wait_apt_lock() {
     done
 }
 wait_apt_lock
+
+# Восстановление после прерванной установки (например SSH-обрыв в прошлый раз):
+# dpkg может застрять в half-configured. Идемпотентно, no-op если всё чисто.
+dpkg --configure -a 2>/dev/null || true
 
 apt-get update -qq
 
