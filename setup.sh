@@ -167,12 +167,22 @@ systemctl stop unattended-upgrades.service \
                apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
 pkill -9 unattended-upgr 2>/dev/null || true
 
-# Ждём пока ВСЕ apt-локи освободятся (если что-то ещё держит после kill)
+# Ждём освобождения ВСЕХ четырёх apt-локов. ВАЖНО: /var/cache/apt/archives/lock
+# тоже надо проверять — иначе apt-get падает на нём даже когда остальные свободны
+# (apt-daily-upgrade на first-boot держит именно archives/lock при скачивании).
+# После grace-периода держателей убиваем принудительно (provisioning, сервер наш).
+APT_LOCKS="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
 wait_apt_lock() {
-    local max=600 elapsed=0
-    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1; do
+    local max=600 elapsed=0 grace=120
+    while fuser $APT_LOCKS >/dev/null 2>&1; do
         if [ $elapsed -ge $max ]; then
             err "apt lock не освободился за 10 минут (что-то странное на сервере)"
+        fi
+        if [ $elapsed -ge $grace ]; then
+            warn "apt lock держится >${grace}s — убиваю держателей принудительно"
+            fuser -k $APT_LOCKS 2>/dev/null || true
+            sleep 3
+            dpkg --configure -a 2>/dev/null || true
         fi
         [ $((elapsed % 30)) -eq 0 ] && info "apt lock занят, жду... (${elapsed}s/$max)"
         sleep 5
