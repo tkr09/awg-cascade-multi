@@ -828,23 +828,23 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
                 )
                 return
 
-            # 5. Читаем info.json напрямую с exit (надёжнее чем парсить stdout)
-            info_result = await asyncio.wait_for(
-                conn.run("cat /etc/awg-cascade-exit/info.json", check=False), timeout=10,
-            )
-            info_text = (info_result.stdout if isinstance(info_result.stdout, str)
-                         else (info_result.stdout.decode() if info_result.stdout else ""))
-            if info_result.exit_status != 0 or not info_text.strip():
+            # 5. Парсим JSON из stdout setup-exit.sh. Все логи скрипт шлёт в
+            #    stderr, на stdout — только итоговый JSON. В SHARED-режиме info
+            #    пишется в per-interface файл (info-awg-in-N.json), которого нет
+            #    по фиксированному пути info.json — поэтому cat фиксированного
+            #    пути давал ЧУЖОЙ primary info (баг: awg<N> коннектился не туда).
+            m = re.search(r"\{.*\}", stdout_text, re.DOTALL)
+            if not m:
                 await update_status(
-                    f"❌ Не удалось прочитать /etc/awg-cascade-exit/info.json с exit:\n"
+                    f"❌ Не нашёл JSON в выводе setup-exit.sh:\n"
                     f"<pre>{html_escape(stdout_text[-400:])}</pre>"
                 )
                 return
             try:
-                exit_info = json.loads(info_text)
+                exit_info = json.loads(m.group(0))
             except json.JSONDecodeError as e:
                 await update_status(
-                    f"❌ info.json невалиден: {e}\n<pre>{html_escape(info_text[:400])}</pre>"
+                    f"❌ info JSON невалиден: {e}\n<pre>{html_escape(m.group(0)[:400])}</pre>"
                 )
                 return
     except Exception as e:
