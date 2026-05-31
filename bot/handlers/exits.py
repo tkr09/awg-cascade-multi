@@ -562,7 +562,8 @@ async def cb_exit_rm_yes(call: CallbackQuery) -> None:
         "/usr/local/sbin/awg-cascade-exit-remove.sh", iface, timeout=20,
     )
     if rc != 0:
-        await call.message.edit_text(
+        await safe_edit_text(
+            call.message,
             f"❌ Ошибка удаления:\n<pre>{(err or out)[:400]}</pre>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -597,7 +598,11 @@ async def cb_exit_rm_yes(call: CallbackQuery) -> None:
             exit_cleanup = (f"\n⚠️ Exit недоступен — <code>{exit_iface}</code> "
                             f"остался на сервере: {html_escape(str(ex))[:120]}")
 
-    await call.message.edit_text(
+    # safe_edit_text — retry 1-2-4с. Удаление exit'а через который бот ходит в
+    # Telegram вызывает кратковременный flap egress (ECMP пересобирается) →
+    # edit_text может таймаутить. State уже изменён, retry дотянется.
+    await safe_edit_text(
+        call.message,
         f"🗑 Exit <b>{iface}</b> удалён.{exit_cleanup}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
