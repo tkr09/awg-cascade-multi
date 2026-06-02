@@ -42,6 +42,11 @@ def _peer_conf_path(name: str) -> Path:
     return PEERS_DIR / f"{name}.conf"
 
 
+def _conf_document(name: str, conf_text: str) -> BufferedInputFile:
+    """Завернуть текст конфига в скачиваемый .conf-документ."""
+    return BufferedInputFile(conf_text.encode("utf-8"), filename=f"{name}.conf")
+
+
 def _make_qr_png(conf_text: str) -> bytes:
     qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, border=2, box_size=8)
     qr.add_data(conf_text)
@@ -221,8 +226,15 @@ async def cb_peer_conf(call: CallbackQuery) -> None:
     if not conf.exists():
         await call.message.answer(f"❌ Конфиг {name} не найден")
         return
+    conf_text = conf.read_text()
+    await call.message.answer_document(
+        _conf_document(name, conf_text),
+        caption=f"📄 <b>{name}.conf</b> — импортируй файлом в AmneziaWG",
+        parse_mode="HTML",
+        reply_markup=_close_kb,
+    )
     await call.message.answer(
-        f"<b>{name}.conf:</b>\n<pre>{html_escape(conf.read_text())}</pre>",
+        f"<b>{name}.conf:</b>\n<pre>{html_escape(conf_text)}</pre>",
         parse_mode="HTML",
         reply_markup=_close_kb,
     )
@@ -388,6 +400,11 @@ async def fsm_peer_name(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
         reply_markup=_close_kb,
     )
+    await message.answer_document(
+        _conf_document(name, client_conf),
+        caption=f"📄 <b>{name}.conf</b> — или импортируй файлом",
+        parse_mode="HTML",
+    )
     await message.answer(
         f"<b>{name}.conf:</b>\n<pre>{html_escape(client_conf)}</pre>",
         parse_mode="HTML",
@@ -454,6 +471,11 @@ async def cb_peer_rotate_yes(call: CallbackQuery) -> None:
         caption=f"✅ <b>{name}</b> rotated.\nПересканируй в amnezia-client.",
         parse_mode="HTML",
         reply_markup=_close_kb,
+    )
+    await call.message.answer_document(
+        _conf_document(name, conf),
+        caption=f"📄 <b>{name}.conf</b> — или импортируй файлом",
+        parse_mode="HTML",
     )
     await call.message.answer(
         f"<b>{name}.conf:</b>\n<pre>{html_escape(conf)}</pre>",
