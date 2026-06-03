@@ -90,7 +90,7 @@ PYEOF
 [Interface]
 PrivateKey = $NEW_PRIVKEY
 Address = ${PEER_IP}/32
-MTU = 1340
+MTU = 1320
 DNS = 1.1.1.1, 8.8.8.8
 Jc = $JC
 Jmin = $JMIN
