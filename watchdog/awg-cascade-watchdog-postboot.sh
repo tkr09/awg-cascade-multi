@@ -77,6 +77,9 @@ if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
     [ -x /usr/local/sbin/awg-cascade-iprule.sh ] && /usr/local/sbin/awg-cascade-iprule.sh
 fi
 
+# 6. per-peer inter-client LAN-доступ (идемпотентно переприменяем после буста)
+[ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
+
 # Финальный отчёт
 if [ ${#issues[@]} -eq 0 ]; then
     log "OK — all checks passed"

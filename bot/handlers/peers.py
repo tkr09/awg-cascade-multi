@@ -87,6 +87,7 @@ def peer_menu_kb(name: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📝 Заметка",    callback_data=f"peer:note:{name}"),
             InlineKeyboardButton(text="🔁 Rotate",     callback_data=f"peer:rotate:{name}"),
         ],
+        [InlineKeyboardButton(text="🏠 LAN-доступ",    callback_data=f"peer:lan:{name}")],
         [InlineKeyboardButton(text="🗑 Удалить",       callback_data=f"peer:rm:{name}")],
         [InlineKeyboardButton(text="◀️ К списку",     callback_data="peers:list")],
     ])
@@ -293,6 +294,79 @@ async def cb_peer_setpin(call: CallbackQuery) -> None:
     # Возвращаем меню peer'а
     text = await render_peer_status(p, with_geo=False)
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=peer_menu_kb(name))
+
+
+# ─── LAN access (per-peer inter-client whitelist src→dst) ────────────────────
+
+def _lan_kb(name: str, allow: list[str]) -> InlineKeyboardMarkup:
+    allow_set = set(allow or [])
+    rows = []
+    for t in peers_list():
+        if t["name"] == name:
+            continue
+        mark = "✅" if t["ip"] in allow_set else "⬜"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {t['name']}  {t['ip']}",
+            callback_data=f"peer:lanX:{name}:{t['ip']}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"peer:menu:{name}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _lan_text(name: str, ip: str, allow: list[str]) -> str:
+    cur = ", ".join(f"<code>{html_escape(a)}</code>" for a in (allow or [])) or "<i>(никого)</i>"
+    return (
+        f"<b>🏠 LAN-доступ: {name}</b>  <code>{ip}</code>\n\n"
+        f"Отметь, к каким <b>внутренним устройствам</b> этому пиру разрешён прямой доступ "
+        f"(его трафик к ним пойдёт локально, а не в каскад).\n\n"
+        f"По умолчанию доступ к внутренней сети <b>закрыт</b> (default-deny). "
+        f"Остальной интернет-трафик всех пиров — через exits, как обычно.\n\n"
+        f"Сейчас разрешено: {cur}"
+    )
+
+
+@router.callback_query(F.data.startswith("peer:lan:"))
+@admin_only
+async def cb_peer_lan(call: CallbackQuery) -> None:
+    await call.answer()
+    name = call.data[len("peer:lan:"):]
+    peer = next((p for p in peers_list() if p["name"] == name), None)
+    if not peer:
+        await call.message.edit_text("Peer не найден.", reply_markup=peers_kb(peers_list()))
+        return
+    allow = peer.get("lan_allow") or []
+    await safe_edit_text(
+        call.message, _lan_text(name, peer["ip"], allow),
+        parse_mode="HTML", reply_markup=_lan_kb(name, allow),
+    )
+
+
+@router.callback_query(F.data.startswith("peer:lanX:"))
+@admin_only
+async def cb_peer_lan_toggle(call: CallbackQuery) -> None:
+    await call.answer("⏳")
+    name, dstip = call.data[len("peer:lanX:"):].rsplit(":", 1)
+    peer = next((p for p in peers_list() if p["name"] == name), None)
+    if not peer:
+        await call.message.edit_text("Peer не найден.")
+        return
+    allow = list(peer.get("lan_allow") or [])
+    if dstip in allow:
+        allow.remove(dstip)
+    else:
+        allow.append(dstip)
+    p = peer_update(name, lan_allow=allow)
+    if not p:
+        await call.message.edit_text("Peer не найден.")
+        return
+    # Применяем iptables-правила inter-client из обновлённого peers.json
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-interclient.sh", timeout=15)
+    if rc != 0:
+        LOG.warning("interclient apply rc=%s err=%s", rc, (err or out)[:300])
+    await safe_edit_text(
+        call.message, _lan_text(name, p["ip"], allow),
+        parse_mode="HTML", reply_markup=_lan_kb(name, allow),
+    )
 
 
 # ─── Note ────────────────────────────────────────────────────────────────────

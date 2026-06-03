@@ -514,6 +514,10 @@ iptables -A FORWARD -i awg0 ! -o awg+ -m comment --comment "awg-cascade-killsw" 
 # --- mangle FORWARD: MSS clamp для TCP (двойная инкапсуляция → нужно PMTU) ---
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment "awg-cascade-mss" -j TCPMSS --clamp-mss-to-pmtu
 
+# --- per-peer inter-client LAN access (whitelist src→dst + default-deny /24) ---
+# Применяет правила awg-lan из peers.json поверх базовых (должно идти ПОСЛЕ MARK).
+[ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
+
 # Persist
 iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 IPTEOF
@@ -678,6 +682,7 @@ REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog-postboot.sh /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-iprule.sh            /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-interclient.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
