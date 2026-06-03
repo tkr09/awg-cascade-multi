@@ -44,20 +44,35 @@ flush_chain "" FORWARD
 
 [ -f "$PEERS" ] || { log "no peers.json — only default-deny applied"; }
 
-# ─── 2. Default-deny: awg0 → внутренняя /24 (жёсткий DROP) ─────────────────────
-# Ставим в начало FORWARD; разрешающие пары вставим ВЫШЕ него (шаг 3).
-iptables -I FORWARD 1 -i awg0 -d "$CN" -m comment --comment "awg-lan-deny" -j DROP
+# ─── 2. База: default-deny + established-ответы ──────────────────────────────
+# Порядок в цепочках (сверху вниз) после всех вставок:
+#   [пары NEW src→dst] [established-ответы к /24] [default-deny] [базовые правила]
+# Вставляем через -I 1 в ОБРАТНОМ порядке (deny → established → пары).
+#
+# Зачем established: трафик пары двусторонний. NEW src→dst разрешает пара (шаг 3),
+# но ОБРАТНЫЙ пакет (dst→src, напр. SYN-ACK) иначе попадёт под общий MARK 0x1 и
+# уедет в exit. Поэтому established-ответы к внутренней /24 — RETURN (локально) +
+# ACCEPT. Это безопасно: established-стейт существует только для потоков, чьё
+# NEW-направление уже разрешено whitelist'ом (для остальных NEW к /24 — DROP).
 
-# ─── 3. Per-pair allow (src → dst) ───────────────────────────────────────────
+# FORWARD: сначала deny (окажется ниже), затем established-accept (выше deny)
+iptables -I FORWARD 1 -i awg0 -d "$CN" -m comment --comment "awg-lan-deny" -j DROP
+iptables -I FORWARD 1 -i awg0 -d "$CN" -m conntrack --ctstate ESTABLISHED,RELATED \
+    -m comment --comment "awg-lan" -j ACCEPT
+# mangle: established-ответы к /24 — RETURN (выше MARK 0x1)
+iptables -t mangle -I PREROUTING 1 -i awg0 -d "$CN" -m conntrack --ctstate ESTABLISHED,RELATED \
+    -m comment --comment "awg-lan" -j RETURN
+
+# ─── 3. Per-pair allow (NEW src → dst) ───────────────────────────────────────
 if [ -f "$PEERS" ]; then
     jq -r '.[] | select(.lan_allow != null and (.lan_allow | length) > 0)
                  | .ip as $s | .lan_allow[] | "\($s) \(.)"' "$PEERS" 2>/dev/null \
     | while read -r src dst; do
         [ -n "$src" ] && [ -n "$dst" ] || continue
-        # mangle: маршрут локальный (RETURN перед MARK 0x1)
+        # mangle: маршрут локальный (RETURN перед MARK 0x1) — вставляем выше established
         iptables -t mangle -I PREROUTING 1 -i awg0 -s "$src/32" -d "$dst/32" \
             -m comment --comment "awg-lan" -j RETURN
-        # filter: разрешить форвард пары (вставляем выше default-deny)
+        # filter: разрешить форвард пары (выше established/deny)
         iptables -I FORWARD 1 -i awg0 -s "$src/32" -d "$dst/32" \
             -m comment --comment "awg-lan" -j ACCEPT
         log "allow $src -> $dst"
