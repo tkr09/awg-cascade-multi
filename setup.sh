@@ -483,6 +483,10 @@ flush_our_rules() {
     iptables -t mangle -F OUTPUT 2>/dev/null || true
 }
 
+# Снять прошлые наши правила перед повторным применением — иначе они
+# дублируются при каждом прогоне (boot/postboot/ручной перезапуск).
+flush_our_rules
+
 # --- mangle: MARK клиентского трафика для ECMP routing ---
 # 0x1 = трафик клиентов awg0 → table 100 (ECMP exits)
 iptables -t mangle -A PREROUTING -i awg0 -m comment --comment "awg-cascade" -j MARK --set-mark 0x1
