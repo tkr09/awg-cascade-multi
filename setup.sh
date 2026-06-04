@@ -330,6 +330,13 @@ EOF
 sysctl --system -q >/dev/null 2>&1 || true
 ok "sysctl применён (ip_forward, fib_multipath_hash_policy=1 для L4 ECMP)"
 
+# gai.conf: предпочитать IPv4. Каскад IPv4-only; если у домена есть AAAA, а
+# рабочего IPv6 нет — getaddrinfo вернёт IPv6 первым, и бот/клиент уйдут в
+# несуществующий IPv6-маршрут (таймаут). Префер IPv4 это снимает.
+grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null \
+    || echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf
+ok "gai.conf: предпочтение IPv4 (каскад IPv4-only)"
+
 mkdir -p "$CONFIG_DIR" "$PEERS_DIR" "$EXITS_DIR" "$SSH_DIR" "$WG_DIR"
 chown -R "$BOT_USER:$BOT_USER" "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR" "$PEERS_DIR" "$EXITS_DIR" "$SSH_DIR"

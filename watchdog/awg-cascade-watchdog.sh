@@ -392,6 +392,19 @@ while true; do
     # Применяем per-peer pinned маршруты (раз в тик — копеечно)
     apply_peer_routing
 
+    # Страховка ip rules: policy-routing (uidrange/fwmark → table 100) может
+    # быть стёрт переконфигурацией сети В РАНТАЙМЕ (netplan/networkd при
+    # apt-upgrade флашит ip rules; table 100 при этом остаётся). Без них
+    # трафик бота (uid) и клиентов (fwmark) уходит МИМО каскада напрямую →
+    # блокировки ТСПУ → бот «висит». iprule.service применяет только на boot,
+    # поэтому проверяем и в цикле.
+    if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
+        log "FAIL: ip rules каскада пропали — переприменяю iprule.sh"
+        [ -x /usr/local/sbin/awg-cascade-iprule.sh ] && /usr/local/sbin/awg-cascade-iprule.sh
+        ntfy "⚠️ ip rules восстановлены" "high" "warning" \
+            "policy-routing (→ table 100) пропадал и был переприменён.\nХост: $(hostname)"
+    fi
+
     # Пересчёт весов раз в 5 мин
     if [ $(( TICK_COUNT % WEIGHT_RECALC_TICKS )) -eq 0 ]; then
         recompute_weights
