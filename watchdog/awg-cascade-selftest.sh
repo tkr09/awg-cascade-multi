@@ -95,3 +95,10 @@ load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
 [ "${disk:-0}" -ge 90 ] && emit WARN "Диск /" "${disk}%" || emit OK "Диск /" "${disk}% занято"
 [ "${ram:-0}" -ge 90 ]  && emit WARN "RAM" "${ram}%"     || emit OK "RAM" "${ram}% занято"
 emit OK "Load / uptime" "load1 ${load1:-?} · up $(uptime -p 2>/dev/null | sed 's/^up //')"
+
+# ─── Версия (version-stamp) ──────────────────────────────────────────────────
+if [ -f /etc/awg-cascade/version ]; then
+    emit OK "Версия" "$(cut -d' ' -f1-2 /etc/awg-cascade/version)"
+else
+    emit WARN "Версия" "stamp отсутствует (старая установка — нужен sync)"
+fi

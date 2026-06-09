@@ -659,6 +659,12 @@ chmod 600 "$CONFIG_FILE"
 chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
 ok "Config файл сохранён: $CONFIG_FILE"
 
+# version-stamp — какой ref/commit развёрнут (для drift-guard и бота)
+_VER=$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null || echo "unknown")
+_COMMIT=$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo "?")
+printf '%s %s %s\n' "$_VER" "$_COMMIT" "$(date -Iseconds)" > /etc/awg-cascade/version
+ok "Version-stamp: $_VER ($_COMMIT)"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 8: systemd units
 # ═════════════════════════════════════════════════════════════════════════════
@@ -715,6 +721,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-interclient.sh       /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-alert.sh             /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-ssh-alert.sh         /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-selftest.sh          /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-sync.sh             /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
