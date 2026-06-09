@@ -714,6 +714,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-iprule.sh            /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-interclient.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-alert.sh             /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-ssh-alert.sh         /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-selftest.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/

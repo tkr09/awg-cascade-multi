@@ -9,8 +9,9 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from common import (admin_only, cfg, fmt_age, name_to_flag, peers_list,
-                    ping_bar, safe_edit_text, state_load, status_icon)
+from common import (admin_only, cfg, fmt_age, html_escape, name_to_flag,
+                    peers_list, ping_bar, safe_edit_text, state_load,
+                    status_icon, sudo_run)
 
 LOG = logging.getLogger("awg.main_menu")
 router = Router(name="main_menu")
@@ -26,8 +27,9 @@ def main_kb(state: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"👤 Peers ({len(peers_list())})", callback_data="peers:list")],
         [
             InlineKeyboardButton(text="📊 Полный статус", callback_data="status:full"),
-            InlineKeyboardButton(text="🔄 Refresh",       callback_data="main"),
+            InlineKeyboardButton(text="🩺 Диагностика",    callback_data="diag"),
         ],
+        [InlineKeyboardButton(text="🔄 Refresh",          callback_data="main")],
         [InlineKeyboardButton(text="➕ Добавить exit",  callback_data="exits:add")],
         [InlineKeyboardButton(text="➕ Добавить peer",  callback_data="peers:add")],
         [InlineKeyboardButton(text="⚙️ Настройки",      callback_data="settings:main")],
@@ -105,6 +107,45 @@ async def cb_close(call: CallbackQuery) -> None:
         await call.message.delete()
     except Exception:
         pass
+
+
+# ─── Диагностика (активные проверки локальной ноды) ──────────────────────────
+
+@router.callback_query(F.data == "diag")
+@admin_only
+async def cb_diag(call: CallbackQuery) -> None:
+    await call.answer("🩺 Проверяю…")
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-selftest.sh", timeout=30)
+    icon = {"OK": "✅", "WARN": "⚠️", "FAIL": "🔴"}
+    rows = [l for l in out.splitlines() if "\t" in l]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Повторить", callback_data="diag"),
+        InlineKeyboardButton(text="🏠 Меню",      callback_data="main"),
+    ]])
+
+    if rc != 0 and not rows:
+        await safe_edit_text(
+            call.message,
+            f"🔴 <b>Диагностика не выполнилась</b>\n<pre>{html_escape((err or out)[:400])}</pre>",
+            parse_mode="HTML", reply_markup=kb,
+        )
+        return
+
+    n_fail = sum(1 for l in rows if l.startswith("FAIL"))
+    n_warn = sum(1 for l in rows if l.startswith("WARN"))
+    if n_fail:
+        head = f"🔴 Проблемы: {n_fail} fail" + (f", {n_warn} warn" if n_warn else "")
+    elif n_warn:
+        head = f"⚠️ Предупреждений: {n_warn}"
+    else:
+        head = "✅ Всё в норме"
+
+    body = [f"<b>🩺 Диагностика</b>  <code>{cfg().ru_public_ip}</code>", "", head, ""]
+    for l in rows:
+        st, sec, det = (l.split("\t", 2) + ["", ""])[:3]
+        body.append(f"{icon.get(st, '•')} <b>{html_escape(sec)}</b>: {html_escape(det)}")
+    await safe_edit_text(call.message, "\n".join(body), parse_mode="HTML", reply_markup=kb)
 
 
 # ─── Full status ─────────────────────────────────────────────────────────────
