@@ -2,6 +2,7 @@
 Description=AWG Cascade Multi — Telegram bot
 After=network-online.target awg-cascade-watchdog.service
 Wants=network-online.target
+OnFailure=awg-cascade-alert@%n.service
 
 [Service]
 Type=simple

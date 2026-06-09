@@ -1,0 +1,6 @@
+[Unit]
+Description=AWG Cascade alert for failed unit %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awg-cascade-alert.sh "unit-%i" 600 "🛑 Юнит упал: %i" urgent rotating_light "systemd-юнит %i перешёл в failed."

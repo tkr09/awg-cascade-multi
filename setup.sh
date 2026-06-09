@@ -646,6 +646,14 @@ TG_CHAT_ID="$TG_CHAT_ID"
 NTFY_URL="$NTFY_URL"
 NTFY_TOPIC="$NTFY_TOPIC"
 BOT_USER="$BOT_USER"
+
+# ─── Alerting (A) ───
+# HC_PING_URL: создай check на healthchecks.io → вставь ping-URL (dead-man). Пусто = выкл.
+HC_PING_URL=""
+DISK_ALERT_PCT=90
+RAM_ALERT_PCT=90
+LOAD_ALERT_MULT=2
+SSH_ALERT=1
 EOF
 chmod 600 "$CONFIG_FILE"
 chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
@@ -704,6 +712,8 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog.sh          /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog-postboot.sh /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-iprule.sh            /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-interclient.sh       /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-alert.sh             /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-ssh-alert.sh         /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
@@ -758,6 +768,14 @@ header "8d. systemd units + запуск"
 install -m 644 "$REPO_DIR/systemd/awg-cascade-watchdog.service" /etc/systemd/system/
 install -m 644 "$REPO_DIR/systemd/awg-cascade-postboot.service" /etc/systemd/system/
 install -m 644 "$REPO_DIR/systemd/awg-cascade-bot.service"      /etc/systemd/system/
+install -m 644 "$REPO_DIR/systemd/awg-cascade-alert@.service"   /etc/systemd/system/
+
+# SSH-логин алерт (pam_exec hook). optional = вход не блокируется если скрипт
+# отсутствует/упал. Только интерактив (pts), дедуп per user@host.
+if ! grep -q "awg-cascade-ssh-alert" /etc/pam.d/sshd 2>/dev/null; then
+    echo "session    optional   pam_exec.so /usr/local/sbin/awg-cascade-ssh-alert.sh" >> /etc/pam.d/sshd
+    ok "SSH-login алерт добавлен в /etc/pam.d/sshd"
+fi
 
 # Logrotate (мог быть уже создан inline в Phase 2 — перетрём shipped версией если есть)
 if [ -f "$REPO_DIR/systemd/awg-cascade.logrotate" ]; then

@@ -33,6 +33,19 @@ HANDSHAKE_MAX=180          # сек, после этого reconnect
 WEIGHT_RECALC_TICKS=30     # 30 тиков * 10с = 5 мин
 WEIGHT_DIFF_PERCENT=20     # пересчёт весов только если разница > 20%
 
+# ─── Alerting (A) — значения можно переопределить в /etc/awg-cascade/config ──
+: "${BOT_USER:=awgbot}"
+: "${HC_PING_URL:=}"               # healthchecks.io ping URL (dead-man); пусто = выкл
+: "${DISK_ALERT_PCT:=90}"          # алерт если занято / >= N%
+: "${RAM_ALERT_PCT:=90}"           # алерт если RAM >= N%
+: "${LOAD_ALERT_MULT:=2}"          # алерт если load1 > MULT * nproc
+: "${RES_COOLDOWN:=21600}"         # 6ч между повторами level-алертов (disk/ram/load)
+: "${EGRESS_CHECK_URL:=https://api.telegram.org}"
+ALERT=/usr/local/sbin/awg-cascade-alert.sh
+NPROC=$(nproc 2>/dev/null || echo 1)
+EGRESS_FAILS=0
+EGRESS_STATE=up
+
 mkdir -p "$(dirname "$LOG")"
 exec >>"$LOG" 2>&1
 
@@ -262,6 +275,56 @@ recompute_weights() {
     $need_apply && apply_route
 }
 
+# ─── Alerting (A): bot egress / ресурсы / healthchecks dead-man ──────────────
+# Bot egress к Telegram через каскад (transition-алерт: state в памяти).
+check_bot_egress() {
+    local code
+    code=$(sudo -u "$BOT_USER" curl -s -o /dev/null -w '%{http_code}' \
+           --max-time 12 "$EGRESS_CHECK_URL" 2>/dev/null)
+    if [ -z "$code" ] || [ "$code" = "000" ]; then
+        EGRESS_FAILS=$(( EGRESS_FAILS + 1 ))
+        if [ "$EGRESS_FAILS" -ge 3 ] && [ "$EGRESS_STATE" = "up" ]; then
+            EGRESS_STATE=down
+            log "EGRESS DOWN (bot→Telegram, fails=$EGRESS_FAILS)"
+            "$ALERT" egress-down 0 "🔴 Бот не видит Telegram" urgent rotating_light \
+                "curl $EGRESS_CHECK_URL = ${code:-timeout} (через каскад). Смотри ip rules / exits / egress."
+        fi
+    else
+        if [ "$EGRESS_STATE" = "down" ]; then
+            EGRESS_STATE=up
+            log "EGRESS UP (bot→Telegram restored, code=$code)"
+            "$ALERT" egress-up 0 "🟢 Egress восстановлен" high white_check_mark \
+                "Бот снова видит Telegram (HTTP $code)."
+        fi
+        EGRESS_FAILS=0
+    fi
+}
+
+# Disk / RAM / load — level-алерты с cooldown.
+check_resources() {
+    local disk ram load1
+    disk=$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
+    ram=$(free 2>/dev/null | awk '/^Mem:/{printf "%d", $3*100/$2}')
+    load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+    [ -n "$disk" ] && [ "$disk" -ge "$DISK_ALERT_PCT" ] && \
+        "$ALERT" disk-high "$RES_COOLDOWN" "⚠️ Диск ${disk}%" high warning \
+            "Занято ${disk}% на / (порог ${DISK_ALERT_PCT}%)."
+    [ -n "$ram" ] && [ "$ram" -ge "$RAM_ALERT_PCT" ] && \
+        "$ALERT" ram-high "$RES_COOLDOWN" "⚠️ RAM ${ram}%" high warning \
+            "Память ${ram}% (порог ${RAM_ALERT_PCT}%)."
+    if [ -n "$load1" ] && awk -v l="$load1" -v t="$(( LOAD_ALERT_MULT * NPROC ))" 'BEGIN{exit !(l>t)}'; then
+        "$ALERT" load-high "$RES_COOLDOWN" "⚠️ Load ${load1}" high warning \
+            "load1=${load1} > ${LOAD_ALERT_MULT}×${NPROC} ядер."
+    fi
+}
+
+# Dead-man: пинг healthchecks.io через eth0. Пропал пинг → их сервис алертит.
+healthcheck_ping() {
+    [ -n "$HC_PING_URL" ] || return 0
+    curl --interface eth0 -fsS -m 10 "$HC_PING_URL" >/dev/null 2>&1 \
+        || log "WARN: healthcheck ping failed"
+}
+
 # Postboot verify (вызывается один раз при старте)
 postboot_check() {
     sleep 3
@@ -403,6 +466,16 @@ while true; do
         [ -x /usr/local/sbin/awg-cascade-iprule.sh ] && /usr/local/sbin/awg-cascade-iprule.sh
         ntfy "⚠️ ip rules восстановлены" "high" "warning" \
             "policy-routing (→ table 100) пропадал и был переприменён.\nХост: $(hostname)"
+    fi
+
+    # A: алертинг. Bot-egress + healthchecks dead-man раз в ~60с (6 тиков),
+    # ресурсы раз в ~5 мин (30 тиков).
+    if [ $(( TICK_COUNT % 6 )) -eq 0 ]; then
+        check_bot_egress
+        healthcheck_ping
+    fi
+    if [ $(( TICK_COUNT % 30 )) -eq 0 ]; then
+        check_resources
     fi
 
     # Пересчёт весов раз в 5 мин
