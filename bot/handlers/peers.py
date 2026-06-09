@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import re
+import time
 from pathlib import Path
 
 import qrcode
@@ -36,6 +37,116 @@ class PeerNoteFSM(StatesGroup):
 _close_kb = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="❌ Закрыть", callback_data="close"),
 ]])
+
+# ─── Traffic history (D) ─────────────────────────────────────────────────────
+# watchdog копит /var/lib/awg-cascade/traffic.csv (epoch,pubkey,rx,tx) раз в 5 мин.
+TRAFFIC_CSV = Path("/var/lib/awg-cascade/traffic.csv")
+_SPARK = "▁▂▃▄▅▆▇█"
+# win_key → (window_sec, n_buckets, человекочитаемая подпись)
+_TRAFFIC_WINDOWS = {
+    "24h": (86_400,  24, "24 часа · бакет 1ч"),
+    "7d":  (604_800, 28, "7 дней · бакет 6ч"),
+}
+
+
+def _read_traffic(pubkey: str) -> list[tuple[int, int, int]]:
+    """Вернуть отсортированные (epoch, rx, tx) для данного pubkey из CSV."""
+    if not TRAFFIC_CSV.exists():
+        return []
+    rows: list[tuple[int, int, int]] = []
+    try:
+        for line in TRAFFIC_CSV.read_text().splitlines():
+            parts = line.split(",")
+            if len(parts) < 4 or parts[1] != pubkey:
+                continue
+            try:
+                rows.append((int(parts[0]), int(parts[2]), int(parts[3])))
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def _spark(values: list[float], length: int) -> str:
+    """Unicode-спарклайн из блочных символов, масштаб к максимуму."""
+    if not values:
+        return "—"
+    mx = max(values)
+    if mx <= 0:
+        return _SPARK[0] * length
+    out = []
+    for v in values:
+        idx = int(v / mx * (len(_SPARK) - 1) + 0.5)
+        out.append(_SPARK[min(max(idx, 0), len(_SPARK) - 1)])
+    return "".join(out)
+
+
+def _fmt_rate(bytes_per_sec: float) -> str:
+    """Байты/с → человекочитаемо."""
+    return f"{fmt_bytes(bytes_per_sec)}/s"
+
+
+def _render_traffic(peer: dict, win_key: str) -> str:
+    """HTML со спарклайнами скорости ↓/↑ per-peer за выбранное окно."""
+    window, nb, label = _TRAFFIC_WINDOWS.get(win_key, _TRAFFIC_WINDOWS["24h"])
+    pubkey = peer["pubkey"]
+    rows = _read_traffic(pubkey)
+    now = int(time.time())
+    start = now - window
+    bsec = window / nb
+
+    rx_b = [0.0] * nb
+    tx_b = [0.0] * nb
+    total_rx = total_tx = 0
+    pairs = 0
+    for (t0, rx0, tx0), (t1, rx1, tx1) in zip(rows, rows[1:]):
+        if t1 < start or t1 > now:
+            continue
+        pairs += 1
+        drx = max(0, rx1 - rx0)
+        dtx = max(0, tx1 - tx0)
+        idx = min(max(int((t1 - start) / bsec), 0), nb - 1)
+        rx_b[idx] += drx
+        tx_b[idx] += dtx
+        total_rx += drx
+        total_tx += dtx
+
+    header = [
+        f"<b>📈 Трафик: {peer['name']}</b>  <code>{peer['ip']}</code>",
+        f"<i>{label}</i>",
+        "",
+    ]
+    if pairs == 0:
+        header.append(
+            "<i>Пока нет данных за это окно.</i>\n"
+            "Сбор идёт раз в 5 мин — загляни позже либо выбери другое окно."
+        )
+        return "\n".join(header)
+
+    peak_rx = max(rx_b) / bsec
+    peak_tx = max(tx_b) / bsec
+    body = [
+        f"↓ rx  <code>{_spark(rx_b, nb)}</code>",
+        f"    Σ <b>{fmt_bytes(total_rx)}</b>  ·  пик <b>{_fmt_rate(peak_rx)}</b>",
+        f"↑ tx  <code>{_spark(tx_b, nb)}</code>",
+        f"    Σ <b>{fmt_bytes(total_tx)}</b>  ·  пик <b>{_fmt_rate(peak_tx)}</b>",
+    ]
+    return "\n".join(header + body)
+
+
+def _traffic_kb(name: str, win_key: str) -> InlineKeyboardMarkup:
+    def lbl(k: str, text: str) -> str:
+        return ("✅ " if k == win_key else "") + text
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=lbl("24h", "24ч"), callback_data=f"peer:gr:{name}:24h"),
+            InlineKeyboardButton(text=lbl("7d", "7д"),   callback_data=f"peer:gr:{name}:7d"),
+            InlineKeyboardButton(text="🔄",             callback_data=f"peer:gr:{name}:{win_key}"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"peer:menu:{name}")],
+    ])
 
 
 def _peer_conf_path(name: str) -> Path:
@@ -87,7 +198,10 @@ def peer_menu_kb(name: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📝 Заметка",    callback_data=f"peer:note:{name}"),
             InlineKeyboardButton(text="🔁 Rotate",     callback_data=f"peer:rotate:{name}"),
         ],
-        [InlineKeyboardButton(text="🏠 LAN-доступ",    callback_data=f"peer:lan:{name}")],
+        [
+            InlineKeyboardButton(text="🏠 LAN-доступ",  callback_data=f"peer:lan:{name}"),
+            InlineKeyboardButton(text="📈 Трафик",      callback_data=f"peer:gr:{name}:24h"),
+        ],
         [InlineKeyboardButton(text="🗑 Удалить",       callback_data=f"peer:rm:{name}")],
         [InlineKeyboardButton(text="◀️ К списку",     callback_data="peers:list")],
     ])
@@ -238,6 +352,26 @@ async def cb_peer_conf(call: CallbackQuery) -> None:
         f"<b>{name}.conf:</b>\n<pre>{html_escape(conf_text)}</pre>",
         parse_mode="HTML",
         reply_markup=_close_kb,
+    )
+
+
+# ─── Traffic graph (unicode sparkline) ───────────────────────────────────────
+
+@router.callback_query(F.data.startswith("peer:gr:"))
+@admin_only
+async def cb_peer_graph(call: CallbackQuery) -> None:
+    await call.answer()
+    rest = call.data[len("peer:gr:"):]
+    name, _, win_key = rest.rpartition(":")
+    if win_key not in _TRAFFIC_WINDOWS:
+        name, win_key = rest, "24h"
+    peer = next((p for p in peers_list() if p["name"] == name), None)
+    if not peer:
+        await safe_edit_text(call.message, "Peer не найден.", reply_markup=peers_kb(peers_list()))
+        return
+    await safe_edit_text(
+        call.message, _render_traffic(peer, win_key),
+        parse_mode="HTML", reply_markup=_traffic_kb(name, win_key),
     )
 
 

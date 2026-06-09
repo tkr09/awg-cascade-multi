@@ -654,6 +654,10 @@ DISK_ALERT_PCT=90
 RAM_ALERT_PCT=90
 LOAD_ALERT_MULT=2
 SSH_ALERT=1
+
+# ─── Traffic graphs (D) ───
+# Сколько суток хранить историю трафика per-peer (/var/lib/awg-cascade/traffic.csv).
+TRAFFIC_RETENTION_DAYS=14
 EOF
 chmod 600 "$CONFIG_FILE"
 chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
@@ -722,6 +726,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-alert.sh             /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-ssh-alert.sh         /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-selftest.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-sync.sh             /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-traffic-sample.sh    /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/

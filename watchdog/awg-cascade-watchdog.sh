@@ -476,6 +476,9 @@ while true; do
     fi
     if [ $(( TICK_COUNT % 30 )) -eq 0 ]; then
         check_resources
+        # D: сэмплируем счётчики трафика per-peer в CSV (для графиков в боте)
+        [ -x /usr/local/sbin/awg-cascade-traffic-sample.sh ] \
+            && /usr/local/sbin/awg-cascade-traffic-sample.sh
     fi
 
     # Пересчёт весов раз в 5 мин
