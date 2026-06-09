@@ -24,13 +24,13 @@ STATE=/etc/awg-cascade/state.json
 STATE_LOCK=/etc/awg-cascade/state.lock
 LOG=/var/log/awg-cascade-watchdog.log
 
-TICK_INTERVAL=5            # сек между тиками
+TICK_INTERVAL=10           # сек между тиками (1-ядерные VPS: меньше пробуждений)
 RING_SIZE=20               # последние N точек пинга
 DOWN_THRESHOLD=3           # 3 fail подряд → DOWN
 UP_THRESHOLD=2             # 2 success подряд → UP
 PING_TIMEOUT=2             # сек
 HANDSHAKE_MAX=180          # сек, после этого reconnect
-WEIGHT_RECALC_TICKS=60     # 60 тиков * 5с = 5 мин
+WEIGHT_RECALC_TICKS=30     # 30 тиков * 10с = 5 мин
 WEIGHT_DIFF_PERCENT=20     # пересчёт весов только если разница > 20%
 
 mkdir -p "$(dirname "$LOG")"

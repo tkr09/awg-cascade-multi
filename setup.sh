@@ -337,6 +337,16 @@ grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null \
     || echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf
 ok "gai.conf: предпочтение IPv4 (каскад IPv4-only)"
 
+# Легаси ifupdown (networking.service/ifup@) конфликтует с netplan/networkd:
+# двойное управление eth0 → failed-юниты + риск reflush ip rules при триггере.
+# Если eth0 ведёт networkd (есть netplan) — маскируем ifupdown, чтобы сетью
+# рулил ТОЛЬКО networkd. mask сеть не рестартит, текущий eth0 не трогается.
+if systemctl is-active --quiet systemd-networkd && ls /etc/netplan/*.yaml >/dev/null 2>&1; then
+    systemctl mask networking.service ifup@eth0.service >/dev/null 2>&1 || true
+    systemctl reset-failed networking.service ifup@eth0.service >/dev/null 2>&1 || true
+    ok "ifupdown замаскирован (eth0 под управлением networkd/netplan)"
+fi
+
 mkdir -p "$CONFIG_DIR" "$PEERS_DIR" "$EXITS_DIR" "$SSH_DIR" "$WG_DIR"
 chown -R "$BOT_USER:$BOT_USER" "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR" "$PEERS_DIR" "$EXITS_DIR" "$SSH_DIR"
