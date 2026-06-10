@@ -12,6 +12,7 @@ NAME="${1:-}"
 
 PUBKEY=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .pubkey' "$PEERS_JSON" 2>/dev/null)
 [ -z "$PUBKEY" ] || [ "$PUBKEY" = "null" ] && { echo "{\"error\":\"peer $NAME not found\"}"; exit 1; }
+PEER_IP=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .ip' "$PEERS_JSON" 2>/dev/null)
 
 # 1. Runtime: убрать peer из awg0
 awg set awg0 peer "$PUBKEY" remove
@@ -34,9 +35,20 @@ PYEOF
 # 3. Удалить .conf клиента
 rm -f "$PEERS_DIR/${NAME}.conf"
 
-# 4. peers.json
+# 4. peers.json — удаляем пира И вычищаем его IP из lan_allow остальных пиров
+#    (иначе освободившийся IP, отданный новому пиру, унаследует чужой LAN-доступ).
 TMP=$(mktemp)
-jq --arg n "$NAME" 'map(select(.name != $n))' "$PEERS_JSON" > "$TMP" && mv "$TMP" "$PEERS_JSON"
+jq --arg n "$NAME" --arg ip "$PEER_IP" '
+    map(select(.name != $n))
+    | map(if .lan_allow
+          then .lan_allow = (.lan_allow | map(select(. != $ip)))
+          else . end)
+' "$PEERS_JSON" > "$TMP" && mv "$TMP" "$PEERS_JSON"
 chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
+chmod 644 "$PEERS_JSON"
+
+# 5. Переприменяем inter-client whitelist — снимает iptables-пары удалённого пира
+#    (RETURN/ACCEPT), иначе они живут до следующего boot/тоггла.
+[ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
 
 echo "{\"ok\":true,\"name\":\"$NAME\",\"pubkey\":\"$PUBKEY\"}"

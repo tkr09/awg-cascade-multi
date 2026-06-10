@@ -31,7 +31,8 @@ FLOCK=/etc/awg-cascade/state.lock
     chmod 644 "$STATE"
 ) 200>"$FLOCK"
 
-# Пересобираем ECMP
-/usr/local/sbin/awg-cascade-route.sh 2>/dev/null || true
+# Триггерим watchdog: пересобрать peer-routing (снять pinned-правила на удалённый
+# exit). ECMP пересобирается каждый тик сам (apply_route увидит, что iface исчез).
+systemctl kill -s SIGUSR1 awg-cascade-watchdog 2>/dev/null || true
 
 echo "{\"ok\":true,\"interface\":\"$IFACE\"}"

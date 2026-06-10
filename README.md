@@ -55,9 +55,8 @@ setup-exit.sh                   # установка на exit (вызывает
 exit-side/
   awg-cascade-exit-warp.sh      # WARP toggle helper для exit
 watchdog/
-  awg-cascade-watchdog.sh       # monitoring + ECMP routing
+  awg-cascade-watchdog.sh       # monitoring + ECMP routing (+ traffic sampling)
   awg-cascade-watchdog-postboot.sh
-  awg-cascade-route.sh          # перестройка ECMP table 100
   awg-cascade-iprule.sh         # ip rule (uidrange + fwmark)
   awg-cascade-peer-add.sh       # создать peer (от бота)
   awg-cascade-peer-remove.sh

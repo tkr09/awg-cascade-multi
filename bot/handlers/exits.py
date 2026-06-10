@@ -85,7 +85,6 @@ def exit_menu_kb(iface: str, warp: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📝 Заметка", callback_data=f"exit:note:{iface}"),
             InlineKeyboardButton(text="✏️ Имя",     callback_data=f"exit:rename:{iface}"),
         ],
-        [InlineKeyboardButton(text="🔁 Rotate (anti-DPI)", callback_data=f"exit:rotate:{iface}")],
         [InlineKeyboardButton(text="🗑 Удалить exit", callback_data=f"exit:rm:{iface}")],
         [InlineKeyboardButton(text="◀️ К списку",    callback_data="exits:list")],
     ])
@@ -136,7 +135,7 @@ def _render_exit_status(e: dict) -> str:
         lines.append(f"<i>Watchdog ещё не собрал статистику.</i>")
 
     if note:
-        lines += ["", f"📝 <i>{note}</i>"]
+        lines += ["", f"📝 <i>{html_escape(note)}</i>"]
     return "\n".join(lines)
 
 
@@ -243,7 +242,7 @@ async def cb_exit_note(call: CallbackQuery, state: FSMContext) -> None:
     st = state_load()
     e = _get_exit(st, iface)
     cur_note = e.get("note", "") if e else ""
-    cur_text = f"<i>«{cur_note}»</i>" if cur_note else "<i>(пусто)</i>"
+    cur_text = f"<i>«{html_escape(cur_note)}»</i>" if cur_note else "<i>(пусто)</i>"
 
     await state.set_state(NoteFSM.waiting_text)
     await state.update_data(iface=iface)
@@ -409,114 +408,6 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
         f"{flag} <b>{e['name']}</b>: WARP → <b>{new_warp.upper()}</b>{suffix}",
         parse_mode="HTML",
         reply_markup=exit_menu_kb(iface, new_warp),
-    )
-
-
-# ─── Rotate exit (anti-DPI) ──────────────────────────────────────────────────
-
-@router.callback_query(F.data.startswith("exit:rotate:"))
-@admin_only
-async def cb_exit_rotate(call: CallbackQuery) -> None:
-    await call.answer()
-    iface = call.data[len("exit:rotate:"):]
-    e = _get_exit(state_load(), iface)
-    if not e:
-        return
-    flag = name_to_flag(e.get("name", ""))
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎭 Обфускация (H1-H4)", callback_data=f"exit:rotate-go:{iface}:obfuscation")],
-        [InlineKeyboardButton(text="🔑 Ключи (privkeys + PSK)", callback_data=f"exit:rotate-go:{iface}:keys")],
-        [InlineKeyboardButton(text="⚡ Всё (обфускация + ключи)", callback_data=f"exit:rotate-go:{iface}:all")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"exit:menu:{iface}")],
-    ])
-    await call.message.edit_text(
-        f"<b>🔁 Rotate exit: {flag} {e['name']}</b>  ({iface})\n\n"
-        f"Главное оружие против ТСПУ: RU↔Exit-туннель имеет фиксированную DPI-сигнатуру "
-        f"(H1-H4 + S1-S4). Если её утечка / mass-fingerprinting → детектят.\n\n"
-        f"<b>🎭 Обфускация</b>: новые H1-H4. Ключи не меняются. Самое лёгкое — клиенты не пострадают.\n"
-        f"<b>🔑 Ключи</b>: новые privkeys RU+Exit + PSK. Если ключи могли утечь.\n"
-        f"<b>⚡ Всё</b>: и то и другое. Максимум.\n\n"
-        f"Во всех режимах: ~5-10 сек downtime в самом туннеле. Клиенты которые сейчас "
-        f"в этот exit (или Auto-ECMP) переключатся на другие exits на время — "
-        f"watchdog подхватит. После rotate → handshake восстановится → exit опять в ECMP.",
-        parse_mode="HTML", reply_markup=kb,
-    )
-
-
-@router.callback_query(F.data.startswith("exit:rotate-go:"))
-@admin_only
-async def cb_exit_rotate_go(call: CallbackQuery) -> None:
-    await call.answer("⏳ Rotating…")
-    parts = call.data.split(":", 3)
-    _, _, iface, mode = parts
-    e = _get_exit(state_load(), iface)
-    if not e:
-        return
-    flag = name_to_flag(e.get("name", ""))
-
-    await call.message.edit_text(
-        f"⏳ {flag} <b>{e['name']}</b>: rotate <code>{mode}</code>…\n\n"
-        f"Обновляю exit-сторону, потом RU-сторону, перезапускаю awg, жду handshake.",
-        parse_mode="HTML",
-    )
-
-    out, err, rc = await sudo_run(
-        "/usr/local/sbin/awg-cascade-exit-rotate.sh", iface, mode, timeout=45,
-    )
-    if rc != 0:
-        await safe_edit_text(
-            call.message,
-            f"❌ Rotate failed:\n<pre>{html_escape((err or out)[:600])}</pre>",
-            parse_mode="HTML",
-            reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
-        )
-        return
-
-    try:
-        result = json.loads(out)
-    except json.JSONDecodeError:
-        await safe_edit_text(
-            call.message,
-            f"❌ Не-JSON ответ:\n<pre>{html_escape(out[:500])}</pre>",
-            parse_mode="HTML",
-            reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
-        )
-        return
-
-    if not result.get("ok"):
-        await safe_edit_text(
-            call.message,
-            f"❌ {result.get('error', 'unknown')}",
-            parse_mode="HTML",
-            reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
-        )
-        return
-
-    hs_ok = result.get("handshake_ok", False)
-    changes = ", ".join(result.get("changes", []))
-
-    # Свежий state
-    new_state = state_load()
-    new_e = _get_exit(new_state, iface)
-    status_text = await _render_status_after_rotate(new_e, mode, changes, hs_ok)
-
-    await safe_edit_text(
-        call.message,
-        status_text, parse_mode="HTML",
-        reply_markup=exit_menu_kb(iface, new_e.get("warp_state", "off")),
-    )
-
-
-async def _render_status_after_rotate(e: dict, mode: str, changes: str, hs_ok: bool) -> str:
-    flag = name_to_flag(e.get("name", ""))
-    hs_icon = "✅" if hs_ok else "⏳"
-    return (
-        f"🔁 <b>{flag} {e['name']}: rotate done</b>\n\n"
-        f"Mode: <code>{mode}</code>\n"
-        f"Changed: <code>{changes}</code>\n"
-        f"Handshake: {hs_icon} {'OK' if hs_ok else 'wait (может занять ~30s)'}\n\n"
-        f"Watchdog сам подхватит новое состояние и обновит ECMP.\n"
-        f"Текущее состояние в полном статусе ↓"
     )
 
 

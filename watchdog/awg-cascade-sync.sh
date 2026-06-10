@@ -63,6 +63,22 @@ for f in "$TMP"/repo/watchdog/awg-cascade-*.sh; do
     sync_file "$f" "/usr/local/sbin/$(basename "$f")" 755
 done
 
+# Орфаны: скрипты на ноде, которых больше нет в репо (удалённые фичи). Защищаем
+# те, что setup.sh генерит inline и в watchdog/ их НЕТ (иначе снесём kill-switch).
+PROTECT_SH="awg-cascade-iptables.sh awg-cascade-iprule.sh"
+for dst in /usr/local/sbin/awg-cascade-*.sh; do
+    [ -e "$dst" ] || continue
+    base=$(basename "$dst")
+    case " $PROTECT_SH " in *" $base "*) continue ;; esac
+    [ -f "$TMP/repo/watchdog/$base" ] && continue
+    drift=$(( drift + 1 ))
+    if [ "$CHECK" = "1" ]; then
+        echo "  ОРФАН: $dst (нет в репо $VER)"
+    else
+        rm -f "$dst" && echo "  удалён орфан: $dst"
+    fi
+done
+
 echo "=== systemd-юниты ==="
 units_changed=0
 for f in "$TMP"/repo/systemd/awg-cascade-*.service; do
@@ -70,6 +86,23 @@ for f in "$TMP"/repo/systemd/awg-cascade-*.service; do
     before=$drift
     sync_file "$f" "/etc/systemd/system/$(basename "$f")" 644
     [ "$drift" -ne "$before" ] && units_changed=1
+done
+
+# Орфан-юниты: на ноде есть, в репо нет. Защищаем inline-генерируемые setup.sh
+# (iptables/iprule.service) — их в репо нет, но они критичны для boot.
+PROTECT_UNIT="awg-cascade-iptables.service awg-cascade-iprule.service"
+for dst in /etc/systemd/system/awg-cascade-*.service; do
+    [ -e "$dst" ] || continue
+    base=$(basename "$dst")
+    case " $PROTECT_UNIT " in *" $base "*) continue ;; esac
+    [ -f "$TMP/repo/systemd/$base" ] && continue
+    drift=$(( drift + 1 )); units_changed=1
+    if [ "$CHECK" = "1" ]; then
+        echo "  ОРФАН-ЮНИТ: $dst (нет в репо $VER)"
+    else
+        systemctl disable --now "$base" >/dev/null 2>&1 || true
+        rm -f "$dst" && echo "  удалён орфан-юнит: $dst"
+    fi
 done
 
 echo "=== sudoers (каноничный) ==="

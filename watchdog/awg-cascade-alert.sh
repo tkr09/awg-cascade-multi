@@ -39,12 +39,15 @@ if [ "$COOLDOWN" -gt 0 ] && [ -f "$STAMP" ]; then
     last=$(cat "$STAMP" 2>/dev/null || echo 0)
     [ "$((now - last))" -lt "$COOLDOWN" ] && exit 0   # в окне cooldown → молчим
 fi
-echo "$now" > "$STAMP" 2>/dev/null || true
 
 [ -n "${NTFY_URL:-}" ] || exit 0
-curl --interface eth0 -s --max-time 8 \
+# Stamp пишем ТОЛЬКО после успешной доставки — иначе упавший curl «съест» весь
+# cooldown и алерт промолчит N часов, ни разу не дойдя.
+if curl --interface eth0 -s --max-time 8 \
     -H "Title: $TITLE" \
     -H "Priority: $PRIO" \
     -H "Tags: $TAGS" \
     -d "$(printf '%s\nHost: %s' "$BODY" "$(hostname)")" \
-    "$NTFY_URL" >/dev/null 2>&1 || true
+    "$NTFY_URL" >/dev/null 2>&1; then
+    echo "$now" > "$STAMP" 2>/dev/null || true
+fi

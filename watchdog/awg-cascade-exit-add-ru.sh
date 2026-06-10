@@ -128,8 +128,8 @@ FLOCK=/etc/awg-cascade/state.lock
 #  setup-exit.sh не добавляет наш SSH ключ. Это надо сделать отдельно.)
 # Бот добавит свой SSH-ключ через ssh_copy_id перед вызовом этого скрипта.
 
-# Триггерим watchdog чтобы пересобрал ECMP
+# Триггерим watchdog чтобы пересобрал peer-routing; ECMP он пересобирает каждый
+# тик сам (apply_route проверяет ip link show awgN — новый iface подхватится ≤10с).
 systemctl kill -s SIGUSR1 awg-cascade-watchdog 2>/dev/null || true
-/usr/local/sbin/awg-cascade-route.sh 2>/dev/null || true
 
 echo "{\"ok\":true,\"interface\":\"$IFACE\",\"name\":\"$NAME\"}"
