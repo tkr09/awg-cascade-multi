@@ -297,7 +297,7 @@ else
 fi
 
 # Sudoers. Wildcard на awg-cascade-*.sh — чтобы не ловить рассинхрон имён
-# (бот зовёт exit-add-ru.sh / exit-rotate.sh / peer-rotate.sh — их легко забыть
+# (бот зовёт exit-add-ru.sh / exit-remove.sh / peer-rotate.sh — их легко забыть
 # перечислить поимённо). Это выделенный appliance с нашим доверенным кодом бота,
 # поэтому даём широкий systemctl/ip — бот и так управляет WG/iptables/routing.
 # Команда без аргументов в sudoers = разрешён любой набор аргументов.
@@ -733,13 +733,8 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-add-ru.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-remove.sh       /usr/local/sbin/
-install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-rotate.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-bootstrap-exit.sh    /usr/local/sbin/
 ok "Helper-скрипты установлены в /usr/local/sbin/"
-
-# Заодно положим setup-exit.sh — пригодится когда будем поднимать новый exit
-install -m 755 "$REPO_DIR/setup-exit.sh" /usr/local/sbin/awg-cascade-setup-exit.sh
-ok "setup-exit.sh доступен как /usr/local/sbin/awg-cascade-setup-exit.sh"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 8c: deploy Telegram bot + venv
