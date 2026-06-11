@@ -365,6 +365,15 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 header "5. AmneziaWG awg0 + первый peer"
 
+# Идемпотентность: повторный запуск setup.sh (или install.sh, который делает
+# exec setup.sh) НЕ должен перегенерировать серверный ключ и переписать awg0.conf
+# — иначе ВСЕ существующие клиенты разом отвалятся, а awg0.conf схлопнется до
+# одного first-peer. Если awg0 уже настроен — пропускаем Phase 5 целиком.
+# Обновление кода/конфига на живой ноде идёт через awg-cascade-sync.sh, не тут.
+if [ -f "$WG_DIR/awg0.conf" ]; then
+    warn "awg0.conf уже существует — Phase 5 пропущена (ключи/пиры/peers.json не трогаю)"
+else
+
 # Генерируем v2.0 параметры (S1-S4 random + H1-H4 ranged monotonic + I1)
 SERVER_PRIVKEY=$(awg genkey)
 SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | awg pubkey)
@@ -476,6 +485,8 @@ jq --arg n "$FIRST_PEER" --arg ip "$PEER_IP" --arg pk "$PEER_PUBKEY" \
    "$PEERS_JSON" > "$PEERS_JSON.tmp" && mv "$PEERS_JSON.tmp" "$PEERS_JSON"
 chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
 ok "Peer '$FIRST_PEER' (IP $PEER_IP) добавлен"
+
+fi  # ── конец гарда идемпотентности Phase 5 (awg0.conf не существовал) ──
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 6: iptables (kill-switch + MARK + MASQUERADE)

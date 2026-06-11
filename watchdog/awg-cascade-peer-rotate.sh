@@ -122,6 +122,7 @@ EOF
        "$PEERS_JSON" > "$TMP"
     mv "$TMP" "$PEERS_JSON"
     chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
+    chmod 644 "$PEERS_JSON"
 
     # Output
     jq -n --arg n "$NAME" --arg ip "$PEER_IP" --arg conf "$(cat "$CLIENT_CONF")" \
