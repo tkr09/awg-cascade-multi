@@ -415,12 +415,13 @@ PEER_PSK=$(awg genpsk)
 PEER_IP="${CLIENT_NET_PREFIX}2"
 
 # Записываем awg0.conf
-# MTU=1340: двойная инкапсуляция (awg0 inside awg1 inside eth0). 1500 - 80 - 80 = 1340.
+# MTU=1280: двойная инкапсуляция (awg0 inside awgN inside eth0) + AWG 2.0 обфускация
+# съедает payload; 1280 эмпирически стабильнее на PPPoE/4G (= IPv6 min-MTU, безопасный минимум).
 cat > $WG_DIR/awg0.conf <<EOF
 [Interface]
 Address = $SERVER_IP/24
 ListenPort = $AWG0_PORT
-MTU = 1340
+MTU = 1280
 PrivateKey = $SERVER_PRIVKEY
 Jc = $JC_VAL
 Jmin = $JMIN_VAL
@@ -450,7 +451,7 @@ cat > "$CLIENT_CONF" <<EOF
 [Interface]
 PrivateKey = $PEER_PRIVKEY
 Address = $PEER_IP/32
-MTU = 1320
+MTU = 1280
 DNS = 1.1.1.1, 8.8.8.8
 Jc = $JC_VAL
 Jmin = $JMIN_VAL
