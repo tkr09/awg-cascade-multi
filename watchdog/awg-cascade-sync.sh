@@ -140,6 +140,13 @@ if systemctl is-active --quiet systemd-networkd && ls /etc/netplan/*.yaml >/dev/
             || { systemctl mask networking.service ifup@eth0.service >/dev/null 2>&1; systemctl reset-failed networking.service ifup@eth0.service >/dev/null 2>&1; echo "  ifupdown замаскирован"; }
     fi
 fi
+# авто-ребут после unattended-upgrades (окно из AUTO_REBOOT_HOUR в config)
+if [ -x /usr/local/sbin/awg-cascade-autoreboot.sh ] \
+   && ! /usr/local/sbin/awg-cascade-autoreboot.sh --check >/dev/null 2>&1; then
+    drift=$(( drift + 1 ))
+    [ "$CHECK" = "1" ] && echo "  ДРЕЙФ: auto-reboot окно не настроено (AUTO_REBOOT_HOUR)" \
+        || { /usr/local/sbin/awg-cascade-autoreboot.sh | sed 's/^/  /'; }
+fi
 # SSH-login pam hook
 if ! grep -q "awg-cascade-ssh-alert" /etc/pam.d/sshd 2>/dev/null; then
     drift=$(( drift + 1 ))

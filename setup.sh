@@ -211,34 +211,9 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-# Авто-ребут для применения kernel-обновлений. Opt-in через env AUTO_REBOOT=1
-# (по умолчанию ВЫКЛ — ручной контроль). Срабатывает только при reboot-required.
-# Минута рандомится в пределах часа AUTO_REBOOT_HOUR (default 05), чтобы серверы
-# каскада не ребутились в одну минуту (иначе все exits лягут разом).
-configure_auto_reboot() {
-    local uu=/etc/apt/apt.conf.d/50unattended-upgrades
-    [ -f "$uu" ] || return 0
-    if [ "${AUTO_REBOOT:-0}" = "1" ]; then
-        local h="${AUTO_REBOOT_HOUR:-05}" m
-        m=$(printf '%02d' $((RANDOM % 60)))
-        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"true";|' "$uu"
-        if grep -q 'Automatic-Reboot-Time' "$uu"; then
-            sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-Time \).*;|\1"'"$h:$m"'";|' "$uu"
-        else
-            echo "Unattended-Upgrade::Automatic-Reboot-Time \"$h:$m\";" >> "$uu"
-        fi
-        if grep -q 'Automatic-Reboot-WithUsers' "$uu"; then
-            sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-WithUsers \).*;|\1"true";|' "$uu"
-        else
-            echo 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";' >> "$uu"
-        fi
-        ok "Авто-ребут ВКЛ: окно $h:$m (только при kernel-обновлении)"
-    else
-        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"false";|' "$uu"
-        ok "Авто-ребут ВЫКЛ (ручной контроль ребутов; вкл: AUTO_REBOOT=1)"
-    fi
-}
-configure_auto_reboot
+# Авто-ребут настраивается ПОЗЖЕ (Phase 8b) через awg-cascade-autoreboot.sh —
+# он идемпотентен, знает про уникальное окно AUTO_REBOOT_HOUR и переприменяется
+# из sync.sh. Здесь только включаем сам сервис обновлений.
 systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 ok "unattended-upgrades включён"
 
@@ -670,6 +645,14 @@ SSH_ALERT=1
 # ─── Traffic graphs (D) ───
 # Сколько суток хранить историю трафика per-peer (/var/lib/awg-cascade/traffic.csv).
 TRAFFIC_RETENTION_DAYS=14
+
+# ─── Auto-reboot после unattended-upgrades ───
+# Срабатывает ТОЛЬКО при /var/run/reboot-required (обновление ядра), не ежедневно.
+# AUTO_REBOOT_HOUR (UTC) должен быть УНИКАЛЕН на каждой ноде каскада — иначе
+# несколько exits перезагрузятся одновременно → пустая ECMP → kill-switch.
+# Применяется через awg-cascade-autoreboot.sh (вызывается из sync.sh guards).
+AUTO_REBOOT=${AUTO_REBOOT:-1}
+AUTO_REBOOT_HOUR="${AUTO_REBOOT_HOUR:-03}"
 EOF
 chmod 600 "$CONFIG_FILE"
 chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
@@ -740,6 +723,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-selftest.sh          /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-sync.sh             /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-traffic-sample.sh    /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-backup.sh            /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-autoreboot.sh        /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
@@ -747,6 +731,12 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-add-ru.sh       /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-bootstrap-exit.sh    /usr/local/sbin/
 ok "Helper-скрипты установлены в /usr/local/sbin/"
+
+# Авто-ребут после unattended-upgrades (окно AUTO_REBOOT_HOUR из config).
+# ВАЖНО: час должен быть уникален на каждой ноде каскада — см. комментарий в config.
+/usr/local/sbin/awg-cascade-autoreboot.sh >/dev/null 2>&1 \
+    && ok "Авто-ребут: $(/usr/local/sbin/awg-cascade-autoreboot.sh --show | awk -F= '/Reboot-Time/{print $2}')" \
+    || warn "Авто-ребут не настроен (проверь: awg-cascade-autoreboot.sh --show)"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 8c: deploy Telegram bot + venv

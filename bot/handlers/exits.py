@@ -17,9 +17,9 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
 from common import (admin_only, cfg, fmt_age, format_geo, geoip_lookup,
-                    html_escape, name_to_flag, ping_bar, safe_edit_text,
-                    ssh_copy_id, ssh_exec, state_load, state_save, status_icon,
-                    sudo_run, SSH_KEY)
+                    html_escape, name_to_flag, peers_list, ping_bar,
+                    safe_edit_text, ssh_copy_id, ssh_exec, state_load,
+                    state_save, status_icon, sudo_run, SSH_KEY)
 
 LOG = logging.getLogger("awg.exits")
 router = Router(name="exits")
@@ -85,6 +85,7 @@ def exit_menu_kb(iface: str, warp: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📝 Заметка", callback_data=f"exit:note:{iface}"),
             InlineKeyboardButton(text="✏️ Имя",     callback_data=f"exit:rename:{iface}"),
         ],
+        [InlineKeyboardButton(text="🔄 Reboot exit",  callback_data=f"exit:reboot:{iface}")],
         [InlineKeyboardButton(text="🗑 Удалить exit", callback_data=f"exit:rm:{iface}")],
         [InlineKeyboardButton(text="◀️ К списку",    callback_data="exits:list")],
     ])
@@ -408,6 +409,113 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
         f"{flag} <b>{e['name']}</b>: WARP → <b>{new_warp.upper()}</b>{suffix}",
         parse_mode="HTML",
         reply_markup=exit_menu_kb(iface, new_warp),
+    )
+
+
+# ─── Reboot exit ─────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("exit:reboot:"))
+@admin_only
+async def cb_exit_reboot(call: CallbackQuery) -> None:
+    await call.answer("🔍 Опрашиваю exit…")
+    iface = call.data[len("exit:reboot:"):]
+    e = _get_exit(state_load(), iface)
+    if not e:
+        return
+    flag = name_to_flag(e.get("name", ""))
+
+    # Живые данные с exit'а. КРИТИЧНО: без собранного DKMS под новое ядро
+    # туннели после ребута не поднимутся — проверяем ДО, а не после.
+    probe = (
+        "run=$(uname -r); "
+        "new=$(dpkg -l 'linux-image-[0-9]*' 2>/dev/null | awk '/^ii/{print $2}' "
+        "| sed 's/linux-image-//' | sort -V | tail -1); "
+        "echo \"run=$run\"; echo \"new=$new\"; "
+        "echo \"up=$(uptime -p | sed 's/^up //')\"; "
+        "echo \"pending=$([ -f /var/run/reboot-required ] && echo yes || echo no)\"; "
+        "echo \"dkms=$(dkms status 2>/dev/null | grep -cF \"$new\")\""
+    )
+    out, _, rc = await ssh_exec(e["ip"], probe, username="root", key_path=SSH_KEY, timeout=25)
+    info = dict(
+        l.split("=", 1) for l in out.strip().splitlines() if "=" in l
+    ) if rc == 0 else {}
+
+    if not info:
+        body = "⚠️ <i>Не удалось опросить exit по SSH — состояние неизвестно.</i>"
+        dkms_warn = ""
+    else:
+        run, new = info.get("run", "?"), info.get("new", "?")
+        kern = (f"<code>{html_escape(run)}</code>" if run == new
+                else f"<code>{html_escape(run)}</code> → <code>{html_escape(new)}</code>")
+        pend = "🔴 да" if info.get("pending") == "yes" else "✅ нет"
+        body = (
+            f"Ядро:      {kern}\n"
+            f"Uptime:    <code>{html_escape(info.get('up', '?'))}</code>\n"
+            f"Ждёт ребута: {pend}"
+        )
+        dkms_warn = ("\n\n🔴 <b>ОПАСНО: DKMS-модуль amneziawg НЕ собран под "
+                     f"<code>{html_escape(new)}</code></b> — после ребута туннели "
+                     "могут не подняться!") if info.get("dkms", "0") == "0" else ""
+
+    # Кто пострадает: пиры, запиненные на этот exit
+    pinned = [p["name"] for p in peers_list() if p.get("pinned_exit") == iface]
+    pinned_line = (
+        f"\n\n📌 Потеряют интернет на время ребута (pinned): "
+        f"<b>{html_escape(', '.join(pinned))}</b>"
+    ) if pinned else ""
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔄 Перезагрузить", callback_data=f"exit:reboot-yes:{iface}"),
+        InlineKeyboardButton(text="❌ Отмена",        callback_data=f"exit:menu:{iface}"),
+    ]])
+    await safe_edit_text(
+        call.message,
+        f"<b>🔄 Reboot: {flag} {e['name']}</b>  <code>{e['ip']}</code>\n\n"
+        f"{body}{dkms_warn}\n\n"
+        f"Exit выпадет из ECMP на ~1 мин. Остальные пиры (Auto) переключатся "
+        f"на живые exits автоматически, watchdog вернёт этот в строй после загрузки."
+        f"{pinned_line}",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("exit:reboot-yes:"))
+@admin_only
+async def cb_exit_reboot_yes(call: CallbackQuery) -> None:
+    await call.answer("⏳ Перезагружаю…")
+    iface = call.data[len("exit:reboot-yes:"):]
+    e = _get_exit(state_load(), iface)
+    if not e:
+        return
+    flag = name_to_flag(e.get("name", ""))
+
+    # Отложенный ребут: обычный `reboot` по SSH не срабатывает — sshd убивается
+    # раньше, чем systemd выполнит команду. Таймер переживает разрыв сессии.
+    out, err, rc = await ssh_exec(
+        e["ip"],
+        "systemd-run --on-active=3 --timer-property=AccuracySec=100ms systemctl reboot",
+        username="root", key_path=SSH_KEY, timeout=20,
+    )
+    if rc != 0:
+        await safe_edit_text(
+            call.message,
+            f"❌ Не удалось запустить ребут:\n<pre>{html_escape((err or out)[:400])}</pre>",
+            parse_mode="HTML",
+            reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
+        )
+        return
+
+    await safe_edit_text(
+        call.message,
+        f"🔄 <b>{flag} {e['name']}</b> уходит в перезагрузку…\n\n"
+        f"Обычно возвращается за ~60–90 сек. Watchdog сам вернёт его в ECMP "
+        f"после появления handshake.\n\n"
+        f"<i>Проверить: 📊 Статус или 🩺 Диагностика через минуту.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📊 Статус", callback_data=f"exit:status:{iface}"),
+            InlineKeyboardButton(text="◀️ К списку", callback_data="exits:list"),
+        ]]),
     )
 
 

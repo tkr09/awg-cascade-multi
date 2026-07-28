@@ -204,7 +204,7 @@ EOF
 # AUTO_REBOOT_HOUR (default 05) — чтобы exits каскада не ребутились разом.
 uu=/etc/apt/apt.conf.d/50unattended-upgrades
 if [ -f "$uu" ]; then
-    if [ "${AUTO_REBOOT:-0}" = "1" ]; then
+    if [ "${AUTO_REBOOT:-1}" = "1" ]; then
         rb_h="${AUTO_REBOOT_HOUR:-05}"; rb_m=$(printf '%02d' $((RANDOM % 60)))
         sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"true";|' "$uu"
         if grep -q 'Automatic-Reboot-Time' "$uu"; then
