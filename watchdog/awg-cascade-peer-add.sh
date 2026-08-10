@@ -71,9 +71,13 @@ I1=$(cfg I1)
 # заголовки, а не аутентифицирует пира). ContentPaddingAddition кладём тоже:
 # без него клиент не будет набивать СВОИ пакеты, набивка была бы односторонней.
 #
-# Пять таймеров (RekeyAfterTime и т.п.) сознательно НЕ кладём в клиентский
-# конфиг: они влияют только на локальное поведение своей стороны, а незнакомый
-# ключ может уронить импорт конфига в стороннем клиенте (Keenetic AWG Manager).
+# Пять таймеров тоже отдаём клиенту. Они управляют локальным поведением своей
+# стороны, и рандомизация нужна именно на клиенте: наблюдателя интересует
+# трафик клиент→сервер, а фиксированные интервалы rekey/keepalive — это
+# «метрономность», по которой туннель узнаётся независимо от обфускации.
+#
+# ⚠️ На awg0 (2.0) этих строк в конфиге нет — блок остаётся пустым, и клиенты
+# 2.0 получают конфиг ровно как раньше.
 HPK=$(cfg HeaderProtectionKey)
 PAD=$(cfg ContentPaddingAddition)
 AWG3_BLOCK=""
@@ -81,6 +85,11 @@ if [ -n "$HPK" ]; then
     AWG3_BLOCK="HeaderProtectionKey = $HPK"
     [ -n "$PAD" ] && [ "$PAD" != "0" ] && AWG3_BLOCK="$AWG3_BLOCK
 ContentPaddingAddition = $PAD"
+    for _k in RekeyAfterTime RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts; do
+        _v=$(cfg "$_k")
+        [ -n "$_v" ] && [ "$_v" != "0" ] && AWG3_BLOCK="$AWG3_BLOCK
+$_k = $_v"
+    done
 fi
 
 # 1. Добавить peer в runtime через awg set (PSK через временный файл, /dev/stdin не работает в sudo)

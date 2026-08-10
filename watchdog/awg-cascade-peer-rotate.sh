@@ -52,7 +52,7 @@ H1=$(cfg H1); H2=$(cfg H2); H3=$(cfg H3); H4=$(cfg H4)
 I1=$(cfg I1)
 
 # AWG 3.0-блок для клиента (см. пояснение в awg-cascade-peer-add.sh):
-# HeaderProtectionKey общий на интерфейс, таймеры клиенту не отдаём.
+# HeaderProtectionKey общий на интерфейс + padding + пять таймеров.
 HPK=$(cfg HeaderProtectionKey)
 PAD=$(cfg ContentPaddingAddition)
 AWG3_BLOCK=""
@@ -60,6 +60,11 @@ if [ -n "$HPK" ]; then
     AWG3_BLOCK="HeaderProtectionKey = $HPK"
     [ -n "$PAD" ] && [ "$PAD" != "0" ] && AWG3_BLOCK="$AWG3_BLOCK
 ContentPaddingAddition = $PAD"
+    for _k in RekeyAfterTime RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts; do
+        _v=$(cfg "$_k")
+        [ -n "$_v" ] && [ "$_v" != "0" ] && AWG3_BLOCK="$AWG3_BLOCK
+$_k = $_v"
+    done
 fi
 
 (
