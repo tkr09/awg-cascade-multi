@@ -726,6 +726,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-backup.sh            /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-autoreboot.sh        /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-awg3.sh              /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-kernel-check.sh      /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-ssh-harden.sh        /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
@@ -739,6 +740,10 @@ ok "Helper-скрипты установлены в /usr/local/sbin/"
 /usr/local/sbin/awg-cascade-autoreboot.sh >/dev/null 2>&1 \
     && ok "Авто-ребут: $(/usr/local/sbin/awg-cascade-autoreboot.sh --show | awk -F= '/Reboot-Time/{print $2}')" \
     || warn "Авто-ребут не настроен (проверь: awg-cascade-autoreboot.sh --show)"
+
+# SSH: отключаем вход по паролю — свежая нода иначе сразу тонет в брутфорсе.
+# Скрипт сам пропустит шаг, если в authorized_keys нет ключей (чтобы не запереть).
+/usr/local/sbin/awg-cascade-ssh-harden.sh 2>&1 | sed 's/^/  /'
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 8c: deploy Telegram bot + venv
@@ -756,7 +761,8 @@ ok "Bot файлы скопированы в $BOT_DIR"
 install -m 755 "$REPO_DIR/setup-exit.sh"                  "$BOT_DIR/scripts/setup-exit.sh"
 install -m 755 "$REPO_DIR/awg2-params.sh"                 "$BOT_DIR/scripts/awg2-params.sh"
 install -m 755 "$REPO_DIR/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"
-ok "Exit-provisioning скрипты в $BOT_DIR/scripts/ (setup-exit, awg2-params, warp)"
+install -m 755 "$REPO_DIR/watchdog/awg-cascade-ssh-harden.sh" "$BOT_DIR/scripts/awg-cascade-ssh-harden.sh"
+ok "Exit-provisioning скрипты в $BOT_DIR/scripts/ (setup-exit, awg2-params, warp, ssh-harden)"
 
 chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
 

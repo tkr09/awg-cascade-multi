@@ -64,6 +64,8 @@ info "Заливаю setup-exit.sh + awg2-params.sh + warp helper..."
 scpx "$BOT_SCRIPTS/setup-exit.sh"               "root@$EXIT_IP:/root/setup-exit.sh" >/dev/null
 scpx "$BOT_SCRIPTS/awg2-params.sh"              "root@$EXIT_IP:/tmp/awg2-params.sh" >/dev/null
 scpx "$BOT_SCRIPTS/awg-cascade-exit-warp.sh"    "root@$EXIT_IP:/tmp/awg-cascade-exit-warp.sh" >/dev/null
+[ -f "$BOT_SCRIPTS/awg-cascade-ssh-harden.sh" ] && \
+  scpx "$BOT_SCRIPTS/awg-cascade-ssh-harden.sh" "root@$EXIT_IP:/tmp/awg-cascade-ssh-harden.sh" >/dev/null
 ok "Скрипты залиты"
 
 # 2. Генерим RU-ключи для этого туннеля

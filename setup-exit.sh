@@ -384,6 +384,17 @@ header "WARP helper-скрипт"
 # Сам скрипт скачивается из репо или подкладывается setup'ом.
 # Если он залит в /tmp перед запуском — копируем; иначе пользователь должен
 # залить руками (или скачать с github).
+# SSH hardening: к этому моменту ключ бота уже в authorized_keys (его кладёт
+# ssh_copy_id до запуска этого скрипта), поэтому пароли можно закрывать —
+# сам helper всё равно перепроверит наличие ключей и откажется, если их нет.
+if [ -f /tmp/awg-cascade-ssh-harden.sh ]; then
+    install -m 755 -o root -g root /tmp/awg-cascade-ssh-harden.sh \
+        /usr/local/sbin/awg-cascade-ssh-harden.sh
+    /usr/local/sbin/awg-cascade-ssh-harden.sh 2>&1 | sed 's/^/  /' >&2
+else
+    warn "ssh-harden не найден в /tmp — вход по паролю останется ВКЛЮЧЁН (брутфорс!)"
+fi
+
 if [ -f /tmp/awg-cascade-exit-warp.sh ]; then
     install -m 755 -o root -g root /tmp/awg-cascade-exit-warp.sh \
         /usr/local/sbin/awg-cascade-exit-warp.sh
