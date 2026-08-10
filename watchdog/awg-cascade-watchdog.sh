@@ -479,6 +479,11 @@ while true; do
         # D: сэмплируем счётчики трафика per-peer в CSV (для графиков в боте)
         [ -x /usr/local/sbin/awg-cascade-traffic-sample.sh ] \
             && /usr/local/sbin/awg-cascade-traffic-sample.sh
+        # Kernel drift: unattended-upgrades не тянет новые ядра (приходят новыми
+        # пакетами) — предупреждаем, чтобы не отставать месяцами. Внутри скрипта
+        # суточный stamp, поэтому реально бегает раз в день.
+        [ -x /usr/local/sbin/awg-cascade-kernel-check.sh ] \
+            && /usr/local/sbin/awg-cascade-kernel-check.sh >/dev/null 2>&1 &
     fi
 
     # Пересчёт весов раз в 5 мин
