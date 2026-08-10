@@ -15,10 +15,10 @@ emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
 
 # ─── Сервисы ──────────────────────────────────────────────────────────────────
 svc_bad=""
-for s in awg-cascade-bot awg-cascade-watchdog awg-quick@awg0; do
+for s in awg-cascade-bot awg-cascade-watchdog awg-quick@awg0 ${CLIENT3_IFACE:+awg-quick@$CLIENT3_IFACE}; do
     systemctl is-active --quiet "$s" 2>/dev/null || svc_bad="$svc_bad $s"
 done
-[ -z "$svc_bad" ] && emit OK "Сервисы" "bot/watchdog/awg0 active" \
+[ -z "$svc_bad" ] && emit OK "Сервисы" "bot/watchdog/awg0${CLIENT3_IFACE:+/$CLIENT3_IFACE} active" \
                    || emit FAIL "Сервисы" "не active:$svc_bad"
 
 # ─── Policy routing (ip rules) ───────────────────────────────────────────────
@@ -59,8 +59,18 @@ else
     emit FAIL "MASQUERADE" "правила отсутствуют"
 fi
 
-# ─── Интерфейсы: awg0 + exits из state ───────────────────────────────────────
-ip link show awg0 >/dev/null 2>&1 && emit OK "awg0 (клиенты)" "up" || emit FAIL "awg0 (клиенты)" "DOWN"
+# ─── Интерфейсы: клиентские + exits из state ─────────────────────────────────
+ip link show awg0 >/dev/null 2>&1 && emit OK "awg0 (клиенты 2.0)" "up" || emit FAIL "awg0 (клиенты 2.0)" "DOWN"
+if [ -n "${CLIENT3_IFACE:-}" ]; then
+    if ! ip link show "$CLIENT3_IFACE" >/dev/null 2>&1; then
+        emit FAIL "$CLIENT3_IFACE (клиенты 3.0)" "DOWN"
+    elif [ "$(awg showconf "$CLIENT3_IFACE" 2>/dev/null | grep -c '^HeaderProtectionKey')" -eq 0 ]; then
+        # Ядро молча игнорирует ключ при S1-S4 < 12 — интерфейс жив, но защиты нет
+        emit FAIL "$CLIENT3_IFACE (клиенты 3.0)" "up, но HeaderProtectionKey НЕ применён"
+    else
+        emit OK "$CLIENT3_IFACE (клиенты 3.0)" "up, header protection активен"
+    fi
+fi
 if [ -f "$STATE" ]; then
     while IFS= read -r row; do
         iface=$(jq -r .interface <<<"$row"); name=$(jq -r .name <<<"$row")

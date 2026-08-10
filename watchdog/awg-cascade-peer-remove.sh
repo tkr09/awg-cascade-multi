@@ -1,9 +1,9 @@
 #!/bin/bash
-# Удаляет peer из awg0. Вызывается ботом через sudo.
+# Удаляет peer. Вызывается ботом через sudo.
 # argv: $1 = имя peer'а
+# Интерфейс берётся из peers.json (поле iface; старые записи без него — awg0).
 set -e
 . /etc/awg-cascade/config
-WG_CONF=/etc/amnezia/amneziawg/awg0.conf
 PEERS_DIR=/etc/awg-cascade/peers
 PEERS_JSON=/etc/awg-cascade/peers.json
 
@@ -13,11 +13,14 @@ NAME="${1:-}"
 PUBKEY=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .pubkey' "$PEERS_JSON" 2>/dev/null)
 [ -z "$PUBKEY" ] || [ "$PUBKEY" = "null" ] && { echo "{\"error\":\"peer $NAME not found\"}"; exit 1; }
 PEER_IP=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .ip' "$PEERS_JSON" 2>/dev/null)
+IFACE=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .iface // "awg0"' "$PEERS_JSON" 2>/dev/null)
+[ -z "$IFACE" ] || [ "$IFACE" = "null" ] && IFACE=awg0
+WG_CONF="/etc/amnezia/amneziawg/${IFACE}.conf"
 
-# 1. Runtime: убрать peer из awg0
-awg set awg0 peer "$PUBKEY" remove
+# 1. Runtime: убрать peer из его интерфейса
+awg set "$IFACE" peer "$PUBKEY" remove
 
-# 2. Удалить блок [Peer] с этим PubKey из awg0.conf
+# 2. Удалить блок [Peer] с этим PubKey из конфига интерфейса
 python3 - "$WG_CONF" "$PUBKEY" <<'PYEOF'
 import re, sys, os
 path, target_pub = sys.argv[1], sys.argv[2]

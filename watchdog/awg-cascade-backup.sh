@@ -3,7 +3,8 @@
 #
 # Что бэкапится (всё что нельзя восстановить если RU сдохнет):
 #   /etc/awg-cascade/        — peers.json, state.json, config, ssh-keys, exits/*.keys
-#   /etc/amnezia/amneziawg/  — awg0.conf + awg<N>.conf (приватные ключи)
+#   /etc/amnezia/amneziawg/  — awg0.conf + awg<N>.conf + второй клиентский
+#                              интерфейс 3.0, если поднят (приватные ключи)
 #   /etc/iptables/rules.v4   — кастомные правила
 #
 # Использование:

@@ -26,6 +26,9 @@ async def cb_settings(call: CallbackQuery) -> None:
         f"<b>RU host:</b>      <code>{c.ru_public_ip}</code>\n"
         f"<b>awg0 port:</b>    <code>{c.awg0_port}/udp</code>\n"
         f"<b>Client subnet:</b> <code>{c.client_net}</code>\n"
+        + (f"<b>{c.client3_iface} (3.0):</b> <code>{c.client3_port}/udp</code>  "
+           f"<code>{c.client3_net}</code>\n" if c.client3_iface else "")
+        +
         f"<b>Admin chat:</b>   <code>{c.tg_chat_id}</code>\n"
         f"<b>ntfy topic:</b>   <code>{c.ntfy_topic}</code>\n"
         f"<b>Bot user:</b>     <code>{c.bot_user}</code>\n\n"

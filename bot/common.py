@@ -51,6 +51,12 @@ class Config:
     ntfy_url: str
     ntfy_topic: str
     bot_user: str
+    # Второй клиентский интерфейс (AmneziaWG 3.0). Пусто = не настроен на этой
+    # ноде; весь связанный UI бота тогда скрыт.
+    client3_iface: str = ""
+    client3_port: int = 0
+    client3_net: str = ""
+    client3_net_prefix: str = ""
 
     @classmethod
     def load(cls) -> "Config":
@@ -75,6 +81,10 @@ class Config:
             ntfy_url=data["NTFY_URL"],
             ntfy_topic=data["NTFY_TOPIC"],
             bot_user=data["BOT_USER"],
+            client3_iface=data.get("CLIENT3_IFACE", ""),
+            client3_port=int(data.get("CLIENT3_PORT") or 0),
+            client3_net=data.get("CLIENT3_NET", ""),
+            client3_net_prefix=data.get("CLIENT3_NET_PREFIX", ""),
         )
 
 

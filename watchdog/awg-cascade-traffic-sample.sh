@@ -24,10 +24,14 @@ NOW=$(date +%s)
 
 mkdir -p "$DIR"
 
-# ─── Замер: дописываем по строке на каждого пира awg0 ────────────────────────
-awg show awg0 transfer 2>/dev/null | while IFS=$'\t' read -r pubkey rx tx; do
-    [ -n "$pubkey" ] || continue
-    printf '%s,%s,%s,%s\n' "$NOW" "$pubkey" "${rx:-0}" "${tx:-0}" >> "$CSV"
+# ─── Замер: по строке на каждого пира каждого клиентского интерфейса ─────────
+# Второй интерфейс (3.0) опционален; pubkey уникален глобально, поэтому формат
+# строки не меняется и бот читает CSV как раньше.
+for _if in awg0 ${CLIENT3_IFACE:-}; do
+    awg show "$_if" transfer 2>/dev/null | while IFS=$'\t' read -r pubkey rx tx; do
+        [ -n "$pubkey" ] || continue
+        printf '%s,%s,%s,%s\n' "$NOW" "$pubkey" "${rx:-0}" "${tx:-0}" >> "$CSV"
+    done
 done
 chmod 644 "$CSV" 2>/dev/null || true
 

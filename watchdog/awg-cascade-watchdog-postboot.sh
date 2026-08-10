@@ -21,12 +21,14 @@ ntfy() {
 
 issues=()
 
-# 1. awg0 поднят?
-if ! awg show awg0 >/dev/null 2>&1; then
-    issues+=("awg0 интерфейс не существует")
-    log "FAIL: awg0 down — trying to bring up"
-    awg-quick up awg0 >/dev/null 2>&1 || true
-fi
+# 1. Клиентские интерфейсы подняты? (awg0 всегда, второй — если настроен)
+for _cif in awg0 ${CLIENT3_IFACE:-}; do
+    if ! awg show "$_cif" >/dev/null 2>&1; then
+        issues+=("$_cif интерфейс не существует")
+        log "FAIL: $_cif down — trying to bring up"
+        awg-quick up "$_cif" >/dev/null 2>&1 || true
+    fi
+done
 
 # 2. Все awgN из state.json поднят и с handshake?
 if [ -f "$STATE" ]; then

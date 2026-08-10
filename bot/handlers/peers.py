@@ -173,8 +173,10 @@ def peers_kb(peers: list[dict]) -> InlineKeyboardMarkup:
     for p in peers:
         pinned = p.get("pinned_exit")
         suffix = f"  → {pinned}" if pinned else "  · 🔄 auto"
+        # 🛡 = пир на втором интерфейсе (AmneziaWG 3.0, header protection)
+        mark = "🛡" if peer_iface(p) != "awg0" else "👤"
         rows.append([InlineKeyboardButton(
-            text=f"👤 {p['name']}  {p['ip']}{suffix}",
+            text=f"{mark} {p['name']}  {p['ip']}{suffix}",
             callback_data=f"peer:menu:{p['name']}"
         )])
     rows.append([
@@ -207,6 +209,28 @@ def peer_menu_kb(name: str) -> InlineKeyboardMarkup:
     ])
 
 
+# ─── Клиентские интерфейсы (2.0 / 3.0) ───────────────────────────────────────
+
+def peer_iface(peer: dict) -> str:
+    """Интерфейс пира. Записи, созданные до появления второго интерфейса, поля
+    не имеют — они на awg0."""
+    return peer.get("iface") or "awg0"
+
+
+def iface_badge(iface: str) -> str:
+    return "🛡 3.0" if iface != "awg0" else "2.0"
+
+
+async def awg_show_all_clients() -> dict[str, dict]:
+    """Live-данные по всем клиентским интерфейсам одним словарём.
+    pubkey уникален глобально, поэтому слияние безопасно."""
+    data = await awg_show_peers("awg0")
+    c3 = cfg().client3_iface
+    if c3:
+        data.update(await awg_show_peers(c3))
+    return data
+
+
 # ─── Render ──────────────────────────────────────────────────────────────────
 
 async def render_peer_status(peer: dict, with_geo: bool = True) -> str:
@@ -217,8 +241,9 @@ async def render_peer_status(peer: dict, with_geo: bool = True) -> str:
     note = peer.get("note", "")
     created = peer.get("created", "?")
 
-    # live data
-    awg = await awg_show_peers("awg0")
+    # live data — с того интерфейса, на котором живёт пир
+    iface = peer_iface(peer)
+    awg = await awg_show_peers(iface)
     live = awg.get(peer["pubkey"], {})
     hs = live.get("hs_age", 9999)
     endpoint = live.get("endpoint")
@@ -247,7 +272,7 @@ async def render_peer_status(peer: dict, with_geo: bool = True) -> str:
         policy = "🔄 <b>Auto</b> (ECMP по всем exit'ам)"
 
     lines = [
-        f"<b>👤 {name}</b>  <code>{ip}</code>",
+        f"<b>👤 {name}</b>  <code>{ip}</code>  <i>{iface_badge(iface)}</i>",
         f"",
         f"{status_icon} {status_text}",
         f"📍 External: <code>{external_ip}{':' + external_port if external_port else ''}</code>",
@@ -284,13 +309,16 @@ async def cb_list(call: CallbackQuery) -> None:
         text = "<b>👤 Peers</b>\n\n<i>Список пуст. Добавь первого peer'а.</i>"
     else:
         # Подмешиваем live status: считаем сколько active
-        awg = await awg_show_peers("awg0")
+        awg = await awg_show_all_clients()
         active = 0
         for p in peers:
             live = awg.get(p["pubkey"], {})
             if live.get("hs_age", 9999) < 180:
                 active += 1
         text = f"<b>👤 Peers ({active}/{len(peers)} active)</b>\n\nВыбери peer'а:"
+        if cfg().client3_iface:
+            n3 = sum(1 for p in peers if peer_iface(p) != "awg0")
+            text += f"\n<i>на AmneziaWG 3.0: {n3} из {len(peers)}</i>"
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=peers_kb(peers))
 
 
@@ -439,8 +467,10 @@ def _lan_kb(name: str, allow: list[str]) -> InlineKeyboardMarkup:
         if t["name"] == name:
             continue
         mark = "✅" if t["ip"] in allow_set else "⬜"
+        # Пиры обоих клиентских интерфейсов — LAN-пары работают и между подсетями
+        ver = " 🛡" if peer_iface(t) != "awg0" else ""
         rows.append([InlineKeyboardButton(
-            text=f"{mark} {t['name']}  {t['ip']}",
+            text=f"{mark} {t['name']}  {t['ip']}{ver}",
             callback_data=f"peer:lanX:{name}:{t['ip']}",
         )])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"peer:menu:{name}")])
@@ -548,18 +578,53 @@ async def fsm_peer_note(message: Message, state: FSMContext) -> None:
 
 # ─── Add peer ────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "peers:add")
-@admin_only
-async def cb_peer_add(call: CallbackQuery, state: FSMContext) -> None:
-    await call.answer()
+async def _ask_peer_name(call: CallbackQuery, state: FSMContext, iface: str) -> None:
     await state.set_state(AddPeerFSM.waiting_name)
+    await state.update_data(iface=iface)
+    ver = "AmneziaWG 3.0 🛡" if iface != "awg0" else "AmneziaWG 2.0"
     await call.message.edit_text(
-        "<b>➕ Новый peer</b>\n\nВведи имя (a-z, 0-9, _, -; например <code>phone-2</code>, <code>laptop</code>):",
+        f"<b>➕ Новый peer</b>  <i>({ver})</i>\n\n"
+        "Введи имя (a-z, 0-9, _, -; например <code>phone-2</code>, <code>laptop</code>):",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="❌ Отмена", callback_data="main")
         ]]),
     )
+
+
+@router.callback_query(F.data == "peers:add")
+@admin_only
+async def cb_peer_add(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    c3 = cfg().client3_iface
+    if not c3:
+        # Второго интерфейса нет — спрашивать нечего
+        await _ask_peer_name(call, state, "awg0")
+        return
+    await call.message.edit_text(
+        "<b>➕ Новый peer</b>\n\nВерсия протокола:\n\n"
+        "<b>2.0</b> — работает у всех клиентов.\n"
+        "<b>3.0</b> 🛡 — плюс шифрование заголовков WireGuard и набивка пакетов. "
+        "Требует amnezia-client 3.x (или Keenetic AWG Manager ≥ 2.16.5) — "
+        "на старом клиенте конфиг просто не подключится.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛡 3.0 (header protection)", callback_data=f"peers:addif:{c3}")],
+            [InlineKeyboardButton(text="2.0 (совместимость)", callback_data="peers:addif:awg0")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("peers:addif:"))
+@admin_only
+async def cb_peer_add_iface(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    iface = call.data[len("peers:addif:"):]
+    if iface != "awg0" and iface != cfg().client3_iface:
+        await call.message.edit_text("Неизвестный интерфейс.")
+        return
+    await _ask_peer_name(call, state, iface)
 
 
 @router.message(AddPeerFSM.waiting_name)
@@ -574,10 +639,12 @@ async def fsm_peer_name(message: Message, state: FSMContext) -> None:
         await message.answer(f"Peer с именем <b>{name}</b> уже есть.", parse_mode="HTML")
         return
 
+    iface = (await state.get_data()).get("iface") or "awg0"
     await state.clear()
-    await message.answer(f"⏳ Создаю peer <b>{name}</b>...", parse_mode="HTML")
+    ver = "3.0 🛡" if iface != "awg0" else "2.0"
+    await message.answer(f"⏳ Создаю peer <b>{name}</b> ({ver})...", parse_mode="HTML")
 
-    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-peer-add.sh", name, timeout=15)
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-peer-add.sh", name, iface, timeout=15)
     if rc != 0:
         await message.answer(
             f"❌ Не удалось создать peer:\n<pre>{html_escape((err or out)[:500])}</pre>",
@@ -602,7 +669,7 @@ async def fsm_peer_name(message: Message, state: FSMContext) -> None:
     await message.answer_photo(
         BufferedInputFile(png, filename=f"{name}.png"),
         caption=(
-            f"✅ Peer <b>{name}</b>  IP <code>{peer_ip}</code>\n\n"
+            f"✅ Peer <b>{name}</b>  IP <code>{peer_ip}</code>  <i>AmneziaWG {ver}</i>\n\n"
             f"📱 Сканируй QR в amnezia-client → Импорт"
         ),
         parse_mode="HTML",

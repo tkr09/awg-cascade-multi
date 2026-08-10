@@ -140,6 +140,28 @@ if systemctl is-active --quiet systemd-networkd && ls /etc/netplan/*.yaml >/dev/
             || { systemctl mask networking.service ifup@eth0.service >/dev/null 2>&1; systemctl reset-failed networking.service ifup@eth0.service >/dev/null 2>&1; echo "  ifupdown замаскирован"; }
     fi
 fi
+# Второй клиентский интерфейс: вызов client3-fw в iptables.sh. Этот скрипт
+# генерится setup.sh инлайном и потому НЕ синкается — правим точечно и только
+# на нодах, где второй интерфейс реально настроен (на остальных — no-op).
+IPT=/usr/local/sbin/awg-cascade-iptables.sh
+C3_CALL='[ -x /usr/local/sbin/awg-cascade-client3-fw.sh ] && /usr/local/sbin/awg-cascade-client3-fw.sh || true'
+if [ -n "${CLIENT3_IFACE:-}" ] && [ -f "$IPT" ] && ! grep -qF 'awg-cascade-client3-fw.sh' "$IPT"; then
+    drift=$(( drift + 1 ))
+    if [ "$CHECK" = "1" ]; then
+        echo "  ДРЕЙФ: iptables.sh не вызывает client3-fw ($CLIENT3_IFACE без firewall-правил)"
+    else
+        # Строго ПЕРЕД interclient: тот вставляет исключения через -I 1 (выше),
+        # а базовые правила client3 должны лечь ниже них.
+        if grep -q 'awg-cascade-interclient\.sh' "$IPT"; then
+            awk -v ins="$C3_CALL" '/awg-cascade-interclient\.sh/ && !d {print ins; d=1} {print}' \
+                "$IPT" > "$IPT.new"
+        else
+            cat "$IPT" > "$IPT.new"; printf '%s\n' "$C3_CALL" >> "$IPT.new"
+        fi
+        install -m 755 "$IPT.new" "$IPT" && rm -f "$IPT.new" && echo "  обновлён: $IPT (вызов client3-fw)"
+        "$IPT" >/dev/null 2>&1 || true
+    fi
+fi
 # SSH: вход только по ключам (cloud-init drop-in может вернуть пароли обратно)
 if [ -x /usr/local/sbin/awg-cascade-ssh-harden.sh ] \
    && ! /usr/local/sbin/awg-cascade-ssh-harden.sh --check >/dev/null 2>&1; then

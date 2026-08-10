@@ -7,7 +7,8 @@ kill-switch, watchdog, drift-guard и Telegram-ботом для управле�
 ## Архитектура
 
 ```
-Клиент (amnezia-client) ──AWG 2.0 (obfuscated)──> RU (entry, awg0)
+Клиент 2.0 ──AWG 2.0 (obfuscated)───> RU (entry, awg0)  ┐
+Клиент 3.0 ──AWG 3.0 (+header prot)─> RU (entry, wgc3)  ┘
                                                      │
                                   ┌─── awg1 ─AWG──> NL exit ──→ интернет
                                   ├─── awg2 ─AWG──> FI exit ──→ интернет (или WARP)
@@ -23,6 +24,12 @@ WARP на shared-exit управляется per-interface (RU не мешают
 
 - **AmneziaWG 2.0 обфускация**: Jc/Jmin/Jmax + random S1-S4 + ranged H1-H4 + I1
   (CPS-decoy под DNS-ответ iCloud). Параметры уникальны на установку.
+- **Опциональный второй клиентский интерфейс на AmneziaWG 3.0** (`awg-cascade-client3.sh up`):
+  `HeaderProtectionKey` + `ContentPaddingAddition` + рандомизация таймеров. Отдельные
+  порт и /24, свои параметры обфускации; awg0 не трогается, клиенты переезжают по
+  одному. Причина отдельного интерфейса — header protection это параметр
+  **интерфейса**, а не пира: включение на awg0 разом отрубает всех клиентов 2.0.
+  Имя интерфейса намеренно **вне маски `awg+`**, иначе ломается kill-switch.
 - **Multi-exit с failover**: exit умер → трафик ECMP-балансится по живым.
 - **Веса по пингу**: `weight = round(min_ping_alive / this_ping × 10)`.
 - **Kill-switch by design**: `FORWARD -i awg0 ! -o awg+ -j DROP` — клиенты не утекают в eth0.
@@ -40,8 +47,9 @@ WARP на shared-exit управляется per-interface (RU не мешают
 
 ## Версия
 
-**v2.0.25** — AmneziaWG 2.0 (amnezia-client-совместимый формат: Jc/Jmin/Jmax +
-S1-S4 + ranged H1-H4 + I1). Ставит `amneziawg` + `amneziawg-dkms` из `ppa:amnezia/ppa`.
+**v2.1.0** — второй клиентский интерфейс на AmneziaWG 3.0 (опционально, рядом
+с awg0). Туннели RU↔exit уже на 3.0 (`awg-cascade-awg3.sh`). Ставит `amneziawg`
++ `amneziawg-dkms` из `ppa:amnezia/ppa`; для 3.0 нужны пакеты ≥ 3.0.
 
 История значимых изменений — в git-тегах (`git tag`), каждый тег с описанием.
 

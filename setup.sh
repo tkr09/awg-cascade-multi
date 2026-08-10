@@ -522,6 +522,12 @@ iptables -A FORWARD -i awg0 ! -o awg+ -m comment --comment "awg-cascade-killsw" 
 # --- mangle FORWARD: MSS clamp для TCP (двойная инкапсуляция → нужно PMTU) ---
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment "awg-cascade-mss" -j TCPMSS --clamp-mss-to-pmtu
 
+# --- второй клиентский интерфейс (AmneziaWG 3.0), если поднят ---
+# No-op без CLIENT3_IFACE в config. ДОЛЖЕН идти после kill-switch'а awg0: тот
+# закрывает awg0 → C3 (имя C3 намеренно вне маски awg+), а этот — обратную
+# сторону. И ДО interclient: тот вставляет исключения через -I 1, то есть выше.
+[ -x /usr/local/sbin/awg-cascade-client3-fw.sh ] && /usr/local/sbin/awg-cascade-client3-fw.sh || true
+
 # --- per-peer inter-client LAN access (whitelist src→dst + default-deny /24) ---
 # Применяет правила awg-lan из peers.json поверх базовых (должно идти ПОСЛЕ MARK).
 [ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
@@ -727,6 +733,8 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-autoreboot.sh        /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-awg3.sh              /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-kernel-check.sh      /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-ssh-harden.sh        /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-client3.sh           /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-client3-fw.sh        /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-add.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
