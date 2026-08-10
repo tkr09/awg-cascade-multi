@@ -183,7 +183,10 @@ if [ "$(awg showconf "$IFACE" 2>/dev/null | grep -c '^HeaderProtectionKey')" -eq
     exit 1
 fi
 
-# Firewall: MARK → ECMP, MASQUERADE, kill-switch, изоляция от awg0
+# Firewall: MARK → ECMP, MASQUERADE, kill-switch, изоляция от awg0.
+# Сначала прописываем вызов client3-fw в inline-генерируемый iptables.sh
+# (он не синкается из репо), потом пересобираем цепочки целиком.
+/usr/local/sbin/awg-cascade-client3-fw.sh --hook 2>&1 | sed 's/^/  /'
 /usr/local/sbin/awg-cascade-iptables.sh >/dev/null 2>&1 || true
 
 echo ""

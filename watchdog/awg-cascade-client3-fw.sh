@@ -10,6 +10,30 @@
 set -u
 . /etc/awg-cascade/config 2>/dev/null || true
 
+# ─── Самоустановка вызова в iptables.sh ──────────────────────────────────────
+# awg-cascade-iptables.sh генерится setup.sh инлайном и потому НЕ синкается из
+# репо — на живой ноде вызов нас в нём надо дописать один раз. Идемпотентно.
+IPT=/usr/local/sbin/awg-cascade-iptables.sh
+CALL='[ -x /usr/local/sbin/awg-cascade-client3-fw.sh ] && /usr/local/sbin/awg-cascade-client3-fw.sh || true'
+
+case "${1:-}" in
+--check-hook)
+    grep -qF 'awg-cascade-client3-fw.sh' "$IPT" 2>/dev/null && exit 0 || exit 1 ;;
+--hook)
+    [ -f "$IPT" ] || { echo "  🔴 $IPT не найден"; exit 1; }
+    grep -qF 'awg-cascade-client3-fw.sh' "$IPT" && { echo "  hook уже на месте"; exit 0; }
+    # Строго ПЕРЕД interclient: тот вставляет свои исключения через -I 1, то
+    # есть выше, а наши базовые правила должны лечь под ними.
+    if grep -q 'awg-cascade-interclient\.sh' "$IPT"; then
+        awk -v ins="$CALL" '/awg-cascade-interclient\.sh/ && !d {print ins; d=1} {print}' \
+            "$IPT" > "$IPT.new"
+    else
+        cp "$IPT" "$IPT.new"; printf '%s\n' "$CALL" >> "$IPT.new"
+    fi
+    install -m 755 "$IPT.new" "$IPT" && rm -f "$IPT.new" && echo "  hook добавлен в $IPT"
+    exit 0 ;;
+esac
+
 C3="${CLIENT3_IFACE:-}"
 NET3="${CLIENT3_NET:-}"
 [ -n "$C3" ] && [ -n "$NET3" ] || exit 0
