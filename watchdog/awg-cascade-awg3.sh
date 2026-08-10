@@ -21,8 +21,12 @@
 # Usage:
 #   awg-cascade-awg3.sh <awgN> on  [--fix-s]   — включить (--fix-s: поднять S<12)
 #   awg-cascade-awg3.sh <awgN> off             — выключить, вернуть 2.0
+#   awg-cascade-awg3.sh <awgN> reroll-s        — перегенерить S (свежая сигнатура)
 #   awg-cascade-awg3.sh <awgN> status          — показать состояние обеих сторон
 #   awg-cascade-awg3.sh all status             — по всем туннелям
+#
+# S-параметры генерятся СЛУЧАЙНО (S_MIN..S_MAX): одинаковое значение на разных
+# туннелях само по себе стало бы сигнатурой для DPI.
 # =============================================================================
 set -u
 . /etc/awg-cascade/config 2>/dev/null || true
@@ -38,7 +42,10 @@ SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/nul
 : "${KEEPALIVE_TO:=8-13}"
 : "${MAX_HS:=15-20}"
 : "${S_MIN:=12}"
-: "${S_NEW:=20}"
+# S_NEW НЕ константа: одинаковое значение на нескольких туннелях само становится
+# сигнатурой для DPI. Каждый вызов даёт свой случайный S в [S_MIN..S_MAX].
+: "${S_MAX:=40}"
+rand_s() { echo $(( S_MIN + RANDOM % (S_MAX - S_MIN + 1) )); }
 
 IFACE="${1:-}"; ACTION="${2:-status}"; FIXS="${3:-}"
 [ -z "$IFACE" ] && { sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 1; }
@@ -79,8 +86,8 @@ read -r EXIT_IP EXIT_IF EXIT_NAME <<<"$INFO"
 
 case "$ACTION" in
 status) echo "=== $IFACE ($EXIT_NAME) ==="; show_status "$IFACE"; exit 0 ;;
-on|off) ;;
-*) echo "🔴 действие: on | off | status"; exit 1 ;;
+on|off|reroll-s) ;;
+*) echo "🔴 действие: on | off | status | reroll-s"; exit 1 ;;
 esac
 
 # ─── версия tools на обеих сторонах ──────────────────────────────────────────
@@ -107,6 +114,31 @@ run_remote() {  # $1 = shell-код
 
 sync_local()  { awg-quick strip "$IFACE" > /tmp/.awg3-l.conf 2>/dev/null && awg syncconf "$IFACE" /tmp/.awg3-l.conf; rm -f /tmp/.awg3-l.conf; }
 
+if [ "$ACTION" = "reroll-s" ]; then
+    # Перегенерация S-параметров на живом туннеле: свежая уникальная сигнатура
+    # без смены ключей. Полезно если S были выставлены одинаково/предсказуемо.
+    echo "  → перегенерирую S1-S4 (случайно, $S_MIN..$S_MAX) на обеих сторонах"
+    RSED=""
+    for k in S1 S2 S3 S4; do
+        old=$(grep -oP "^$k = \K.*" "$CONF")
+        # S1-S3 обычно уже широкие и уникальные — трогаем только те, что <S_MIN
+        # или равны дефолту-заглушке; S4 перегенерируем всегда (его мы правили).
+        if [ "$k" = "S4" ] || [ "${old:-0}" -lt "$S_MIN" ]; then
+            v=$(rand_s)
+            echo "    $k: $old → $v"
+            sed -i "s|^$k = .*|$k = $v|" "$CONF"
+            RSED="$RSED sed -i 's|^$k = .*|$k = $v|' $WG_DIR/$EXIT_IF.conf;"
+        fi
+    done
+    [ -z "$RSED" ] && { echo "    нечего менять"; exit 0; }
+    run_remote "$RSED
+awg-quick strip $EXIT_IF > /tmp/.c 2>/dev/null && awg syncconf $EXIT_IF /tmp/.c && echo '  exit: применено'; rm -f /tmp/.c"
+    sync_local && echo "  RU: применено"
+    sleep 6
+    show_status "$IFACE"
+    exit 0
+fi
+
 if [ "$ACTION" = "off" ]; then
     echo "  → выключаю 3.0 (возврат к 2.0)"
     sed -i '/^HeaderProtectionKey/d;/^ContentPaddingAddition/d;/^RekeyAfterTime/d;/^RekeyTimeout/d;/^RejectAfterTime/d;/^KeepaliveTimeout/d;/^MaxHandshakeAttempts/d' "$CONF"
@@ -123,14 +155,15 @@ fi
 LOW=$(grep -E '^S[1-4] ' "$CONF" | awk -v m="$S_MIN" '$3 < m {printf "%s ", $1}')
 if [ -n "$LOW" ]; then
     if [ "$FIXS" = "--fix-s" ]; then
-        echo "  ⚠ S<$S_MIN: $LOW→ поднимаю до $S_NEW на обеих сторонах"
         for k in $LOW; do
-            sed -i "s|^$k = .*|$k = $S_NEW|" "$CONF"
-            run_remote "sed -i 's|^$k = .*|$k = $S_NEW|' $WG_DIR/$EXIT_IF.conf" >/dev/null
+            v=$(rand_s)   # свой рандом на каждый параметр и туннель, не константа
+            echo "  ⚠ $k < $S_MIN → $v (случайно) на обеих сторонах"
+            sed -i "s|^$k = .*|$k = $v|" "$CONF"
+            run_remote "sed -i 's|^$k = .*|$k = $v|' $WG_DIR/$EXIT_IF.conf" >/dev/null
         done
     else
         echo "  🔴 S-параметры ниже $S_MIN: ${LOW}— header protection НЕ включится."
-        echo "     Повтори с --fix-s (поднимет до $S_NEW согласованно с обеих сторон)."
+        echo "     Повтори с --fix-s (поднимет до случайного $S_MIN..$S_MAX с обеих сторон)."
         exit 1
     fi
 fi
