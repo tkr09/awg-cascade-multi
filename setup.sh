@@ -643,8 +643,8 @@ LOAD_ALERT_MULT=2
 SSH_ALERT=1
 
 # ─── Traffic graphs (D) ───
-# Сколько суток хранить историю трафика per-peer (/var/lib/awg-cascade/traffic.csv).
-TRAFFIC_RETENTION_DAYS=14
+# Сколько суток хранить историю трафика per-peer (72 часа — минимум метаданных).
+TRAFFIC_RETENTION_DAYS=3
 
 # ─── Auto-reboot после unattended-upgrades ───
 # Срабатывает ТОЛЬКО при /var/run/reboot-required (обновление ядра), не ежедневно.
