@@ -17,7 +17,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
 from common import (admin_only, cfg, fmt_age, format_geo, geoip_lookup,
-                    html_escape, name_to_flag, peers_list, ping_bar,
+                    html_escape, local_run, name_to_flag, peers_list, ping_bar,
                     safe_edit_text, ssh_copy_id, ssh_exec, state_load,
                     state_save, status_icon, sudo_run, SSH_KEY)
 
@@ -190,8 +190,15 @@ async def cb_exit_ping(call: CallbackQuery) -> None:
 
     results = []
     for i in range(10):
-        out, _, rc = await sudo_run(
-            "/bin/ping", "-I", iface, "-c", "1", "-W", "2", "1.1.1.1", timeout=4
+        # БЕЗ sudo: ping несёт cap_net_raw=ep, поэтому -I <iface> работает и от
+        # awgbot. Раньше тут был `sudo /bin/ping`, и это ломалось дважды:
+        #   • в каноничном sudoers (setup.sh/sync.sh) правила на ping нет —
+        #     оно жило только дописанным вручную на ноде, и первый же sync.sh
+        #     приводил sudoers к канону и стирал его;
+        #   • /bin/ping — симлинк на /usr/bin/ping, а sudo сверяет реальный путь,
+        #     так что правило `/bin/ping` всё равно не сработало бы надёжно.
+        out, _, rc = await local_run(
+            "ping", "-I", iface, "-c", "1", "-W", "2", "1.1.1.1", timeout=4
         )
         if rc == 0:
             m = re.search(r"time=([0-9.]+)", out)
