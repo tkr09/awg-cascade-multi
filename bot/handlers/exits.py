@@ -191,12 +191,12 @@ async def cb_exit_ping(call: CallbackQuery) -> None:
     results = []
     for i in range(10):
         # БЕЗ sudo: ping несёт cap_net_raw=ep, поэтому -I <iface> работает и от
-        # awgbot. Раньше тут был `sudo /bin/ping`, и это ломалось дважды:
-        #   • в каноничном sudoers (setup.sh/sync.sh) правила на ping нет —
-        #     оно жило только дописанным вручную на ноде, и первый же sync.sh
-        #     приводил sudoers к канону и стирал его;
-        #   • /bin/ping — симлинк на /usr/bin/ping, а sudo сверяет реальный путь,
-        #     так что правило `/bin/ping` всё равно не сработало бы надёжно.
+        # awgbot. Раньше тут был `sudo /bin/ping`, и это отвалилось разом на всех
+        # нодах: правила на ping в каноничном sudoers (setup.sh/sync.sh) нет —
+        # оно жило дописанным ВРУЧНУЮ на ноде, а sync.sh приводит
+        # /etc/sudoers.d/<bot> к канону и стирает всё лишнее.
+        # Отсюда правило: всё, что боту нужно под sudo, должно быть в каноне,
+        # иначе не переживёт синк. Здесь sudo просто не нужен — так надёжнее.
         out, _, rc = await local_run(
             "ping", "-I", iface, "-c", "1", "-W", "2", "1.1.1.1", timeout=4
         )
