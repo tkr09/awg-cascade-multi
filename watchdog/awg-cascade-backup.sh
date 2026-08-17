@@ -23,7 +23,10 @@
 
 set -e
 
-DST="${1:-/root/awg-cascade-backup-$(date +%Y%m%d-%H%M).tar.gz}"
+# Имя включает hostname: каскад multi-RU, и без него бэкапы с двух RU, снятые в
+# одну минуту, дают одинаковое имя. При сборе в одну папку второй молча
+# перезаписывает первый — так уже терялся бэкап RU-1.
+DST="${1:-/root/awg-cascade-backup-$(hostname -s)-$(date +%Y%m%d-%H%M).tar.gz}"
 
 mkdir -p "$(dirname "$DST")"
 
