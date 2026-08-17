@@ -7,6 +7,10 @@ Wants=network-online.target
 Type=oneshot
 # Ждём 90с после network-online чтобы все туннели успели подняться
 ExecStart=/bin/bash -c 'sleep 90 && /usr/local/sbin/awg-cascade-watchdog-postboot.sh'
+# ОБЯЗАТЕЛЬНО: systemd по умолчанию даёт oneshot-юниту 90с (DefaultTimeoutStartSec),
+# а ExecStart выше только на sleep расходует ровно 90с — юнит убивался таймаутом
+# в момент запуска самой проверки, то есть postboot-verify фактически не работал.
+TimeoutStartSec=600
 RemainAfterExit=no
 
 [Install]
