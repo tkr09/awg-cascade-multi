@@ -916,8 +916,9 @@ ${YELLOW}ВАЖНО:${NC} если exit ещё не подключён — ${RED
   ${BOLD}journalctl -u awg-cascade-bot -f${NC}      логи бота вживую
   ${BOLD}tail -f /var/log/awg-cascade-watchdog.log${NC} логи watchdog'а
 
-Обновление до новой версии репо:
-  ${BOLD}cd /opt/awg-cascade-src && git pull && bash setup.sh${NC}
+Обновление живой ноды — ТОЛЬКО через drift-guard, не повторным setup.sh:
+  ${BOLD}awg-cascade-sync.sh --check${NC}          показать дрейф от репо
+  ${BOLD}awg-cascade-sync.sh${NC}                  привести ноду к последнему тегу
 NEXT
 
 echo ""
