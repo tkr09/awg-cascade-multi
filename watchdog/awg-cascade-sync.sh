@@ -6,12 +6,20 @@
 #
 # Синхронизирует ТОЛЬКО безопасные элементы:
 #   • helper-скрипты /usr/local/sbin/awg-cascade-*.sh
+#   • код бота /opt/awg-cascade-bot/{*.py,handlers/*.py,requirements.txt}
+#     + provisioning-скрипты /opt/awg-cascade-bot/scripts/ (setup-exit, awg2-params,
+#     exit-warp, ssh-harden). При изменении кода бот перезапускается.
 #   • systemd-юниты awg-cascade-*.service
 #   • каноничный sudoers awgbot (с visudo-валидацией)
 #   • идемпотентные guards: gai.conf IPv4, маскировка ifupdown, alerting-блок
 #   • version-stamp /etc/awg-cascade/version
-# НЕ ТРОГАЕТ: awg0/awgN, ключи, peers.json, state.json, серверные значения
-# config (RU_PUBLIC_IP/порт/подсеть и т.п.).
+# НЕ ТРОГАЕТ: awg0/awgN/wgc3, ключи, peers.json, state.json, venv бота, серверные
+# значения config (RU_PUBLIC_IP/порт/подсеть, параметры обфускации и т.п.).
+#
+# ВАЖНО про область проверки: всё, что вне списка выше (в первую очередь setup.sh
+# и inline-генерируемые setup.sh'ем iptables.sh/iprule.sh), drift-guard НЕ видит.
+# Поэтому итоговое сообщение всегда печатает, что именно было проверено — иначе
+# «дрейфа нет» читается как заявление о всей ноде, чем оно не является.
 #
 # Usage:
 #   awg-cascade-sync.sh [ref]        — применить (re-deploy)
@@ -45,15 +53,15 @@ COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
 echo "→ Версия в репо: $VER ($COMMIT)"
 
 drift=0
-sync_file() {  # <src> <dst> <mode>
-    local src="$1" dst="$2" mode="$3"
+sync_file() {  # <src> <dst> <mode> [доп. аргументы install, например -o awgbot -g awgbot]
+    local src="$1" dst="$2" mode="$3"; shift 3
     [ -f "$src" ] || return 0
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then return 0; fi
     drift=$(( drift + 1 ))
     if [ "$CHECK" = "1" ]; then
         echo "  ДРЕЙФ: $dst (отличается от репо $VER)"
     else
-        install -m "$mode" "$src" "$dst" && echo "  обновлён: $dst"
+        install -m "$mode" "$@" "$src" "$dst" && echo "  обновлён: $dst"
     fi
 }
 
@@ -78,6 +86,69 @@ for dst in /usr/local/sbin/awg-cascade-*.sh; do
         rm -f "$dst" && echo "  удалён орфан: $dst"
     fi
 done
+
+echo "=== код бота (/opt/awg-cascade-bot) ==="
+# Раньше эта область НЕ проверялась вообще, при том что скрипт печатал
+# «нода соответствует репо $VER». Тег v2.1.3 правит ровно bot/handlers/exits.py,
+# поэтому на живых нодах выдавалось ложное «дрейфа нет» — version-stamp честно
+# показывал v2.1.2, а drift-guard утверждал соответствие v2.1.3. Теперь код
+# бота и его provisioning-скрипты тоже под guard'ом.
+#
+# venv НЕ трогаем: он собирается на ноде и в репо его нет.
+BOT_DIR=/opt/awg-cascade-bot
+bot_changed=0
+req_changed=0
+if [ ! -d "$BOT_DIR" ]; then
+    echo "  $BOT_DIR отсутствует — пропускаю (нода без бота)"
+else
+    # Файлы бота принадлежат $BOT_USER. Если пользователя нет — ставим без chown,
+    # иначе install упал бы и оборвал синк.
+    BOT_OWN=""
+    id "$BOT_USER" >/dev/null 2>&1 && BOT_OWN="-o $BOT_USER -g $BOT_USER"
+    _bot_before=$drift
+
+    for f in "$TMP"/repo/bot/*.py; do
+        [ -e "$f" ] || continue
+        sync_file "$f" "$BOT_DIR/$(basename "$f")" 644 $BOT_OWN
+    done
+
+    # requirements.txt: синкаем файл, но venv автоматически НЕ переустанавливаем —
+    # новая версия зависимости может сломать работающего бота. Только предупреждаем.
+    if [ -f "$TMP/repo/bot/requirements.txt" ] \
+       && ! cmp -s "$TMP/repo/bot/requirements.txt" "$BOT_DIR/requirements.txt" 2>/dev/null; then
+        req_changed=1
+    fi
+    sync_file "$TMP/repo/bot/requirements.txt" "$BOT_DIR/requirements.txt" 644 $BOT_OWN
+
+    [ "$CHECK" = "1" ] || mkdir -p "$BOT_DIR/handlers" "$BOT_DIR/scripts"
+    for f in "$TMP"/repo/bot/handlers/*.py; do
+        [ -e "$f" ] || continue
+        sync_file "$f" "$BOT_DIR/handlers/$(basename "$f")" 644 $BOT_OWN
+    done
+
+    # Provisioning-скрипты, которые бот SCP-ит на новый exit. Лежат в репо в трёх
+    # разных местах, поэтому перечислены поимённо, а не глобом.
+    sync_file "$TMP/repo/setup-exit.sh"                      "$BOT_DIR/scripts/setup-exit.sh"                 755 $BOT_OWN
+    sync_file "$TMP/repo/awg2-params.sh"                     "$BOT_DIR/scripts/awg2-params.sh"                755 $BOT_OWN
+    sync_file "$TMP/repo/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"      755 $BOT_OWN
+    sync_file "$TMP/repo/watchdog/awg-cascade-ssh-harden.sh" "$BOT_DIR/scripts/awg-cascade-ssh-harden.sh"     755 $BOT_OWN
+
+    # Орфаны в handlers/: удалённый из репо хендлер иначе останется на ноде вместе
+    # со своим .pyc и продолжит импортироваться.
+    for dst in "$BOT_DIR"/handlers/*.py; do
+        [ -e "$dst" ] || continue
+        base=$(basename "$dst")
+        [ -f "$TMP/repo/bot/handlers/$base" ] && continue
+        drift=$(( drift + 1 ))
+        if [ "$CHECK" = "1" ]; then
+            echo "  ОРФАН: $dst (нет в репо $VER)"
+        else
+            rm -f "$dst" && echo "  удалён орфан: $dst"
+        fi
+    done
+
+    [ "$drift" -ne "$_bot_before" ] && bot_changed=1
+fi
 
 echo "=== systemd-юниты ==="
 units_changed=0
@@ -174,14 +245,41 @@ if ! grep -q "awg-cascade-ssh-alert" /etc/pam.d/sshd 2>/dev/null; then
         || { echo "session    optional   pam_exec.so /usr/local/sbin/awg-cascade-ssh-alert.sh" >> /etc/pam.d/sshd; echo "  pam SSH-alert добавлен"; }
 fi
 
+# Область проверки печатаем явно: раньше скрипт утверждал «нода соответствует
+# репо $VER», не заглянув в код бота, и на v2.1.3 это было прямой неправдой.
+SCOPE="helper-скрипты, systemd-юниты, sudoers, код бота и scripts/"
+UNCHECKED="setup.sh, inline-генерируемые iptables.sh/iprule.sh, venv, ключи и значения config"
+
 if [ "$CHECK" = "1" ]; then
     echo "─────────────────────────────"
-    if [ "$drift" -eq 0 ]; then echo "✅ Дрейфа нет — нода соответствует репо $VER"; exit 0
+    echo "   проверено:     $SCOPE"
+    echo "   вне проверки:  $UNCHECKED"
+    if [ "$drift" -eq 0 ]; then echo "✅ Дрейфа нет — проверяемая область соответствует репо $VER"; exit 0
     else echo "⚠️ Найдено расхождений: $drift (репо $VER). Применить: awg-cascade-sync.sh $REF"; exit 2; fi
 else
     [ "$units_changed" = "1" ] && { systemctl daemon-reload; echo "  systemctl daemon-reload"; }
+    if [ "$bot_changed" = "1" ]; then
+        # Устаревший .pyc может пережить замену .py — чистим кеш перед рестартом.
+        find "$BOT_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+        if systemctl restart awg-cascade-bot 2>/dev/null; then
+            echo "  бот перезапущен (код изменился)"
+        else
+            echo "  ⚠️ бот не перезапустился — проверь: systemctl status awg-cascade-bot"
+        fi
+    fi
     printf '%s %s %s\n' "$VER" "$COMMIT" "$(date -Iseconds)" > /etc/awg-cascade/version
     echo "─────────────────────────────"
     echo "✅ Синхронизировано с $VER ($COMMIT). Изменений: $drift. version-stamp обновлён."
-    [ "$drift" -gt 0 ] && echo "ℹ️  Перезапусти при необходимости: systemctl restart awg-cascade-watchdog awg-cascade-bot"
+    echo "   проверено:     $SCOPE"
+    echo "   вне проверки:  $UNCHECKED"
+    if [ "$req_changed" = "1" ]; then
+        echo "  ⚠️ requirements.txt изменился, но venv НЕ обновлён автоматически:"
+        echo "     новая версия зависимости может сломать работающего бота. Вручную:"
+        echo "       sudo -u $BOT_USER $BOT_DIR/venv/bin/pip install -r $BOT_DIR/requirements.txt"
+        echo "       sudo systemctl restart awg-cascade-bot"
+    fi
+    [ "$drift" -gt 0 ] && echo "ℹ️  Watchdog при необходимости: systemctl restart awg-cascade-watchdog"
+    # Без явного exit 0 скрипт возвращал rc=1 при drift=0 (последней командой
+    # оказывался ложный тест выше) — вызывающая сторона читала это как сбой.
+    exit 0
 fi

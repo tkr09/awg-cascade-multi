@@ -47,9 +47,12 @@ WARP на shared-exit управляется per-interface (RU не мешают
 
 ## Версия
 
-**v2.1.0** — второй клиентский интерфейс на AmneziaWG 3.0 (опционально, рядом
-с awg0). Туннели RU↔exit уже на 3.0 (`awg-cascade-awg3.sh`). Ставит `amneziawg`
-+ `amneziawg-dkms` из `ppa:amnezia/ppa`; для 3.0 нужны пакеты ≥ 3.0.
+**v2.1.4** — drift-guard теперь покрывает код бота и его provisioning-скрипты
+(до этого `sync.sh` печатал «нода соответствует репо», не проверив `bot/`, —
+и на v2.1.3, который правит ровно один файл в `bot/`, это было прямой неправдой).
+Второй клиентский интерфейс на AmneziaWG 3.0 — с v2.1.0 (опционально, рядом с
+awg0). Туннели RU↔exit на 3.0 (`awg-cascade-awg3.sh`). Ставит `amneziawg` +
+`amneziawg-dkms` из `ppa:amnezia/ppa`; для 3.0 нужны пакеты ≥ 3.0.
 
 История значимых изменений — в git-тегах (`git tag`), каждый тег с описанием.
 
@@ -59,7 +62,7 @@ WARP на shared-exit управляется per-interface (RU не мешают
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tkr09/awg-cascade-multi/main/install.sh \
-  | sudo REF=v2.0.25 bash
+  | sudo REF=v2.1.4 bash
 ```
 
 `install.sh` клонирует репо на нужном теге и запускает `setup.sh`, который спросит:
@@ -77,11 +80,18 @@ Phase 5 (серверный ключ/awg0.conf) под гардом идемпо
 **Только через drift-guard, НЕ повторным `setup.sh`:**
 
 ```bash
-sudo awg-cascade-sync.sh --check v2.0.25   # показать дрейф
-sudo awg-cascade-sync.sh v2.0.25           # привести ноду к тегу
+sudo awg-cascade-sync.sh --check v2.1.4   # показать дрейф
+sudo awg-cascade-sync.sh v2.1.4           # привести ноду к тегу
 ```
 
 (При смене логики самого `sync.sh` нужны два прогона: 1-й ставит новый sync, 2-й им работает.)
+
+Что покрывает drift-guard: helper-скрипты, код бота + `scripts/`, systemd-юниты,
+sudoers. Что **не** покрывает и проверять надо глазами: `setup.sh`, генерируемые
+им inline `iptables.sh`/`iprule.sh`, `venv` бота, ключи и значения `config`.
+Итоговое сообщение всегда печатает область проверки — «дрейфа нет» относится
+только к ней, а не ко всей ноде. При изменении кода бота sync перезапускает бота
+(≈10 с без ответа в Telegram, клиентский трафик не затронут).
 
 ## Структура репо
 
@@ -102,7 +112,7 @@ watchdog/
   awg-cascade-exit-add-ru.sh / -remove.sh
   awg-cascade-bootstrap-exit.sh     # CLI: первый exit без живого бота
   awg-cascade-selftest.sh           # активная диагностика ноды (для 🩺 в боте)
-  awg-cascade-sync.sh               # drift-guard / re-deploy из репо
+  awg-cascade-sync.sh               # drift-guard / re-deploy из репо (вкл. bot/ и scripts/)
   awg-cascade-traffic-sample.sh     # сэмплинг трафика per-peer в CSV
   awg-cascade-alert.sh              # ntfy + cooldown/дедуп
   awg-cascade-ssh-alert.sh          # SSH-login алерт (pam_exec)
