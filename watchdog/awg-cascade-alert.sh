@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # AWG Cascade Multi — alert helper
-# ntfy через --interface eth0 (emergency egress, работает даже когда каскад
+# ntfy через --interface $MAIN_IFACE (emergency egress, работает даже когда каскад
 # или Telegram лежит) + дедуп/cooldown, чтобы не спамить один и тот же алерт.
 #
 # Usage:
@@ -14,6 +14,13 @@
 # =============================================================================
 set -u
 . /etc/awg-cascade/config 2>/dev/null || true
+
+# Интерфейс аварийного egress: раньше литерал eth0, из-за чего на ноде с ens3
+# алерты молча не уходили (ошибка curl подавлена). Фолбэк = прежнее поведение.
+: "${MAIN_IFACE:=eth0}"
+ip link show "$MAIN_IFACE" >/dev/null 2>&1 || MAIN_IFACE=$(
+    ip route show default 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+: "${MAIN_IFACE:=eth0}"
 
 ADIR=/run/awg-cascade/alerts
 mkdir -p "$ADIR" 2>/dev/null || true
@@ -43,7 +50,7 @@ fi
 [ -n "${NTFY_URL:-}" ] || exit 0
 # Stamp пишем ТОЛЬКО после успешной доставки — иначе упавший curl «съест» весь
 # cooldown и алерт промолчит N часов, ни разу не дойдя.
-if curl --interface eth0 -s --max-time 8 \
+if curl --interface "$MAIN_IFACE" -s --max-time 8 \
     -H "Title: $TITLE" \
     -H "Priority: $PRIO" \
     -H "Tags: $TAGS" \

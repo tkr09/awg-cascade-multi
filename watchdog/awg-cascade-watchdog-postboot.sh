@@ -9,12 +9,19 @@ set -u
 STATE=/etc/awg-cascade/state.json
 LOG=/var/log/awg-cascade-watchdog.log
 
+# Интерфейс аварийного egress: см. пояснение в awg-cascade-watchdog.sh.
+# Фолбэк на eth0 сохраняет прежнее поведение там, где MAIN_IFACE не задан.
+: "${MAIN_IFACE:=eth0}"
+ip link show "$MAIN_IFACE" >/dev/null 2>&1 || MAIN_IFACE=$(
+    ip route show default 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+: "${MAIN_IFACE:=eth0}"
+
 log() { echo "$(date -Iseconds) POSTBOOT $*" >> "$LOG"; }
 
 ntfy() {
     local title="$1" priority="${2:-default}" tags="${3:-}" body="${4:-}"
     [ -n "${NTFY_URL:-}" ] || return 0
-    curl --interface eth0 -s --max-time 8 \
+    curl --interface "$MAIN_IFACE" -s --max-time 8 \
         -H "Title: $title" -H "Priority: $priority" -H "Tags: $tags" \
         -d "$body" "$NTFY_URL" >/dev/null 2>&1 || true
 }

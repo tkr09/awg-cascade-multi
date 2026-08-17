@@ -10,7 +10,7 @@
 #   5. Atomic update state.json
 #   6. ECMP route replace
 #   7. Каждые 5 мин пересчёт весов (если разница > 20%)
-#   8. ntfy alerts через --interface eth0 (emergency egress)
+#   8. ntfy alerts через --interface $MAIN_IFACE (emergency egress, мимо каскада)
 #
 # Запускается из awg-cascade-watchdog.service (systemd)
 # =============================================================================
@@ -43,6 +43,17 @@ WEIGHT_DIFF_PERCENT=20     # пересчёт весов только если �
 : "${EGRESS_CHECK_URL:=https://api.telegram.org}"
 ALERT=/usr/local/sbin/awg-cascade-alert.sh
 NPROC=$(nproc 2>/dev/null || echo 1)
+
+# Интерфейс для аварийного egress (ntfy/healthchecks идут МИМО каскада, чтобы
+# алертить даже когда туннели лежат). Раньше здесь был литерал eth0 — на ноде с
+# ens3/enp1s0 весь алертинг молча умирал бы, потому что ошибки curl подавляются.
+# Берём из config (setup.sh его определяет), с фолбэком на eth0 = прежнее поведение.
+: "${MAIN_IFACE:=eth0}"
+# Если NIC переименовался после апгрейда ядра, config устарел: молчащий алертинг
+# хуже неточного, поэтому подстраховываемся текущим default-route.
+ip link show "$MAIN_IFACE" >/dev/null 2>&1 || MAIN_IFACE=$(
+    ip route show default 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+: "${MAIN_IFACE:=eth0}"
 EGRESS_FAILS=0
 EGRESS_STATE=up
 
@@ -80,12 +91,12 @@ update_state() {
 ntfy() {
     local title="$1" priority="${2:-default}" tags="${3:-}" body="${4:-}"
     [ -n "${NTFY_URL:-}" ] || return 0
-    curl --interface eth0 -s --max-time 8 \
+    curl --interface "$MAIN_IFACE" -s --max-time 8 \
         -H "Title: $title" \
         -H "Priority: $priority" \
         -H "Tags: $tags" \
         -d "$body" \
-        "$NTFY_URL" >/dev/null 2>&1 || log "WARN: ntfy failed"
+        "$NTFY_URL" >/dev/null 2>&1 || log "WARN: ntfy failed (iface=$MAIN_IFACE)"
 }
 
 # Возвращает handshake age в секундах (9999 если нет handshake)
@@ -321,8 +332,8 @@ check_resources() {
 # Dead-man: пинг healthchecks.io через eth0. Пропал пинг → их сервис алертит.
 healthcheck_ping() {
     [ -n "$HC_PING_URL" ] || return 0
-    curl --interface eth0 -fsS -m 10 "$HC_PING_URL" >/dev/null 2>&1 \
-        || log "WARN: healthcheck ping failed"
+    curl --interface "$MAIN_IFACE" -fsS -m 10 "$HC_PING_URL" >/dev/null 2>&1 \
+        || log "WARN: healthcheck ping failed (iface=$MAIN_IFACE)"
 }
 
 # Postboot verify (вызывается один раз при старте)
