@@ -112,7 +112,10 @@ run_remote() {  # $1 = shell-код
     rm -f "$tmp"
 }
 
-sync_local()  { awg-quick strip "$IFACE" > /tmp/.awg3-l.conf 2>/dev/null && awg syncconf "$IFACE" /tmp/.awg3-l.conf; rm -f /tmp/.awg3-l.conf; }
+# umask 077 в субшелле: `awg-quick strip` печатает конфиг ВМЕСТЕ с приватным
+# ключом интерфейса, а /tmp доступен на чтение всем — при root-umask 022 файл
+# создавался с правами 0644 и ключ был читаем всем на время операции.
+sync_local()  { ( umask 077; awg-quick strip "$IFACE" > /tmp/.awg3-l.conf 2>/dev/null ) && awg syncconf "$IFACE" /tmp/.awg3-l.conf; rm -f /tmp/.awg3-l.conf; }
 
 if [ "$ACTION" = "reroll-s" ]; then
     # Перегенерация S-параметров на живом туннеле: свежая уникальная сигнатура
@@ -132,7 +135,7 @@ if [ "$ACTION" = "reroll-s" ]; then
     done
     [ -z "$RSED" ] && { echo "    нечего менять"; exit 0; }
     run_remote "$RSED
-awg-quick strip $EXIT_IF > /tmp/.c 2>/dev/null && awg syncconf $EXIT_IF /tmp/.c && echo '  exit: применено'; rm -f /tmp/.c"
+( umask 077; awg-quick strip $EXIT_IF > /tmp/.c 2>/dev/null ) && awg syncconf $EXIT_IF /tmp/.c && echo '  exit: применено'; rm -f /tmp/.c"
     sync_local && echo "  RU: применено"
     sleep 6
     show_status "$IFACE"
@@ -188,7 +191,7 @@ apply_block() {  # вставить/заменить блок в конфиге 
 echo "  → пишу конфиги (ключ ${KEY:0:12}…)"
 apply_block "$CONF"
 run_remote "$(declare -f apply_block); BLOCK='$BLOCK'; apply_block $WG_DIR/$EXIT_IF.conf
-awg-quick strip $EXIT_IF > /tmp/.c 2>/dev/null && awg syncconf $EXIT_IF /tmp/.c && echo '  exit: применено'; rm -f /tmp/.c"
+( umask 077; awg-quick strip $EXIT_IF > /tmp/.c 2>/dev/null ) && awg syncconf $EXIT_IF /tmp/.c && echo '  exit: применено'; rm -f /tmp/.c"
 sync_local && echo "  RU: применено"
 
 sleep 6

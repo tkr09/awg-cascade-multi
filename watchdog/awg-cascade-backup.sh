@@ -30,6 +30,10 @@ DST="${1:-/root/awg-cascade-backup-$(hostname -s)-$(date +%Y%m%d-%H%M).tar.gz}"
 
 mkdir -p "$(dirname "$DST")"
 
+# umask ДО создания архива: внутри приватные ключи сервера, клиентов и бота, а
+# chmod 600 ниже срабатывает уже после записи — файл успевал полежать с 0644.
+umask 077
+
 tar czf "$DST" \
     --exclude='/etc/awg-cascade/state.lock' \
     /etc/awg-cascade/ \
