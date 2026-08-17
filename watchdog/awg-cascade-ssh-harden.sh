@@ -28,10 +28,28 @@ MODE="${1:-}"
 
 eff() { sshd -T 2>/dev/null | grep -oP "^$1 \K.*"; }
 
+# Считаем ключи через awk, а НЕ через grep -c. Прежняя реализация была опасна:
+# grep -c при нуле совпадений печатает "0" И выходит с кодом 1, поэтому `|| echo 0`
+# дописывал ВТОРОЙ ноль. Выражение $(( n + 0<newline>0 )) падало с arithmetic error,
+# count_keys возвращала ПУСТУЮ строку, а тест `[ "$KEYS" -lt 1 ]` на пустой строке
+# печатал "integer expected" и давал ЛОЖЬ — то есть скрипт шёл отключать пароли на
+# ноде, где ключей нет. Ровно тот сценарий блокировки, от которого он защищает.
+#
+# Тип ключа ищем в ЛЮБОМ поле строки: authorized_keys допускает префикс опций
+# (`restrict,command="..." ssh-ed25519 AAAA...`), и такой ключ полностью рабочий —
+# прежний якорь `^(ssh-|...)` его не видел и недосчитывал.
 count_keys() {
     local n=0 f
     for f in /root/.ssh/authorized_keys /root/.ssh/authorized_keys2; do
-        [ -f "$f" ] && n=$(( n + $(grep -cE '^(ssh-|ecdsa-|sk-)' "$f" 2>/dev/null || echo 0) ))
+        [ -f "$f" ] || continue
+        n=$(( n + $(awk '
+            /^[[:space:]]*(#|$)/ { next }
+            {
+                for (i = 1; i <= NF; i++)
+                    if ($i ~ /^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-|sk-(ssh-ed25519|ecdsa-sha2-))/) { c++; next }
+            }
+            END { print c + 0 }
+        ' "$f" 2>/dev/null) ))
     done
     echo "$n"
 }
@@ -53,6 +71,9 @@ if [ "$MODE" = "--check" ]; then
 fi
 
 KEYS=$(count_keys)
+# Fail-safe: любой неожиданный вывод трактуем как «ключей нет», то есть отказ от
+# hardening. Ошибка подсчёта должна приводить к сохранению доступа, а не к его потере.
+case "$KEYS" in ''|*[!0-9]*) KEYS=0 ;; esac
 if [ "$KEYS" -lt 1 ] && [ "$MODE" != "--force" ]; then
     echo "  ⚠ SSH hardening ПРОПУЩЕН: в /root/.ssh/authorized_keys нет ключей."
     echo "    Отключать пароль нельзя — потеряешь доступ. Добавь ключ и запусти:"
