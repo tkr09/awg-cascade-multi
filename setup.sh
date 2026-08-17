@@ -57,6 +57,12 @@ CONFIG_FILE=$CONFIG_DIR/config
 LOG_FILE=/var/log/awg-cascade.log
 BOT_USER=awgbot
 
+# REPO_DIR — где лежат исходники (install.sh кладёт в /opt/awg-cascade-src).
+# Определяется ЗДЕСЬ, а не в Phase 8b: version-stamp пишется раньше, в Phase 7,
+# и с необъявленной переменной `git -C ""` падал, а стамп получался "unknown ?".
+# Валидация содержимого (наличие watchdog/, bot/, systemd/) осталась в Phase 8b.
+REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+
 # AmneziaWG v2.0 параметры — генерируем через awg2-params.sh (sourced ниже).
 # Каждая установка получает уникальные H-ranges + случайные S1-S4.
 # Совместимо с amnezia-client v2.0 (формат idential to реальному client config).
@@ -544,7 +550,7 @@ ok "iptables правила применены"
 # ─── ip rule для policy routing ──────────────────────────────────────────────
 # fwmark 0x1 (клиенты awg0) → table 100 (ECMP exits)
 # uidrange awgbot → table 100 (бот'трафик к Telegram через NL)
-# Всё остальное (включая ntfy через --interface eth0) → main table (eth0)
+# Всё остальное (включая ntfy через --interface $MAIN_IFACE) → main table
 
 BOT_UID=$(id -u $BOT_USER)
 ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
@@ -711,9 +717,8 @@ ok "awg-cascade-iptables.service зарегистрирован"
 # ═════════════════════════════════════════════════════════════════════════════
 header "8b. Deploy watchdog + helper-скрипты"
 
-# REPO_DIR — куда install.sh положил исходники. Если setup.sh запустили
-# напрямую (не через install.sh) — берём dirname текущего скрипта.
-REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+# REPO_DIR задан в блоке констант (нужен уже в Phase 7 для version-stamp).
+# Здесь только проверяем, что там действительно исходники репо.
 [ -d "$REPO_DIR/watchdog" ] || err "Не найдена директория $REPO_DIR/watchdog. Запусти через install.sh или из корня репо."
 [ -d "$REPO_DIR/bot" ]      || err "Не найдена директория $REPO_DIR/bot"
 [ -d "$REPO_DIR/systemd" ]  || err "Не найдена директория $REPO_DIR/systemd"
@@ -838,22 +843,35 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 header "9. Готово! QR первого peer'а"
 
-echo ""
-echo -e "${BOLD}Peer: ${GREEN}$FIRST_PEER${NC}  IP: ${BOLD}$PEER_IP${NC}"
-echo -e "Конфиг: ${BOLD}$CLIENT_CONF${NC}"
-echo ""
+# При повторном запуске Phase 5 пропущена гардом идемпотентности, поэтому
+# FIRST_PEER/PEER_IP/CLIENT_CONF/SERVER_PUBKEY не заданы. Раньше здесь безусловно
+# выполнялось `qrencode < "$CLIENT_CONF"` с пустым именем файла — редирект падал,
+# а из-за `set -e` скрипт обрывался ДО Phase 10 (bootstrap первого exit) и до
+# финальных инструкций. То есть повторный запуск, который README называет
+# безопасным, всегда заканчивался ошибкой.
+if [ -n "${CLIENT_CONF:-}" ] && [ -f "${CLIENT_CONF:-}" ]; then
+    echo ""
+    echo -e "${BOLD}Peer: ${GREEN}$FIRST_PEER${NC}  IP: ${BOLD}$PEER_IP${NC}"
+    echo -e "Конфиг: ${BOLD}$CLIENT_CONF${NC}"
+    echo ""
 
-# QR в терминал
-qrencode -t ANSIUTF8 < "$CLIENT_CONF"
+    # QR в терминал
+    qrencode -t ANSIUTF8 < "$CLIENT_CONF"
 
-echo ""
-info "Импорт в amnezia-client:"
-echo "  Mobile: открой app → '+' → 'Импорт конфига' → 'Сканировать QR-код' → сканируй ↑"
-echo "  Desktop: открой app → 'Импорт конфига' → 'Из файла' → загрузи $CLIENT_CONF"
-echo ""
-info "Endpoint: ${BOLD}$RU_PUBLIC_IP:$AWG0_PORT${NC}"
-info "Server pubkey: ${BOLD}$SERVER_PUBKEY${NC}"
-echo ""
+    echo ""
+    info "Импорт в amnezia-client:"
+    echo "  Mobile: открой app → '+' → 'Импорт конфига' → 'Сканировать QR-код' → сканируй ↑"
+    echo "  Desktop: открой app → 'Импорт конфига' → 'Из файла' → загрузи $CLIENT_CONF"
+    echo ""
+    info "Endpoint: ${BOLD}$RU_PUBLIC_IP:$AWG0_PORT${NC}"
+    info "Server pubkey: ${BOLD}$SERVER_PUBKEY${NC}"
+    echo ""
+else
+    info "Phase 5 была пропущена (нода уже настроена) — QR первого peer'а не выводим."
+    echo "  Конфиги существующих пиров: ${BOLD}ls $PEERS_DIR/${NC}"
+    echo "  Или через бота: 👤 Peers → выбрать пира → 📱 QR / 📄 Конфиг"
+    echo ""
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 10: bootstrap первого exit (опционально, интерактивно)
