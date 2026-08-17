@@ -193,7 +193,11 @@ async def cb_status_full(call: CallbackQuery) -> None:
                 lines.append(f"  ping <code>{ping:.0f}ms</code>  loss <code>{ploss:.0f}%</code>  hs <code>{fmt_age(hs)}</code>")
                 lines.append(f"  <code>{ping_bar(ring)}</code>")
             if note:
-                lines.append(f"  📝 <i>{note}</i>")
+                # html_escape обязателен: заметка — свободный текст, и '<' в ней
+                # ломает HTML-парсер Telegram, то есть весь «Полный статус»
+                # перестаёт отправляться (TelegramBadRequest). В exits.py и
+                # peers.py заметка экранируется, здесь этого не хватало.
+                lines.append(f"  📝 <i>{html_escape(note)}</i>")
             lines.append("")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[

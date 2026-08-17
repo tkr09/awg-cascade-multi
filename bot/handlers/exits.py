@@ -811,11 +811,15 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
     out, _ = await proc.communicate()
     ru_privkey = out.decode().strip()
 
-    proc = await asyncio.create_subprocess_shell(
-        f"echo '{ru_privkey}' | /usr/bin/awg pubkey",
+    # Приватный ключ подаём в stdin, а НЕ через `echo '<key>' | awg pubkey` в шелле:
+    # аргументы команды видны в /proc, то есть ключ утекал в вывод `ps` любому
+    # локальному пользователю на время выполнения.
+    proc = await asyncio.create_subprocess_exec(
+        "/usr/bin/awg", "pubkey",
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
     )
-    out, _ = await proc.communicate()
+    out, _ = await proc.communicate(ru_privkey.encode())
     ru_pubkey = out.decode().strip()
 
     proc = await asyncio.create_subprocess_exec(
