@@ -31,7 +31,9 @@ WARP на shared-exit управляется per-interface (RU не мешают
   **интерфейса**, а не пира: включение на awg0 разом отрубает всех клиентов 2.0.
   Имя интерфейса намеренно **вне маски `awg+`**, иначе ломается kill-switch.
 - **Multi-exit с failover**: exit умер → трафик ECMP-балансится по живым.
-- **Веса по пингу**: `weight = round(min_ping_alive / this_ping × 10)`.
+- **Веса по пингу**: фиксированные пороги (`WEIGHT_TIERS`) по медиане ping-ring'а,
+  с гистерезисом на границе и выдержкой между сменами. Намеренно инертны: смена
+  веса переставляет живые потоки на другой exit и рвёт установленные сессии.
 - **Kill-switch by design**: `FORWARD -i awg0 ! -o awg+ -j DROP` — клиенты не утекают в eth0.
 - **Watchdog** (systemd): ping 10s, hysteresis 3/2, reconnect зависшего handshake,
   пересчёт весов 5мин, self-heal ip-rules, сэмплинг трафика per-peer.
@@ -46,6 +48,18 @@ WARP на shared-exit управляется per-interface (RU не мешают
   к git-тегу (re-deploy скриптов/юнитов/sudoers + вычистка орфанов), version-stamp.
 
 ## Версия
+
+**v2.1.6** — watchdog больше не перетасовывает живые соединения. Веса ECMP
+считались от `min_ping` живых exit'ов и менялись 110–145 раз в сутки, а каждая
+смена — это `ip route replace` на multipath-маршруте, то есть перераспределение
+хеша и переезд части потоков на другой exit с другим внешним IP (рвутся
+установленные TCP/TLS). Теперь фиксированные пороги пинга + гистерезис на
+границе + выдержка 30 мин + медиана вместо среднего. Заодно per-peer routing
+перестраивается только при реальном изменении pin'а, а не каждые 10 секунд
+(pinned-пир на это время проваливался в общий ECMP).
+
+**v2.1.5** — латентные ловушки: `count_keys` в ssh-harden, `MAIN_IFACE` вместо
+литерала `eth0`, `TimeoutStartSec` для postboot, `umask 077` для strip/backup.
 
 **v2.1.4** — drift-guard теперь покрывает код бота и его provisioning-скрипты
 (до этого `sync.sh` печатал «нода соответствует репо», не проверив `bot/`, —
@@ -62,7 +76,7 @@ awg0). Туннели RU↔exit на 3.0 (`awg-cascade-awg3.sh`). Ставит `
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tkr09/awg-cascade-multi/main/install.sh \
-  | sudo REF=v2.1.4 bash
+  | sudo REF=v2.1.6 bash
 ```
 
 `install.sh` клонирует репо на нужном теге и запускает `setup.sh`, который спросит:
@@ -80,8 +94,8 @@ Phase 5 (серверный ключ/awg0.conf) под гардом идемпо
 **Только через drift-guard, НЕ повторным `setup.sh`:**
 
 ```bash
-sudo awg-cascade-sync.sh --check v2.1.4   # показать дрейф
-sudo awg-cascade-sync.sh v2.1.4           # привести ноду к тегу
+sudo awg-cascade-sync.sh --check v2.1.6   # показать дрейф
+sudo awg-cascade-sync.sh v2.1.6           # привести ноду к тегу
 ```
 
 (При смене логики самого `sync.sh` нужны два прогона: 1-й ставит новый sync, 2-й им работает.)
