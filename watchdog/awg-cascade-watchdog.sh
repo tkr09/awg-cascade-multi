@@ -30,6 +30,16 @@ DOWN_THRESHOLD=3           # 3 fail подряд → DOWN
 UP_THRESHOLD=2             # 2 success подряд → UP
 PING_TIMEOUT=2             # сек
 HANDSHAKE_MAX=180          # сек, после этого reconnect
+
+# ─── Backoff переподключения ──────────────────────────────────────────────────
+# Без него зависший handshake давал `awg-quick down/up` КАЖДЫЙ тик, то есть раз
+# в 10 секунд без конца. В инциденте 22.08.2026, когда с RU-1 разом пропали все
+# четыре туннеля, это дало 35 переподключений подряд: вылечить они ничего не
+# могли (проблема была вне ноды), а каждое down/up рвало то, что ещё жило, и
+# сбрасывало счётчики. Теперь интервал удваивается до потолка и сбрасывается,
+# как только handshake снова свежий.
+: "${RECONNECT_BACKOFF_MIN:=30}"    # сек до первой повторной попытки
+: "${RECONNECT_BACKOFF_MAX:=600}"   # потолок интервала (10 мин)
 WEIGHT_RECALC_TICKS=30     # 30 тиков * 10с = 5 мин
 
 # ─── Веса ECMP ────────────────────────────────────────────────────────────────
@@ -157,10 +167,10 @@ smart_ping() {
     return 1
 }
 
-# Down + Up интерфейса
+# Down + Up интерфейса. $2 — текущий интервал backoff, только для лога.
 reconnect_iface() {
-    local iface=$1
-    log "RECONNECT $iface (handshake stale)"
+    local iface=$1 wait_s=${2:-}
+    log "RECONNECT $iface (handshake stale${wait_s:+, следующая попытка не раньше чем через ${wait_s}s})"
     awg-quick down "$iface" >/dev/null 2>&1 || true
     sleep 1
     awg-quick up   "$iface" >/dev/null 2>&1 || true
@@ -365,7 +375,11 @@ recompute_weights() {
 
         update_state "(.exits[] | select(.interface==\"$iface\"))
                       |= (.weight = $new_weight | .weight_changed_at = $now)"
-        log "WEIGHT $iface: $cur_weight → $new_weight (медиана=${med}ms, выдержка=$(( now - changed_at ))s)"
+        # changed_at=0 = поля ещё не было (первая смена после апгрейда), и
+        # разница с нулём печаталась бы как эпоха целиком.
+        local since
+        [ "$changed_at" -gt 0 ] && since="$(( now - changed_at ))s" || since="первая"
+        log "WEIGHT $iface: $cur_weight → $new_weight (медиана=${med}ms, выдержка=$since)"
         need_apply=true
     done < <(jq -c '.exits[]' "$STATE")
 
@@ -450,6 +464,8 @@ postboot_check() {
 declare -A FAIL_COUNT
 declare -A SUCC_COUNT
 declare -A PREV_STATUS
+declare -A RECONNECT_NEXT   # iface → epoch, раньше которого не переподключаемся
+declare -A RECONNECT_WAIT   # iface → текущий интервал backoff в секундах
 TICK_COUNT=0
 
 process_exit() {
@@ -489,8 +505,25 @@ process_exit() {
     fi
 
     # Reconnect если handshake состарился
+    # Reconnect если handshake состарился — но не чаще, чем позволяет backoff.
     if [ "$hs" -gt "$HANDSHAKE_MAX" ]; then
-        reconnect_iface "$iface"
+        local now_ts wait_s
+        now_ts=$(date +%s)
+        if [ "$now_ts" -ge "${RECONNECT_NEXT[$iface]:-0}" ]; then
+            wait_s=${RECONNECT_WAIT[$iface]:-$RECONNECT_BACKOFF_MIN}
+            reconnect_iface "$iface" "$wait_s"
+            RECONNECT_NEXT[$iface]=$(( now_ts + wait_s ))
+            wait_s=$(( wait_s * 2 ))
+            [ "$wait_s" -gt "$RECONNECT_BACKOFF_MAX" ] && wait_s=$RECONNECT_BACKOFF_MAX
+            RECONNECT_WAIT[$iface]=$wait_s
+        fi
+    else
+        # Handshake свежий — цепочка неудач прервана, начинаем счёт заново.
+        if [ -n "${RECONNECT_NEXT[$iface]:-}" ] && [ "${RECONNECT_NEXT[$iface]}" != "0" ]; then
+            log "RECONNECT $iface: handshake восстановлен, backoff сброшен"
+        fi
+        RECONNECT_NEXT[$iface]=0
+        RECONNECT_WAIT[$iface]=$RECONNECT_BACKOFF_MIN
     fi
 
     # Записываем в state: ping_ring, status, last_ping, handshake_age, ping_avg, ping_loss
