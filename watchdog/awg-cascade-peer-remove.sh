@@ -10,6 +10,13 @@ PEERS_JSON=/etc/awg-cascade/peers.json
 NAME="${1:-}"
 [ -z "$NAME" ] && { echo '{"error":"empty name"}'; exit 1; }
 
+# Общий замок каскада на всё «прочитать peers.json → поменять → записать»:
+# тот же, что берут peer-add.sh, peer-rotate.sh и бот. Без него параллельное
+# добавление пира между нашим чтением и записью терялось целиком.
+FLOCK=/etc/awg-cascade/state.lock
+exec 200>"$FLOCK"
+flock -x 200
+
 PUBKEY=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .pubkey' "$PEERS_JSON" 2>/dev/null)
 [ -z "$PUBKEY" ] || [ "$PUBKEY" = "null" ] && { echo "{\"error\":\"peer $NAME not found\"}"; exit 1; }
 PEER_IP=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .ip' "$PEERS_JSON" 2>/dev/null)
@@ -49,6 +56,8 @@ jq --arg n "$NAME" --arg ip "$PEER_IP" '
 ' "$PEERS_JSON" > "$TMP" && mv "$TMP" "$PEERS_JSON"
 chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
 chmod 644 "$PEERS_JSON"
+
+flock -u 200        # конец критической секции; interclient ниже замок не требует
 
 # 5. Переприменяем inter-client whitelist — снимает iptables-пары удалённого пира
 #    (RETURN/ACCEPT), иначе они живут до следующего boot/тоггла.

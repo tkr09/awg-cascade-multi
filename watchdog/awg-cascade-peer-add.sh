@@ -33,6 +33,17 @@ fi
 WG_CONF="/etc/amnezia/amneziawg/${IFACE}.conf"
 [ -f "$WG_CONF" ] || { echo "{\"error\":\"$WG_CONF not found\"}"; exit 1; }
 
+# ─── Критическая секция ──────────────────────────────────────────────────────
+# Всё от проверки дубликата до записи peers.json — под общим замком каскада
+# (тем же, что берут peer-rotate.sh и бот). Без него два одновременных запуска
+# читали список пиров ДО того, как соседний его дописал, и оба выбирали ОДИН И
+# ТОТ ЖЕ свободный IP: второй молча затирал первого в peers.json, а в конфиге
+# интерфейса оставались два пира с одинаковым AllowedIPs.
+# Держим замок меньше секунды, watchdog за это время лишь пропустит один тик.
+FLOCK=/etc/awg-cascade/state.lock
+exec 200>"$FLOCK"
+flock -x 200
+
 # Не дублируем (имена глобальны — по обоим интерфейсам)
 if [ -f "$PEERS_JSON" ] && jq -e --arg n "$NAME" 'map(.name) | index($n)' "$PEERS_JSON" >/dev/null 2>&1; then
     echo "{\"error\":\"peer $NAME already exists\"}"; exit 1
@@ -152,6 +163,8 @@ jq --arg n "$NAME" --arg ip "$PEER_IP" --arg pk "$PUBKEY" --arg if "$IFACE" \
    "$PEERS_JSON" > "$TMP" && mv "$TMP" "$PEERS_JSON"
 chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
 chmod 644 "$PEERS_JSON"
+
+flock -u 200        # конец критической секции
 
 # 5. Output JSON для бота
 jq -n \

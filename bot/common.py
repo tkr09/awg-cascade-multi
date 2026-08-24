@@ -25,6 +25,7 @@ LOG = logging.getLogger("awg.common")
 CONFIG_PATH = Path("/etc/awg-cascade/config")
 STATE_PATH = Path("/etc/awg-cascade/state.json")
 STATE_LOCK = Path("/etc/awg-cascade/state.lock")
+PEERS_PATH = Path("/etc/awg-cascade/peers.json")
 PEERS_DIR = Path("/etc/awg-cascade/peers")
 EXITS_DIR = Path("/etc/awg-cascade/exits")
 SSH_KEY = Path("/etc/awg-cascade/ssh/id_ed25519")
@@ -99,18 +100,45 @@ def state_load() -> dict[str, Any]:
                 "kill_switch_active": True, "last_update": None}
 
 
-def state_save(state: dict[str, Any]) -> None:
-    """Atomic save with file lock."""
+def _state_write_unlocked(state: dict[str, Any]) -> None:
+    """Запись state. Вызывать ТОЛЬКО удерживая STATE_LOCK."""
     state["last_update"] = datetime.now(timezone.utc).isoformat()
     tmp = STATE_PATH.with_suffix(".tmp")
-    # Lock file: создаём с 666 если ещё нет (чтобы и watchdog от root и бот от awgbot могли)
+    with tmp.open("w") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, STATE_PATH)
+    os.chmod(STATE_PATH, 0o644)
+
+
+# state_save() намеренно НЕ существует. Она записывала объект, прочитанный
+# когда-то раньше, и затирала всё, что watchdog успел записать в промежутке.
+# Единственный способ поменять state из бота — state_locked() ниже.
+
+
+@contextlib.contextmanager
+def state_locked():
+    """Прочитать state, дать поменять и записать — всё под одной блокировкой.
+
+    Зачем: watchdog пишет state.json точечными jq-фильтрами каждые несколько
+    секунд (ping_ring, ping_avg, status, handshake_age, weight). Бот же писал
+    ФАЙЛ ЦЕЛИКОМ из объекта, прочитанного до того, как начал долгую операцию, —
+    и всё, что watchdog успел записать за это время, молча пропадало.
+
+    Внутри блока нельзя делать ничего долгого (SSH, запросы к Telegram): пока
+    он не закрыт, watchdog ждёт на flock. Схема — сделать долгое ДО, а внутри
+    только присвоить поля.
+    """
     fd = os.open(str(STATE_LOCK), os.O_RDWR | os.O_CREAT, 0o666)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        with tmp.open("w") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, STATE_PATH)
-        os.chmod(STATE_PATH, 0o644)
+        try:
+            with STATE_PATH.open() as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            state = {"schema": 1, "exits": [], "active_default_route": [],
+                     "kill_switch_active": True, "last_update": None}
+        yield state
+        _state_write_unlocked(state)
     finally:
         os.close(fd)
 
@@ -126,37 +154,64 @@ def get_exit(state: dict[str, Any], identifier: str) -> dict[str, Any] | None:
 # ─── Peers (clients of awg0) ─────────────────────────────────────────────────
 
 def peers_list() -> list[dict[str, Any]]:
-    peers_json = Path("/etc/awg-cascade/peers.json")
-    if not peers_json.exists():
+    if not PEERS_PATH.exists():
         return []
-    return json.loads(peers_json.read_text())
+    return json.loads(PEERS_PATH.read_text())
+
+
+def _peers_write_unlocked(peers: list[dict[str, Any]]) -> None:
+    """Запись peers.json. Вызывать ТОЛЬКО удерживая STATE_LOCK."""
+    tmp = PEERS_PATH.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        json.dump(peers, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, PEERS_PATH)
+    os.chmod(PEERS_PATH, 0o644)
 
 
 def peers_save(peers: list[dict[str, Any]]) -> None:
-    peers_json = Path("/etc/awg-cascade/peers.json")
-    tmp = peers_json.with_suffix(".tmp")
     fd = os.open(str(STATE_LOCK), os.O_RDWR | os.O_CREAT, 0o666)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        with tmp.open("w") as f:
-            json.dump(peers, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, peers_json)
-        os.chmod(peers_json, 0o644)
+        _peers_write_unlocked(peers)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def peers_locked():
+    """Прочитать peers.json, дать поменять и записать — под одной блокировкой.
+
+    peers.json пишут четверо: бот и три helper-скрипта (peer-add, peer-remove,
+    peer-rotate), причём скрипты — через `jq файл > tmp && mv`. Общий замок —
+    /etc/awg-cascade/state.lock (его же берёт peer-rotate.sh), поэтому здесь и
+    в шелле блокировка одна и та же.
+    """
+    fd = os.open(str(STATE_LOCK), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            peers = json.loads(PEERS_PATH.read_text())
+        except FileNotFoundError:
+            peers = []
+        yield peers
+        _peers_write_unlocked(peers)
     finally:
         os.close(fd)
 
 
 def peer_update(name: str, **changes: Any) -> dict | None:
-    """Update one peer fields atomically. Returns updated peer or None."""
-    peers = peers_list()
+    """Обновить поля одного пира атомарно. Возвращает обновлённого пира или None.
+
+    Раньше читало список вне блокировки и записывало под ней: параллельный
+    peer-add.sh между чтением и записью терялся целиком.
+    """
     updated = None
-    for p in peers:
-        if p["name"] == name:
-            p.update(changes)
-            updated = p
-            break
-    if updated:
-        peers_save(peers)
+    with peers_locked() as peers:
+        for p in peers:
+            if p["name"] == name:
+                p.update(changes)
+                updated = dict(p)
+                break
     return updated
 
 

@@ -19,7 +19,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from common import (admin_only, cfg, fmt_age, format_geo, geoip_lookup,
                     html_escape, local_run, name_to_flag, peers_list, ping_bar,
                     safe_edit_text, ssh_copy_id, ssh_exec, state_load,
-                    state_save, status_icon, sudo_run, SSH_KEY)
+                    state_locked, status_icon, sudo_run, SSH_KEY)
 
 LOG = logging.getLogger("awg.exits")
 router = Router(name="exits")
@@ -276,13 +276,13 @@ async def fsm_note_text(message: Message, state: FSMContext) -> None:
         text = ""
     await state.clear()
 
-    st = state_load()
-    e = _get_exit(st, iface)
+    with state_locked() as st:
+        e = _get_exit(st, iface)
+        if e:
+            e["note"] = text[:200]
     if not e:
         await message.answer("Exit не найден")
         return
-    e["note"] = text[:200]
-    state_save(st)
     # Показываем меню с обновлённым статусом (там же видна новая заметка)
     await message.answer(
         _render_exit_status(e),
@@ -325,13 +325,13 @@ async def fsm_rename(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
 
-    st = state_load()
-    e = _get_exit(st, iface)
+    with state_locked() as st:
+        e = _get_exit(st, iface)
+        if e:
+            e["name"] = new_name
     if not e:
         await message.answer("Exit не найден.")
         return
-    e["name"] = new_name
-    state_save(st)
     await message.answer(
         f"✅ Имя обновлено: <b>{new_name}</b>",
         parse_mode="HTML",
@@ -380,19 +380,34 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
         except json.JSONDecodeError:
             new_warp = op if "OK" in out else "unknown"
 
-    # Сохраняем в state. При WARP on делаем GeoIP-lookup на exit IP — кешируем.
-    e["warp_state"] = new_warp
+    # GeoIP по exit IP — ДО взятия блокировки: это сетевой запрос, а под
+    # STATE_LOCK ждёт watchdog.
+    warp_geo = None
     if exit_warp_ip:
-        e["warp_exit_ip"] = exit_warp_ip
         try:
             geo = await geoip_lookup(exit_warp_ip)
-            e["warp_exit_geo"] = format_geo(geo) if geo else None
+            warp_geo = format_geo(geo) if geo else None
         except Exception:
-            e["warp_exit_geo"] = None
-    elif new_warp == "off":
-        e.pop("warp_exit_ip", None)
-        e.pop("warp_exit_geo", None)
-    state_save(state)
+            warp_geo = None
+
+    # Между чтением state выше и этим местом прошёл SSH (до 120 с) и GeoIP.
+    # Раньше здесь писался объект, прочитанный ДО них, и всё, что watchdog
+    # успел записать за это время (ping_ring, status, weight), пропадало.
+    # Теперь перечитываем под блокировкой и правим только свои поля.
+    def _apply(exit_obj: dict) -> None:
+        exit_obj["warp_state"] = new_warp
+        if exit_warp_ip:
+            exit_obj["warp_exit_ip"] = exit_warp_ip
+            exit_obj["warp_exit_geo"] = warp_geo
+        elif new_warp == "off":
+            exit_obj.pop("warp_exit_ip", None)
+            exit_obj.pop("warp_exit_geo", None)
+
+    with state_locked() as fresh:
+        fresh_e = _get_exit(fresh, iface)
+        if fresh_e is not None:
+            _apply(fresh_e)
+    _apply(e)   # локальная копия — только для отрисовки ответа ниже
 
     # UI update через safe_edit_text — retry 3x с backoff 1/2/4 сек.
     # Cascade моргает при WARP toggle (роуты на exit перестраиваются),
