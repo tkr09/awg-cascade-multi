@@ -9,7 +9,7 @@
 #   4. Если handshake > 180s → reconnect awgN
 #   5. Atomic update state.json
 #   6. ECMP route replace
-#   7. Каждые 5 мин пересчёт весов (если разница > 20%)
+#   7. Каждые 5 мин пересчёт весов (пороги + гистерезис + выдержка, см. ниже)
 #   8. ntfy alerts через --interface $MAIN_IFACE (emergency egress, мимо каскада)
 #
 # Запускается из awg-cascade-watchdog.service (systemd)
@@ -31,7 +31,27 @@ UP_THRESHOLD=2             # 2 success подряд → UP
 PING_TIMEOUT=2             # сек
 HANDSHAKE_MAX=180          # сек, после этого reconnect
 WEIGHT_RECALC_TICKS=30     # 30 тиков * 10с = 5 мин
-WEIGHT_DIFF_PERCENT=20     # пересчёт весов только если разница > 20%
+
+# ─── Веса ECMP ────────────────────────────────────────────────────────────────
+# ВАЖНО, почему тут пороги, а не формула от min_ping (как было до v2.1.6):
+# `ip route replace` на multipath-маршруте НЕ бесплатен. При
+# fib_multipath_hash_policy=1 nexthop выбирается по хешу L4-кортежа на каждый
+# пакет, привязки потока к маршруту в Linux нет. Смена весов двигает границы
+# бакетов → часть ЖИВЫХ соединений переезжает на другой exit → там другой
+# MASQUERADE и другой внешний IP → установленные TCP/TLS-сессии рвутся.
+#
+# Старая формула weight = min_ping_alive/this_ping*10 меняла веса 110-145 раз
+# в сутки (замер по логам обеих RU), то есть практически каждый пересчёт рвал
+# кому-то соединения. Две причины: min_ping — ПОДВИЖНАЯ точка отсчёта (джиттер
+# на самом быстром exit'е пересчитывал веса сразу всем), а порог в 20%
+# сравнивался на целых 1..10, где шаг ±1 это 10-50% и проходил почти всегда.
+#
+# Теперь: фиксированные пороги пинга (ни от кого не зависят) + гистерезис на
+# границе + минимальная выдержка между сменами + медиана вместо среднего.
+WEIGHT_TIERS="30:10 45:8 65:6 90:4 130:2"   # <ping_ms>:<вес>, свыше последнего → 1
+: "${WEIGHT_HYST_PCT:=15}"      # на сколько % надо перевалить границу, чтобы УХУДШИТЬ вес
+: "${WEIGHT_MIN_DWELL:=1800}"   # сек: не менять вес одного iface чаще, чем раз в 30 мин
+: "${WEIGHT_URGENT_DELTA:=6}"   # обвал на 3+ ступени (напр. 8→2) — деградация, выдержку игнорируем
 
 # ─── Alerting (A) — значения можно переопределить в /etc/awg-cascade/config ──
 : "${BOT_USER:=awgbot}"
@@ -146,10 +166,34 @@ reconnect_iface() {
     awg-quick up   "$iface" >/dev/null 2>&1 || true
 }
 
+# Отпечаток желаемого состояния peer-routing: пары «ip>интерфейс» плюс живость
+# каждого задействованного интерфейса. Меняется ровно тогда, когда правила надо
+# перестраивать, — и не меняется от тика к тику при спокойном каскаде.
+PEERS_JSON=/etc/awg-cascade/peers.json
+PEER_ROUTING_SIG=""
+PEER_TABLES_APPLIED=""
+
+peer_routing_signature() {
+    [ -f "$PEERS_JSON" ] || { echo "-"; return; }
+    local pairs iface up=""
+    pairs=$(jq -r '[.[] | select(.pinned_exit != null) | "\(.ip)>\(.pinned_exit)"]
+                   | sort | join(",")' "$PEERS_JSON" 2>/dev/null)
+    for iface in $(jq -r '[.[] | .pinned_exit // empty] | unique | .[]?' "$PEERS_JSON" 2>/dev/null); do
+        ip link show "$iface" >/dev/null 2>&1 && up="$up$iface:1," || up="$up$iface:0,"
+    done
+    echo "$pairs|$up"
+}
+
 # Применить per-peer routing rules: pinned peers → их exit (table 100+idx),
 # остальные (auto) — через fwmark→table 100 (ECMP).
+#
+# ВЫЗЫВАТЬ ТОЛЬКО ПРИ ИЗМЕНЕНИИ (см. peer_routing_signature). До v2.1.6 эта
+# функция бежала КАЖДЫЙ тик, то есть раз в 10 секунд сносила правила priority
+# 999 и заново их ставила. В окне между `ip rule del` и `ip rule add` pinned-пир
+# проваливался на общее правило fwmark → table 100 и уезжал в ECMP на чужой
+# exit — то есть его соединения рвались каждые 10 секунд. Плюс `seq 101 199`
+# давал 99 вызовов `ip route show` на тик впустую.
 apply_peer_routing() {
-    local PEERS_JSON=/etc/awg-cascade/peers.json
     [ -f "$PEERS_JSON" ] || return 0
 
     # 1. Удаляем все наши per-peer rules (priority 999, from <ip>/32)
@@ -157,12 +201,14 @@ apply_peer_routing() {
         ip rule del priority 999 2>/dev/null || break
     done
 
-    # 2. Чистим персональные таблицы 101..199
-    for tid in $(seq 101 199); do
-        if ip route show table $tid 2>/dev/null | grep -q .; then
-            ip route flush table $tid 2>/dev/null
-        fi
+    # 2. Чистим только те персональные таблицы, которые сами же и наполняли в
+    #    прошлый раз. Слепой проход по 101..199 не нужен: чужого там быть не
+    #    может, а свои мы помним.
+    local tid
+    for tid in $PEER_TABLES_APPLIED; do
+        ip route flush table "$tid" 2>/dev/null
     done
+    PEER_TABLES_APPLIED=""
 
     # 3. Для каждого pinned peer'а:
     #    - table = 100 + exit_index
@@ -180,14 +226,40 @@ apply_peer_routing() {
             continue
         fi
 
-        local idx tid
+        local idx ptid
         idx=$(echo "$pinned" | sed 's/awg//')
         [[ "$idx" =~ ^[0-9]+$ ]] || continue
-        tid=$((100 + idx))
+        ptid=$((100 + idx))
 
-        ip route replace default dev "$pinned" table "$tid"
-        ip rule add from "${peer_ip}/32" lookup "$tid" priority 999 2>/dev/null
+        ip route replace default dev "$pinned" table "$ptid"
+        ip rule add from "${peer_ip}/32" lookup "$ptid" priority 999 2>/dev/null
+        case " $PEER_TABLES_APPLIED " in
+            *" $ptid "*) ;;
+            *) PEER_TABLES_APPLIED="$PEER_TABLES_APPLIED $ptid" ;;
+        esac
     done < <(jq -c '.[]' "$PEERS_JSON" 2>/dev/null)
+}
+
+# Перестроить peer-routing, только если желаемое состояние изменилось.
+sync_peer_routing() {
+    local sig
+    sig=$(peer_routing_signature)
+    [ "$sig" = "$PEER_ROUTING_SIG" ] && return 0
+    apply_peer_routing
+    PEER_ROUTING_SIG="$sig"
+}
+
+# Разовая уборка на старте. Инкрементальная чистка выше помнит только таблицы,
+# которые наполнил ЭТОТ процесс, поэтому после рестарта watchdog'а таблицы от
+# прошлого запуска остались бы висеть. Сами по себе они безвредны (правил на них
+# нет, значит в маршрутизации не участвуют), но пусть не копятся. Проход по
+# 101..199 стоит дорого только когда он на каждом тике — раз при старте не жалко.
+peer_routing_initial_cleanup() {
+    local tid
+    for tid in $(seq 101 199); do
+        ip route show table "$tid" 2>/dev/null | grep -q . \
+            && ip route flush table "$tid" 2>/dev/null
+    done
 }
 
 # Применить ECMP route в table 100 на основе текущего state
@@ -230,58 +302,72 @@ apply_route() {
     update_state ".active_default_route = $active_json | .kill_switch_active = $kill_switch"
 }
 
-# Пересчёт весов: weight = round(min_ping_alive / this_ping * 10), min 1
+# Вес по пингу: фиксированные пороги + гистерезис на границе.
+# $1 = пинг (целое, мс), $2 = текущий вес. Печатает новый вес.
+#
+# Гистерезис асимметричный и это намеренно: УЛУЧШЕНИЕ применяется сразу, а
+# чтобы ухудшить вес, пинг должен перевалить границу с запасом. Иначе пинг,
+# болтающийся ровно на пороге, гонял бы вес туда-сюда — ровно то, от чего
+# уходим. Расширяем только ту границу, на которой стоим сейчас.
+weight_for_ping() {
+    local p=$1 cur=${2:-0} tier bound w
+    for tier in $WEIGHT_TIERS; do
+        bound=${tier%%:*}
+        w=${tier##*:}
+        [ "$w" = "$cur" ] && bound=$(( bound * (100 + WEIGHT_HYST_PCT) / 100 ))
+        if [ "$p" -lt "$bound" ]; then echo "$w"; return; fi
+    done
+    echo 1
+}
+
+# Пересчёт весов ECMP. Осторожно: каждая смена веса перетасовывает живые потоки
+# между exit'ами (см. блок WEIGHT_TIERS выше), поэтому здесь три независимых
+# тормоза — пороги, гистерезис и выдержка.
 recompute_weights() {
-    local pings=()
-    local ifaces=()
+    local now need_apply=false
+    now=$(date +%s)
+
     while IFS= read -r row; do
-        local iface enabled status avg
-        iface=$(jq -r .interface  <<<"$row")
-        enabled=$(jq -r .enabled  <<<"$row")
-        status=$(jq -r .status    <<<"$row")
-        avg=$(jq -r '.ping_avg // empty' <<<"$row")
-        if [ "$enabled" = "true" ] && [ "$status" = "up" ] && [ -n "$avg" ]; then
-            pings+=("$avg")
-            ifaces+=("$iface")
+        local iface enabled status med cur_weight changed_at new_weight
+        iface=$(jq -r .interface <<<"$row")
+        enabled=$(jq -r .enabled <<<"$row")
+        status=$(jq -r .status   <<<"$row")
+        [ "$enabled" = "true" ] && [ "$status" = "up" ] || continue
+
+        # Медиана ring'а, а не среднее: одиночный выброс (наблюдали 30→114 мс на
+        # PL) сдвигает среднее настолько, что вес прыгал 6→2 и обратно.
+        med=$(jq -r '[.ping_ring[] | select(. > 0)] | sort
+                     | if length == 0 then empty else .[(length/2)|floor] end' <<<"$row")
+        [ -n "$med" ] || continue
+        med=${med%.*}
+        [ "$med" -lt 1 ] && med=1
+
+        cur_weight=$(jq -r '.weight // 0'            <<<"$row")
+        changed_at=$(jq -r '.weight_changed_at // 0' <<<"$row")
+        case "$changed_at" in ''|*[!0-9]*) changed_at=0 ;; esac
+
+        new_weight=$(weight_for_ping "$med" "$cur_weight")
+        [ "$new_weight" = "$cur_weight" ] && continue
+
+        # Выдержка. Обходим её ТОЛЬКО при резком ухудшении: держать трафик
+        # полчаса на обвалившемся exit'е хуже, чем разово перетасовать потоки.
+        # Восстановление выдержку не обходит — оно не срочное (трафик и так
+        # идёт по живым exit'ам), а спешка тут превратила бы пару
+        # «просадка + возврат» в две перетасовки подряд.
+        local urgent=0
+        if [ "$new_weight" -lt "$cur_weight" ] \
+           && [ $(( cur_weight - new_weight )) -ge "$WEIGHT_URGENT_DELTA" ]; then
+            urgent=1
         fi
+        if [ "$urgent" = "0" ] && [ $(( now - changed_at )) -lt "$WEIGHT_MIN_DWELL" ]; then
+            continue
+        fi
+
+        update_state "(.exits[] | select(.interface==\"$iface\"))
+                      |= (.weight = $new_weight | .weight_changed_at = $now)"
+        log "WEIGHT $iface: $cur_weight → $new_weight (медиана=${med}ms, выдержка=$(( now - changed_at ))s)"
+        need_apply=true
     done < <(jq -c '.exits[]' "$STATE")
-
-    local n=${#pings[@]}
-    [ "$n" -lt 1 ] && return
-
-    # Минимальный пинг среди живых
-    local min_ping=999999
-    for p in "${pings[@]}"; do
-        # int сравнение через bc если float
-        local pi=${p%.*}
-        [ "$pi" -lt "$min_ping" ] && min_ping=$pi
-    done
-    [ "$min_ping" -lt 1 ] && min_ping=1
-
-    # Считаем новые веса
-    local need_apply=false
-    for i in "${!ifaces[@]}"; do
-        local iface=${ifaces[$i]}
-        local p=${pings[$i]%.*}
-        [ "$p" -lt 1 ] && p=1
-        local new_weight=$(( (min_ping * 10 + p / 2) / p ))
-        [ "$new_weight" -lt 1 ] && new_weight=1
-        [ "$new_weight" -gt 10 ] && new_weight=10
-
-        local cur_weight
-        cur_weight=$(jq -r ".exits[] | select(.interface==\"$iface\") | .weight" "$STATE")
-
-        # Применять только если разница > WEIGHT_DIFF_PERCENT
-        local diff_pct=0
-        if [ "$cur_weight" -gt 0 ]; then
-            diff_pct=$(( (new_weight > cur_weight ? new_weight - cur_weight : cur_weight - new_weight) * 100 / cur_weight ))
-        fi
-        if [ "$diff_pct" -ge "$WEIGHT_DIFF_PERCENT" ]; then
-            update_state "(.exits[] | select(.interface==\"$iface\")) |= (.weight = $new_weight)"
-            log "WEIGHT $iface: $cur_weight → $new_weight (ping=${p}ms, min=${min_ping}ms)"
-            need_apply=true
-        fi
-    done
 
     $need_apply && apply_route
 }
@@ -438,10 +524,13 @@ ntfy "🚀 Watchdog started" "low" "rocket" "Host: $(hostname)\nTick: ${TICK_INT
 
 postboot_check
 apply_route
-apply_peer_routing
+peer_routing_initial_cleanup
+sync_peer_routing   # первый прогон заодно инициализирует отпечаток
 
-# SIGUSR1 = немедленно пересобрать peer-routing (когда бот меняет pin)
-trap 'apply_peer_routing; log "SIGUSR1: peer routing reapplied"' SIGUSR1
+# SIGUSR1 = немедленно пересобрать peer-routing (когда бот меняет pin).
+# Строим безусловно и обновляем отпечаток: бот шлёт сигнал именно потому, что
+# уже изменил peers.json, а ждать следующего тика незачем.
+trap 'apply_peer_routing; PEER_ROUTING_SIG=$(peer_routing_signature); log "SIGUSR1: peer routing reapplied"' SIGUSR1
 
 while true; do
     TICK_COUNT=$(( TICK_COUNT + 1 ))
@@ -463,8 +552,10 @@ while true; do
     # таблица 100 опустела из-за restart awg-quick@awgN или ручного down/up.
     apply_route
 
-    # Применяем per-peer pinned маршруты (раз в тик — копеечно)
-    apply_peer_routing
+    # Per-peer pinned маршруты: сверяем отпечаток и трогаем правила ТОЛЬКО если
+    # что-то реально изменилось (сменился pin или упал/поднялся его интерфейс).
+    # Безусловная перестройка каждый тик рвала соединения pinned-пиров.
+    sync_peer_routing
 
     # Страховка ip rules: policy-routing (uidrange/fwmark → table 100) может
     # быть стёрт переконфигурацией сети В РАНТАЙМЕ (netplan/networkd при
