@@ -71,6 +71,8 @@ WEIGHT_TIERS="30:10 45:8 65:6 90:4 130:2"   # <ping_ms>:<вес>, свыше п�
 : "${LOAD_ALERT_MULT:=2}"          # алерт если load1 > MULT * nproc
 : "${RES_COOLDOWN:=21600}"         # 6ч между повторами level-алертов (disk/ram/load)
 : "${EGRESS_CHECK_URL:=https://api.telegram.org}"
+: "${NTFY_TIMEOUT:=15}"            # сек на попытку (замер: обычно 0.4с, но бывает 5.4с)
+: "${NTFY_RETRIES:=3}"             # попыток доставки аварийного алерта
 ALERT=/usr/local/sbin/awg-cascade-alert.sh
 NPROC=$(nproc 2>/dev/null || echo 1)
 
@@ -117,16 +119,40 @@ update_state() {
     ) 200>"$STATE_LOCK"
 }
 
-# Send ntfy via eth0 (emergency egress, bypasses cascade)
+# Send ntfy via eth0 (emergency egress, bypasses cascade).
+#
+# С ретраями, и это не перестраховка: замерено на живых нодах, что обычный
+# запрос к ntfy.sh идёт 0.37 с, но иногда затягивается до 5.4 с. При прежнем
+# `--max-time 8` без повторов одной такой заминки хватало, чтобы алерт пропал
+# навсегда — так владелец не узнал о трёх падениях exit'а 25-26.08.2026.
+# Алерт шлётся ровно в момент аварии, то есть тогда, когда сеть и так не в
+# лучшей форме; одна попытка для аварийного канала — слишком мало.
+# Отправка идёт в ФОНЕ, и это обязательно: три попытки по $NTFY_TIMEOUT плюс
+# паузы — это до ~54 с, а тик цикла всего 10 с. Синхронная отправка застопорила
+# бы пинги и обновление состояния всех exit'ов, причём именно в аварии, когда
+# алертов много и мониторинг нужен больше всего. Возвращаемое значение
+# вызывающие стороны не используют, поэтому отвязка ничего не ломает.
 ntfy() {
     local title="$1" priority="${2:-default}" tags="${3:-}" body="${4:-}"
     [ -n "${NTFY_URL:-}" ] || return 0
-    curl --interface "$MAIN_IFACE" -s --max-time 8 \
-        -H "Title: $title" \
-        -H "Priority: $priority" \
-        -H "Tags: $tags" \
-        -d "$body" \
-        "$NTFY_URL" >/dev/null 2>&1 || log "WARN: ntfy failed (iface=$MAIN_IFACE)"
+    (
+        attempt=1
+        while [ "$attempt" -le "$NTFY_RETRIES" ]; do
+            if curl --interface "$MAIN_IFACE" -s --max-time "$NTFY_TIMEOUT" \
+                -H "Title: $title" \
+                -H "Priority: $priority" \
+                -H "Tags: $tags" \
+                -d "$body" \
+                "$NTFY_URL" >/dev/null 2>&1; then
+                [ "$attempt" -gt 1 ] && log "ntfy доставлен с попытки $attempt"
+                exit 0
+            fi
+            [ "$attempt" -lt "$NTFY_RETRIES" ] && sleep $(( attempt * 3 ))
+            attempt=$(( attempt + 1 ))
+        done
+        log "WARN: ntfy НЕ доставлен за $NTFY_RETRIES попыток (iface=$MAIN_IFACE, timeout=${NTFY_TIMEOUT}s)"
+    ) &
+    return 0
 }
 
 # Возвращает handshake age в секундах (9999 если нет handshake)
@@ -398,20 +424,22 @@ check_bot_egress() {
             EGRESS_STATE=down
             log "EGRESS DOWN (bot→Telegram, fails=$EGRESS_FAILS)"
             "$ALERT" egress-down 0 "🔴 Бот не видит Telegram" urgent rotating_light \
-                "curl $EGRESS_CHECK_URL = ${code:-timeout} (через каскад). Смотри ip rules / exits / egress."
+                "curl $EGRESS_CHECK_URL = ${code:-timeout} (через каскад). Смотри ip rules / exits / egress." &
         fi
     else
         if [ "$EGRESS_STATE" = "down" ]; then
             EGRESS_STATE=up
             log "EGRESS UP (bot→Telegram restored, code=$code)"
             "$ALERT" egress-up 0 "🟢 Egress восстановлен" high white_check_mark \
-                "Бот снова видит Telegram (HTTP $code)."
+                "Бот снова видит Telegram (HTTP $code)." &
         fi
         EGRESS_FAILS=0
     fi
 }
 
 # Disk / RAM / load — level-алерты с cooldown.
+# Вызовы $ALERT ниже уходят в фон (&) по той же причине, что и ntfy(): внутри
+# alert.sh теперь до трёх попыток доставки, и синхронный вызов задержал бы тик.
 check_resources() {
     local disk ram load1
     disk=$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
@@ -419,13 +447,13 @@ check_resources() {
     load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
     [ -n "$disk" ] && [ "$disk" -ge "$DISK_ALERT_PCT" ] && \
         "$ALERT" disk-high "$RES_COOLDOWN" "⚠️ Диск ${disk}%" high warning \
-            "Занято ${disk}% на / (порог ${DISK_ALERT_PCT}%)."
+            "Занято ${disk}% на / (порог ${DISK_ALERT_PCT}%)." &
     [ -n "$ram" ] && [ "$ram" -ge "$RAM_ALERT_PCT" ] && \
         "$ALERT" ram-high "$RES_COOLDOWN" "⚠️ RAM ${ram}%" high warning \
-            "Память ${ram}% (порог ${RAM_ALERT_PCT}%)."
+            "Память ${ram}% (порог ${RAM_ALERT_PCT}%)." &
     if [ -n "$load1" ] && awk -v l="$load1" -v t="$(( LOAD_ALERT_MULT * NPROC ))" 'BEGIN{exit !(l>t)}'; then
         "$ALERT" load-high "$RES_COOLDOWN" "⚠️ Load ${load1}" high warning \
-            "load1=${load1} > ${LOAD_ALERT_MULT}×${NPROC} ядер."
+            "load1=${load1} > ${LOAD_ALERT_MULT}×${NPROC} ядер." &
     fi
 }
 
@@ -481,6 +509,19 @@ process_exit() {
     local ping_ms hs
     ping_ms=$(smart_ping "$iface")
     hs=$(hs_age "$iface")
+
+    # Fail-safe. smart_ping обязан вернуть число или -1, но если в момент
+    # замера пришёл сигнал (например SIGUSR1 от бота при смене pin'а), ping
+    # обрывается и подстановка отдаёт ПУСТО. Дальше пустое значение уезжало
+    # прямо в jq-фильтр, тот собирался битым (`.ping_ring + []`, `.last_ping =`)
+    # и update_state падал с ошибкой — наблюдали 25.08.2026 на RU-1.
+    # Непрочитанный замер трактуем как неудачный: потерять одну точку не жалко,
+    # сломать обновление состояния — жалко.
+    case "$ping_ms" in
+        -1)          ;;                 # штатный признак неудачи
+        ''|*[!0-9]*) ping_ms=-1 ;;      # пусто или не число целиком
+    esac
+    case "$hs" in ''|*[!0-9]*) hs=9999 ;; esac
 
     if [ "$ping_ms" = "-1" ]; then
         FAIL_COUNT[$iface]=$(( ${FAIL_COUNT[$iface]:-0} + 1 ))

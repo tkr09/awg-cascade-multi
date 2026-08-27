@@ -18,12 +18,24 @@ ip link show "$MAIN_IFACE" >/dev/null 2>&1 || MAIN_IFACE=$(
 
 log() { echo "$(date -Iseconds) POSTBOOT $*" >> "$LOG"; }
 
+# С ретраями — см. пояснение в awg-cascade-watchdog.sh. Здесь это особенно
+# важно: сообщение отправляется сразу после загрузки, когда сеть только встаёт
+# и первая попытка проваливается охотнее обычного, а второго шанса у postboot
+# нет — юнит oneshot и больше не запустится.
 ntfy() {
     local title="$1" priority="${2:-default}" tags="${3:-}" body="${4:-}"
     [ -n "${NTFY_URL:-}" ] || return 0
-    curl --interface "$MAIN_IFACE" -s --max-time 8 \
-        -H "Title: $title" -H "Priority: $priority" -H "Tags: $tags" \
-        -d "$body" "$NTFY_URL" >/dev/null 2>&1 || true
+    : "${NTFY_TIMEOUT:=15}"
+    : "${NTFY_RETRIES:=3}"
+    local attempt
+    for attempt in $(seq 1 "$NTFY_RETRIES"); do
+        curl --interface "$MAIN_IFACE" -s --max-time "$NTFY_TIMEOUT" \
+            -H "Title: $title" -H "Priority: $priority" -H "Tags: $tags" \
+            -d "$body" "$NTFY_URL" >/dev/null 2>&1 && return 0
+        [ "$attempt" -lt "$NTFY_RETRIES" ] && sleep $(( attempt * 3 ))
+    done
+    log "WARN: ntfy НЕ доставлен за $NTFY_RETRIES попыток"
+    return 1
 }
 
 issues=()

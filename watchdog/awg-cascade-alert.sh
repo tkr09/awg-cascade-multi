@@ -48,13 +48,27 @@ if [ "$COOLDOWN" -gt 0 ] && [ -f "$STAMP" ]; then
 fi
 
 [ -n "${NTFY_URL:-}" ] || exit 0
+: "${NTFY_TIMEOUT:=15}"
+: "${NTFY_RETRIES:=3}"
+
 # Stamp пишем ТОЛЬКО после успешной доставки — иначе упавший curl «съест» весь
 # cooldown и алерт промолчит N часов, ни разу не дойдя.
-if curl --interface "$MAIN_IFACE" -s --max-time 8 \
-    -H "Title: $TITLE" \
-    -H "Priority: $PRIO" \
-    -H "Tags: $TAGS" \
-    -d "$(printf '%s\nHost: %s' "$BODY" "$(hostname)")" \
-    "$NTFY_URL" >/dev/null 2>&1; then
-    echo "$now" > "$STAMP" 2>/dev/null || true
-fi
+#
+# Ретраи по той же причине, что и в watchdog'е: замерено, что запрос к ntfy.sh
+# обычно идёт 0.37 с, но иногда затягивается до 5.4 с, а одной попытки с
+# коротким таймаутом хватало, чтобы алерт потерялся. Здесь это ещё чувствительнее:
+# сюда приходят диск, RAM, SSH-входы и упавшие юниты — то, что дедуплицируется
+# длинным cooldown'ом и потому повторится не скоро.
+for _attempt in $(seq 1 "$NTFY_RETRIES"); do
+    if curl --interface "$MAIN_IFACE" -s --max-time "$NTFY_TIMEOUT" \
+        -H "Title: $TITLE" \
+        -H "Priority: $PRIO" \
+        -H "Tags: $TAGS" \
+        -d "$(printf '%s\nHost: %s' "$BODY" "$(hostname)")" \
+        "$NTFY_URL" >/dev/null 2>&1; then
+        echo "$now" > "$STAMP" 2>/dev/null || true
+        exit 0
+    fi
+    [ "$_attempt" -lt "$NTFY_RETRIES" ] && sleep $(( _attempt * 3 ))
+done
+exit 1
