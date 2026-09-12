@@ -173,7 +173,7 @@ def peers_kb(peers: list[dict]) -> InlineKeyboardMarkup:
     for p in peers:
         pinned = p.get("pinned_exit")
         suffix = f"  → {pinned}" if pinned else "  · 🔄 auto"
-        # 🛡 = пир на втором интерфейсе (AmneziaWG 3.0, header protection)
+        # 🛡 = пир на втором интерфейсе (AmneziaWG 3.1, header protection)
         mark = "🛡" if peer_iface(p) != "awg0" else "👤"
         rows.append([InlineKeyboardButton(
             text=f"{mark} {p['name']}  {p['ip']}{suffix}",
@@ -604,12 +604,17 @@ async def cb_peer_add(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(
         "<b>➕ Новый peer</b>\n\nВерсия протокола:\n\n"
         "<b>2.0</b> — работает у всех клиентов.\n"
-        "<b>3.0</b> 🛡 — плюс шифрование заголовков WireGuard и набивка пакетов. "
-        "Требует amnezia-client 3.x (или Keenetic AWG Manager ≥ 2.16.5) — "
-        "на старом клиенте конфиг просто не подключится.",
+        "<b>3.1</b> 🛡 — шифрование заголовков WireGuard, набивка пакетов и "
+        "рандомизация таймеров. Клиенту достаточно поддержки <b>3.x</b>: всё, "
+        "что добавила 3.1, работает на стороне сервера и в конфиг не попадает. "
+        "На клиенте 2.x конфиг не подключится — обратной совместимости между "
+        "версиями протокола нет.\n\n"
+        "⚠️ <b>Keenetic:</b> туннель должен быть в режиме <b>kernel</b>. В NativeWG "
+        "прошивка не понимает параметры 3.x и молча оставляет туннель на 2.0 — "
+        "он покажет «подключено», но к этому интерфейсу не подключится.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛡 3.0 (header protection)", callback_data=f"peers:addif:{c3}")],
+            [InlineKeyboardButton(text="🛡 3.1 (header protection)", callback_data=f"peers:addif:{c3}")],
             [InlineKeyboardButton(text="2.0 (совместимость)", callback_data="peers:addif:awg0")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="main")],
         ]),
