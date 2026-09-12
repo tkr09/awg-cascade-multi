@@ -29,6 +29,8 @@ PEERS_PATH = Path("/etc/awg-cascade/peers.json")
 PEERS_DIR = Path("/etc/awg-cascade/peers")
 EXITS_DIR = Path("/etc/awg-cascade/exits")
 SSH_KEY = Path("/etc/awg-cascade/ssh/id_ed25519")
+# Пины host-ключей exit'ов. TOFU: первый контакт запоминаем, дальше сверяем.
+KNOWN_HOSTS_PATH = Path("/etc/awg-cascade/known_hosts")
 WG_DIR = Path("/etc/amnezia/amneziawg")
 
 # AmneziaWG Default preset
@@ -229,6 +231,101 @@ def next_peer_ip(cfg: Config) -> str:
 
 # ─── SSH ─────────────────────────────────────────────────────────────────────
 
+# ─── Пиннинг host-ключей exit'ов ─────────────────────────────────────────────
+#
+# До этого бот подключался с known_hosts=None, то есть принимал ЛЮБОЙ ключ
+# хоста: перехват на пути RU->exit прошёл бы незамеченным, а по этому каналу
+# идут провижининг exit'а и выполнение команд под root.
+#
+# Схема — TOFU с пином: ключ, увиденный при первом контакте, запоминается, и
+# дальше любое расхождение это отказ. Жёсткий пин без TOFU здесь не годится:
+# exit заводится ботом на чистой машине, где взять ключ заранее неоткуда.
+#
+# Осознанная асимметрия в обработке ошибок: РАСХОЖДЕНИЕ ключа — отказ и алерт
+# (единственный настоящий сигнал атаки), а недоступность или порча самого файла
+# пинов — НЕ отказ: иначе сломанный файл отнял бы у бота управление всеми
+# exit'ами разом, то есть ровно ту аварию, которую мы предотвращаем.
+
+
+def _kh_name(host: str, port: int = 22) -> str:
+    """Имя хоста в формате known_hosts: для нестандартного порта — [host]:port."""
+    return host if port == 22 else "[{}]:{}".format(host, port)
+
+
+def host_key_known(host: str, port: int = 22) -> bool:
+    """Есть ли пин для этого хоста."""
+    try:
+        if not KNOWN_HOSTS_PATH.exists():
+            return False
+        name = _kh_name(host, port)
+        for line in KNOWN_HOSTS_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if name in line.split()[0].split(","):
+                return True
+    except OSError as e:
+        LOG.warning("known_hosts недоступен (%s) — работаем без пина", e)
+    return False
+
+
+def host_key_forget(host: str, port: int = 22) -> int:
+    """
+    Убирает пин. Нужен при ПЕРЕустановке exit'а: машина та же, ключ новый, и без
+    этого бот честно откажется подключаться. Вызывается из flow добавления
+    exit'а — там провижининг инициируем мы сами, значит смена ключа ожидаема.
+    Возвращает число удалённых строк.
+    """
+    try:
+        if not KNOWN_HOSTS_PATH.exists():
+            return 0
+        name = _kh_name(host, port)
+        kept, dropped = [], 0
+        for line in KNOWN_HOSTS_PATH.read_text().splitlines():
+            st = line.strip()
+            if st and not st.startswith("#") and name in st.split()[0].split(","):
+                dropped += 1
+                continue
+            kept.append(line)
+        if dropped:
+            tmp = KNOWN_HOSTS_PATH.with_suffix(".tmp")
+            body = ("\n".join(kept).rstrip() + "\n") if any(k.strip() for k in kept) else ""
+            tmp.write_text(body)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, KNOWN_HOSTS_PATH)
+            LOG.info("host-key пин снят для %s (строк: %d)", name, dropped)
+        return dropped
+    except OSError as e:
+        LOG.warning("не удалось снять пин для %s: %s", host, e)
+        return 0
+
+
+def _host_key_remember(host: str, port: int, key: Any) -> None:
+    """Записывает увиденный ключ. Тихо не делает ничего, если записать нельзя."""
+    try:
+        pub = key.export_public_key().decode().strip()
+        with open(KNOWN_HOSTS_PATH, "a", encoding="utf-8") as fh:
+            fh.write("{} {}\n".format(_kh_name(host, port), pub))
+        os.chmod(KNOWN_HOSTS_PATH, 0o600)
+        LOG.info("host-key запомнен (TOFU) для %s", _kh_name(host, port))
+    except (OSError, AttributeError) as e:
+        LOG.warning("не удалось запомнить host-key для %s: %s", host, e)
+
+
+async def _host_key_alert(host: str, detail: str) -> None:
+    """Расхождение ключа — событие для владельца, а не строчка в логе."""
+    with contextlib.suppress(Exception):
+        await sudo_run(
+            "/usr/local/sbin/awg-cascade-alert.sh",
+            "hostkey-{}".format(host), "3600",
+            "🛑 Host-key exit'а не совпал", "urgent", "warning",
+            "Бот отказался подключаться к {}: ключ хоста отличается от "
+            "запомненного.\n\n{}\n\nЕсли exit переустанавливали — заведите его "
+            "заново через бот, пин снимется. Если нет — это перехват.".format(host, detail),
+            timeout=25,
+        )
+
+
 async def ssh_exec(
     host: str, command: str, *, username: str = "root",
     password: str | None = None, key_path: Path | None = SSH_KEY,
@@ -238,8 +335,12 @@ async def ssh_exec(
     Запускает команду по SSH. Возвращает (stdout, stderr, exit_code).
     Если password задан — авторизация по паролю. Иначе — по key_path.
     """
+    # Пин есть — сверяем по нему. Пина нет — первый контакт (TOFU), запомним
+    # ключ сразу после установления соединения.
+    pinned = host_key_known(host, port)
     opts: dict[str, Any] = {
-        "username": username, "port": port, "known_hosts": None,
+        "username": username, "port": port,
+        "known_hosts": str(KNOWN_HOSTS_PATH) if pinned else None,
         "connect_timeout": 15,
     }
     if password:
@@ -249,6 +350,8 @@ async def ssh_exec(
 
     try:
         async with asyncssh.connect(host, **opts) as conn:
+            if not pinned:
+                _host_key_remember(host, port, conn.get_server_host_key())
             result = await asyncio.wait_for(conn.run(command, check=False), timeout=timeout)
             return (
                 result.stdout if isinstance(result.stdout, str) else (result.stdout.decode() if result.stdout else ""),
@@ -257,7 +360,13 @@ async def ssh_exec(
             )
     except asyncio.TimeoutError:
         return "", f"SSH timeout after {timeout}s", -2
-    except (asyncssh.PermissionDenied, asyncssh.HostKeyNotVerifiable) as e:
+    except asyncssh.HostKeyNotVerifiable as e:
+        # Отдельно от прочих ошибок авторизации и НЕ молча: ключ, не совпавший с
+        # запомненным, означает либо переустановку exit'а, либо перехват. Обе
+        # ситуации требуют человека, а не повтора попытки.
+        await _host_key_alert(host, str(e))
+        return "", f"SSH host-key mismatch: {e}", -4
+    except asyncssh.PermissionDenied as e:
         return "", f"SSH auth error: {e}", -3
     except (OSError, asyncssh.Error) as e:
         return "", f"SSH error: {e}", -1

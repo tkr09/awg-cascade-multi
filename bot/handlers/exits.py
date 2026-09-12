@@ -17,9 +17,9 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
 from common import (admin_only, cfg, fmt_age, format_geo, geoip_lookup,
-                    html_escape, local_run, name_to_flag, peers_list, ping_bar,
-                    safe_edit_text, ssh_copy_id, ssh_exec, state_load,
-                    state_locked, status_icon, sudo_run, SSH_KEY)
+                    host_key_forget, html_escape, local_run, name_to_flag,
+                    peers_list, ping_bar, safe_edit_text, ssh_copy_id, ssh_exec,
+                    state_load, state_locked, status_icon, sudo_run, SSH_KEY)
 
 LOG = logging.getLogger("awg.exits")
 router = Router(name="exits")
@@ -815,6 +815,17 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
             except Exception as e:
                 LOG.warning("update_status unexpected: %s", e)
                 return
+
+    # 0. Снимаем старый пин host-ключа для этого IP.
+    #
+    # Добавление exit'а — это провижининг, который инициируем МЫ, поэтому смена
+    # ключа здесь ожидаема и легитимна: адрес мог быть переустановлен или отдан
+    # хостером под новую машину. Без сброса бот честно упёрся бы в расхождение
+    # и отказался подключаться — правильное поведение в любой другой момент, но
+    # не в этот. Дальше первый же контакт запомнит новый ключ (TOFU).
+    dropped = host_key_forget(ip)
+    if dropped:
+        LOG.info("addexit: снят прежний host-key пин для %s", ip)
 
     # 1. Если есть пароль — копируем pubkey
     if password:
