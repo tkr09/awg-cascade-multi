@@ -98,6 +98,19 @@ if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
     [ -x /usr/local/sbin/awg-cascade-iprule.sh ] && /usr/local/sbin/awg-cascade-iprule.sh
 fi
 
+# 5b. Firewall второго клиентского интерфейса на месте?
+#     Отдельная проверка, а не часть п.4: тот смотрит на kill-switch awg0, а он
+#     присутствует всегда — даже когда правила $CLIENT3_IFACE не применились
+#     совсем. Ровно так wgc3 и оставался без MARK/MASQUERADE после загрузки,
+#     а postboot рапортовал OK.
+if [ -n "${CLIENT3_IFACE:-}" ] && ip link show "$CLIENT3_IFACE" >/dev/null 2>&1; then
+    if [ "$(iptables-save -t mangle 2>/dev/null | grep -c awg-cascade-c3)" -eq 0 ]; then
+        issues+=("$CLIENT3_IFACE без firewall-правил (нет MARK -> трафик мимо table 100)")
+        log "FAIL: $CLIENT3_IFACE c3-rules missing - reapplying"
+        [ -x /usr/local/sbin/awg-cascade-client3-fw.sh ] && /usr/local/sbin/awg-cascade-client3-fw.sh >/dev/null 2>&1 || true
+    fi
+fi
+
 # 6. per-peer inter-client LAN-доступ (идемпотентно переприменяем после буста)
 [ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
 
