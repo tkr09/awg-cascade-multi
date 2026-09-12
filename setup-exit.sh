@@ -413,7 +413,10 @@ fi
 
 mkdir -p $CONFIG_DIR
 chown $BOT_USER:$BOT_USER $CONFIG_DIR
-chmod 755 $CONFIG_DIR
+# 750, а не 755: внутри метаданные exit'а (info*.json) и публичные ключи.
+# Приватные и так 600, но каталог нараспашку означает, что любой локальный
+# процесс видит состав каскада — имена интерфейсов, какие RU подключены.
+chmod 750 $CONFIG_DIR
 
 header "Запуск awg-quick@$IFACE_NAME"
 
@@ -465,7 +468,9 @@ jq -n \
         i_params: {I1: $i1},
         warp_state: "off", installed_at: $t
     }' > "$STATE_FILE"
-chmod 644 "$STATE_FILE"
+# 640: info.json описывает состав каскада — какие RU подключены, через какие
+# интерфейсы. Читает его только root (бот ходит сюда по SSH под root).
+chmod 640 "$STATE_FILE"
 
 # Вывод JSON на stdout (бот парсит)
 header "Готово. JSON для RU:"

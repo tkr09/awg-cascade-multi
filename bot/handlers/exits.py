@@ -578,6 +578,10 @@ async def cb_exit_rm_yes(call: CallbackQuery) -> None:
     exit_ip = e.get("ip") if e else None
     exit_iface = e.get("exit_iface", "awg-in") if e else "awg-in"
 
+    # Кто был запинен на этот exit — снимаем ДО удаления, чтобы было что показать:
+    # сам скрипт обнулит pinned_exit, и после вызова список уже не восстановить.
+    pinned_names = [p["name"] for p in peers_list() if p.get("pinned_exit") == iface]
+
     # 1. RU-side: down awgN, rm conf/keys, убрать из state, пересобрать ECMP.
     out, err, rc = await sudo_run(
         "/usr/local/sbin/awg-cascade-exit-remove.sh", iface, timeout=20,
@@ -622,9 +626,17 @@ async def cb_exit_rm_yes(call: CallbackQuery) -> None:
     # safe_edit_text — retry 1-2-4с. Удаление exit'а через который бот ходит в
     # Telegram вызывает кратковременный flap egress (ECMP пересобирается) →
     # edit_text может таймаутить. State уже изменён, retry дотянется.
+    # Имена интерфейсов переиспользуются: освободившийся awgN достанется
+    # следующему добавленному exit'у. Поэтому про снятые pin'ы говорим явно —
+    # молча они бы «переехали» на новый exit в другой стране.
+    unpin_line = (
+        f"\n📌 Сняты pin'ы (теперь Auto): <b>{html_escape(', '.join(pinned_names))}</b>"
+        if pinned_names else ""
+    )
+
     await safe_edit_text(
         call.message,
-        f"🗑 Exit <b>{iface}</b> удалён.{exit_cleanup}",
+        f"🗑 Exit <b>{iface}</b> удалён.{exit_cleanup}{unpin_line}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🌍 К списку", callback_data="exits:list"),

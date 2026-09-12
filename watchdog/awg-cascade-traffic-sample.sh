@@ -34,7 +34,13 @@ for _if in awg0 ${CLIENT3_IFACE:-}; do
         printf '%s,%s,%s,%s\n' "$NOW" "$pubkey" "${rx:-0}" "${tx:-0}" >> "$CSV"
     done
 done
-chmod 644 "$CSV" 2>/dev/null || true
+# 640, а не 644: в CSV лежат публичные ключи пиров и их объёмы трафика — это
+# метаданные о том, кто и сколько качал, читать их любому локальному
+# пользователю незачем. И не 600: файл читает бот (📈 графики трафика в
+# Telegram), поэтому группа — $BOT_USER, иначе графики молча опустеют.
+: "${BOT_USER:=awgbot}"
+chown "root:$BOT_USER" "$CSV" 2>/dev/null || true
+chmod 640 "$CSV" 2>/dev/null || true
 
 # ─── Ретенция: прунить не чаще раза в сутки (дёшево) ─────────────────────────
 last=$(cat "$PRUNE_MARK" 2>/dev/null || echo 0)
@@ -44,7 +50,13 @@ if [ $(( NOW - last )) -ge 86400 ] && [ -f "$CSV" ]; then
     tmp=$(mktemp)
     if awk -F, -v c="$cutoff" 'NF>=4 && $1+0 >= c' "$CSV" > "$tmp" 2>/dev/null; then
         mv "$tmp" "$CSV"
-        chmod 644 "$CSV" 2>/dev/null || true
+        # 640, а не 644: в CSV лежат публичные ключи пиров и их объёмы трафика — это
+# метаданные о том, кто и сколько качал, читать их любому локальному
+# пользователю незачем. И не 600: файл читает бот (📈 графики трафика в
+# Telegram), поэтому группа — $BOT_USER, иначе графики молча опустеют.
+: "${BOT_USER:=awgbot}"
+chown "root:$BOT_USER" "$CSV" 2>/dev/null || true
+chmod 640 "$CSV" 2>/dev/null || true
     else
         rm -f "$tmp"
     fi
