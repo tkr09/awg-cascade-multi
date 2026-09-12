@@ -388,6 +388,33 @@ AllowedIPs = $RU_TUNNEL_IP/32
 PersistentKeepalive = 25
 EOF
 chmod 600 $WG_DIR/$IFACE_NAME.conf
+
+# DisableCookies на слушающем интерфейсе exit'а.
+#
+# Флаг отключает ответ cookie-reply под нагрузкой. Смысл не в экономии, а в
+# защите от активного зондирования: цензор может послать на подозрительный UDP
+# порт поток handshake'ов и опознать сервер по тому, что тот ответил cookie'ом.
+# С флагом хост молчит. Именно порты exit'ов и стали бы зондировать в первую
+# очередь — они торчат в интернет из чужой страны.
+#
+# Плата честная: вместе с cookie в ядре отключается и rate limiter (в
+# amneziawg-go это один и тот же блок под IsUnderLoad), то есть флудом
+# handshake'ов с подменённым адресом сервер можно заставить считать
+# криптографию. Для exit'а размен принят; на исходящей стороне RU (awgN) флаг
+# намеренно НЕ ставим — там собеседник ровно один и известен, и защита от
+# флуда там полезнее.
+#
+# Ставим, только если tools реально умеют: на старых пакетах awg setconf
+# упал бы на незнакомом ключе и интерфейс не поднялся бы вовсе.
+if awg set --help 2>&1 | grep -q "disable-cookies"; then
+    if ! grep -q '^DisableCookies' "$WG_DIR/$IFACE_NAME.conf"; then
+        sed -i "0,/^\[Peer\]/s//DisableCookies = on\n\n[Peer]/" "$WG_DIR/$IFACE_NAME.conf"
+    fi
+    ok "DisableCookies включён для $IFACE_NAME"
+else
+    warn "amneziawg-tools без поддержки disable-cookies — флаг не выставлен"
+fi
+
 ok "$WG_DIR/$IFACE_NAME.conf создан"
 
 # ═════════════════════════════════════════════════════════════════════════════
