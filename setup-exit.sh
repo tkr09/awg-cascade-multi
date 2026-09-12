@@ -294,7 +294,8 @@ else
     ok "Сгенерированы новые ключи для $IFACE_NAME"
 fi
 
-# v2.0 параметры (S1-S4 random, H1-H4 monotonic ranges, I1 DNS-iCloud).
+# v2.0 параметры (S1-S4 random, H1-H4 monotonic ranges, I1 — случайный
+# профиль мимикрии из каталога в awg2-params.sh).
 # Если уже сохранены для этого интерфейса — берём существующие (постоянство).
 if [ ! -f "$PARAMS_FILE" ]; then
     # Ищем awg2-params.sh в /tmp (положил бот) или рядом со setup-exit.sh
@@ -315,6 +316,7 @@ H2='$H2'
 H3='$H3'
 H4='$H4'
 I1='$I1'
+I1_PROFILE='$I1_PROFILE'
 EOF
     chmod 600 "$PARAMS_FILE"
 fi

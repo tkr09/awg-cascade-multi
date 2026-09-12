@@ -373,10 +373,14 @@ H2='$H2'
 H3='$H3'
 H4='$H4'
 I1='$I1'
+# Имя профиля мимикрии — только для диагностики: по самой строке I1 глазами
+# понять, чем притворяется декой, трудно, а знать это нужно при разборе
+# блокировок («какие установки пережили фильтр»).
+I1_PROFILE='$I1_PROFILE'
 EOF
     chmod 600 "$CONFIG_DIR/awg2_params"
     chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/awg2_params"
-    ok "Сгенерированы v2.0 params: S=$S1/$S2/$S3/$S4  H1=$H1"
+    ok "Сгенерированы v2.0 params: S=$S1/$S2/$S3/$S4  H1=$H1  I1-профиль=$I1_PROFILE"
 else
     . "$CONFIG_DIR/awg2_params"
     ok "v2.0 params подгружены из $CONFIG_DIR/awg2_params"
