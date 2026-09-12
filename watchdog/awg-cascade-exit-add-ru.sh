@@ -56,13 +56,22 @@ RU_PSK=$RU_PSK
 EOF
 chmod 600 "/etc/awg-cascade/exits/${IFACE}.keys"
 
+# MTU считаем, а не берём 1420. Накладные расходы AmneziaWG на пакет данных —
+# 60 + S4 байт (IPv4 + UDP + заголовок + tag), а сверху до 100 байт кладёт
+# ContentPaddingAddition, который включает awg-cascade-awg3.sh. При MTU 1420 и
+# S4=35 полноразмерный пакет давал на проводе до 1615 байт при path MTU 1500 —
+# WireGuard ставит DF, поэтому ядро не фрагментировало их, а роняло: на RU-1
+# счётчик "outgoing packets failed fragmentation" набрал 3917 за 12 часов.
+# Клиентский трафик приходит уже <=1280 и пролезал, страдал трафик самой ноды.
+TUNNEL_MTU=$(( 1500 - 60 - S4 - 100 ))
+
 # Записываем awg<N>.conf
 cat > "$WG_DIR/${IFACE}.conf" <<EOF
 [Interface]
 Address = $RU_TUNNEL_IP/30
 PrivateKey = $RU_PRIVKEY
 Table = off
-MTU = 1420
+MTU = $TUNNEL_MTU
 Jc = 5
 Jmin = 10
 Jmax = 50

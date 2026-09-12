@@ -337,9 +337,16 @@ else
     MASQ_DOWN="iptables -t nat -D POSTROUTING -o $MAIN_IFACE -j MASQUERADE"
 fi
 
+# MTU: по той же арифметике, что на RU-стороне (см. awg-cascade-exit-add-ru.sh).
+# Раньше строки MTU здесь не было вовсе, то есть awg-quick брал дефолтные 1420 —
+# а это направление как раз несёт крупные пакеты (download к клиентам, средний
+# размер ~1317 байт), поэтому именно оно и упиралось в path MTU 1500.
+TUNNEL_MTU=$(( 1500 - 60 - S4 - 100 ))
+
 cat > $WG_DIR/$IFACE_NAME.conf <<EOF
 [Interface]
 Address = $EXIT_TUNNEL_IP/30
+MTU = $TUNNEL_MTU
 ListenPort = $EXIT_PORT
 PrivateKey = $EXIT_PRIVKEY
 Jc = $JC_VAL

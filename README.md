@@ -49,6 +49,16 @@ WARP на shared-exit управляется per-interface (RU не мешают
 
 ## Версия
 
+**v2.1.10** — MTU туннелей RU<->exit считается, а не берётся равным 1420.
+Накладные расходы AmneziaWG на пакет данных — 60 + S4 байт, и сверху до 100
+байт кладёт `ContentPaddingAddition`. При S4=35 полноразмерный пакет давал на
+проводе до 1615 байт при path MTU 1500, а WireGuard ставит DF — ядро такие
+пакеты не фрагментировало, а роняло: счётчик `outgoing packets failed
+fragmentation` на RU-1 набрал 3917 штук за 12 часов. Клиентский трафик приходит
+уже <=1280 и пролезал, страдал трафик самой ноды. Теперь `MTU = 1500 - 60 - S4 -
+100` с обеих сторон; на exit-стороне строки MTU не было вовсе, хотя именно она
+несёт крупные пакеты (средний размер download ~1317 байт).
+
 **v2.1.9** — второй клиентский интерфейс больше не остаётся без firewall'а.
 `client3-fw.sh` начинался с проверки `ip link show $CLIENT3_IFACE || exit 0`, а
 вызывает его `iptables.sh`, чей юнит объявляет `Before=awg-quick@awg0`, но про
@@ -108,7 +118,7 @@ awg0). Туннели RU↔exit на 3.0 (`awg-cascade-awg3.sh`). Ставит `
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tkr09/awg-cascade-multi/main/install.sh \
-  | sudo REF=v2.1.9 bash
+  | sudo REF=v2.1.10 bash
 ```
 
 `install.sh` клонирует репо на нужном теге и запускает `setup.sh`, который спросит:
@@ -126,8 +136,8 @@ Phase 5 (серверный ключ/awg0.conf) под гардом идемпо
 **Только через drift-guard, НЕ повторным `setup.sh`:**
 
 ```bash
-sudo awg-cascade-sync.sh --check v2.1.9   # показать дрейф
-sudo awg-cascade-sync.sh v2.1.9           # привести ноду к тегу
+sudo awg-cascade-sync.sh --check v2.1.10   # показать дрейф
+sudo awg-cascade-sync.sh v2.1.10           # привести ноду к тегу
 ```
 
 (При смене логики самого `sync.sh` нужны два прогона: 1-й ставит новый sync, 2-й им работает.)
