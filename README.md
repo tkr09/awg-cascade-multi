@@ -49,6 +49,15 @@ WARP на shared-exit управляется per-interface (RU не мешают
 
 ## Версия
 
+**v2.1.11** — бэкапы делаются сами. До сих пор их не делал никто: ни cron, ни
+таймера ни на одной ноде, при 23 живых пирах, чьи конфиги невосстановимы.
+Добавлен `awg-cascade-backup.timer` (ежедневно в 04:30, мимо окон авто-ребута в
+02:51 и 03:15, `Persistent=true` — пропуск догоняется после старта), ротация
+последних 14 архивов и проверка `gzip -t` сразу после создания: битый бэкап, о
+котором узнаёшь в момент восстановления, хуже отсутствующего. Заодно drift-guard
+научился таймерам — раньше цикл по `systemd/` смотрел только на `*.service`, и
+любой `.timer` из репо на ноду не приезжал, причём `--check` об этом молчал.
+
 **v2.1.10** — MTU туннелей RU<->exit считается, а не берётся равным 1420.
 Накладные расходы AmneziaWG на пакет данных — 60 + S4 байт, и сверху до 100
 байт кладёт `ContentPaddingAddition`. При S4=35 полноразмерный пакет давал на
@@ -118,7 +127,7 @@ awg0). Туннели RU↔exit на 3.0 (`awg-cascade-awg3.sh`). Ставит `
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tkr09/awg-cascade-multi/main/install.sh \
-  | sudo REF=v2.1.10 bash
+  | sudo REF=v2.1.11 bash
 ```
 
 `install.sh` клонирует репо на нужном теге и запускает `setup.sh`, который спросит:
@@ -136,8 +145,8 @@ Phase 5 (серверный ключ/awg0.conf) под гардом идемпо
 **Только через drift-guard, НЕ повторным `setup.sh`:**
 
 ```bash
-sudo awg-cascade-sync.sh --check v2.1.10   # показать дрейф
-sudo awg-cascade-sync.sh v2.1.10           # привести ноду к тегу
+sudo awg-cascade-sync.sh --check v2.1.11   # показать дрейф
+sudo awg-cascade-sync.sh v2.1.11           # привести ноду к тегу
 ```
 
 (При смене логики самого `sync.sh` нужны два прогона: 1-й ставит новый sync, 2-й им работает.)
@@ -185,6 +194,7 @@ bot/
 systemd/
   awg-cascade-watchdog.service / -bot.service / -postboot.service
   awg-cascade-alert@.service       # OnFailure-алерты
+  awg-cascade-backup.service / -.timer  # ежедневный бэкап + ротация
   awg-cascade.logrotate
 ```
 

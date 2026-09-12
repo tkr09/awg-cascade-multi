@@ -152,7 +152,9 @@ fi
 
 echo "=== systemd-юниты ==="
 units_changed=0
-for f in "$TMP"/repo/systemd/awg-cascade-*.service; do
+# .timer наравне с .service: раньше цикл смотрел только на сервисы, и таймер,
+# добавленный в репо, на ноду не приезжал вообще — drift-guard при этом молчал.
+for f in "$TMP"/repo/systemd/awg-cascade-*.service "$TMP"/repo/systemd/awg-cascade-*.timer; do
     [ -e "$f" ] || continue
     before=$drift
     sync_file "$f" "/etc/systemd/system/$(basename "$f")" 644
@@ -162,7 +164,7 @@ done
 # Орфан-юниты: на ноде есть, в репо нет. Защищаем inline-генерируемые setup.sh
 # (iptables/iprule.service) — их в репо нет, но они критичны для boot.
 PROTECT_UNIT="awg-cascade-iptables.service awg-cascade-iprule.service"
-for dst in /etc/systemd/system/awg-cascade-*.service; do
+for dst in /etc/systemd/system/awg-cascade-*.service /etc/systemd/system/awg-cascade-*.timer; do
     [ -e "$dst" ] || continue
     base=$(basename "$dst")
     case " $PROTECT_UNIT " in *" $base "*) continue ;; esac
@@ -247,7 +249,7 @@ fi
 
 # Область проверки печатаем явно: раньше скрипт утверждал «нода соответствует
 # репо $VER», не заглянув в код бота, и на v2.1.3 это было прямой неправдой.
-SCOPE="helper-скрипты, systemd-юниты, sudoers, код бота и scripts/"
+SCOPE="helper-скрипты, systemd-юниты и таймеры, sudoers, код бота и scripts/"
 UNCHECKED="setup.sh, inline-генерируемые iptables.sh/iprule.sh, venv, ключи и значения config"
 
 if [ "$CHECK" = "1" ]; then
@@ -258,6 +260,14 @@ if [ "$CHECK" = "1" ]; then
     else echo "⚠️ Найдено расхождений: $drift (репо $VER). Применить: awg-cascade-sync.sh $REF"; exit 2; fi
 else
     [ "$units_changed" = "1" ] && { systemctl daemon-reload; echo "  systemctl daemon-reload"; }
+    # Таймеры надо не только положить, но и включить — иначе файл на месте, а
+    # бэкапов нет, и это самый неприятный вид тишины.
+    for t in "$TMP"/repo/systemd/awg-cascade-*.timer; do
+        [ -e "$t" ] || continue
+        tb=$(basename "$t")
+        systemctl is-enabled "$tb" >/dev/null 2>&1 && continue
+        systemctl enable --now "$tb" >/dev/null 2>&1             && echo "  таймер включён: $tb"             || echo "  ⚠️ не удалось включить таймер: $tb"
+    done
     if [ "$bot_changed" = "1" ]; then
         # Устаревший .pyc может пережить замену .py — чистим кеш перед рестартом.
         find "$BOT_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

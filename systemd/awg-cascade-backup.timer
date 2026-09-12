@@ -1,0 +1,16 @@
+[Unit]
+Description=AWG Cascade Multi — ежедневный бэкап состояния
+Documentation=https://github.com/tkr09/awg-cascade-multi
+
+[Timer]
+# 04:30 намеренно: авто-ребуты нод стоят на 02:51 и 03:15, и бэкап не должен
+# попадать в это окно. RandomizedDelaySec разносит ноды между собой.
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=1800
+# Нода могла быть выключена в назначенный час — тогда догоняем после старта,
+# иначе пропуск молча превращается в дыру в истории.
+Persistent=true
+Unit=awg-cascade-backup.service
+
+[Install]
+WantedBy=timers.target

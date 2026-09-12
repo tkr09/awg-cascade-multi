@@ -1,0 +1,13 @@
+[Unit]
+Description=AWG Cascade Multi — бэкап состояния
+Documentation=https://github.com/tkr09/awg-cascade-multi
+# После сети не требуется: бэкап локальный и никуда не ходит.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awg-cascade-backup.sh
+# Ротацию держим здесь, а не в скрипте по умолчанию: менять глубину хранения
+# правкой юнита проще, чем правкой кода, а drift-guard вернёт и то, и другое.
+Environment=BACKUP_KEEP=14
+Nice=10
+IOSchedulingClass=idle

@@ -42,6 +42,23 @@ tar czf "$DST" \
     2>/dev/null
 
 chmod 600 "$DST"
+
+# Проверяем архив сразу, а не при скачивании: битый бэкап, о котором узнаёшь в
+# момент восстановления, хуже отсутствующего — на него рассчитывают.
+if ! gzip -t "$DST" 2>/dev/null; then
+    echo "🔴 архив не проходит gzip -t, удаляю: $DST" >&2
+    rm -f "$DST"
+    exit 1
+fi
+
+# Ротация. Нужна с появлением таймера: без неё ежедневный бэкап растёт без
+# границ. Считаем только автоимена в /root — файлы с явным путём (аргумент $1)
+# не наши, их не трогаем.
+: "${BACKUP_KEEP:=14}"
+if [ -z "${1:-}" ]; then
+    ls -1t /root/awg-cascade-backup-*.tar.gz 2>/dev/null         | tail -n +$((BACKUP_KEEP + 1))         | while IFS= read -r old; do rm -f "$old"; echo "ротация: удалён $old"; done
+fi
+
 echo "Backup: $DST ($(du -h "$DST" | cut -f1))"
 echo
 echo "Скопируй на безопасное место:"
