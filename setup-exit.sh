@@ -437,6 +437,11 @@ else
     warn "ssh-harden не найден в /tmp — вход по паролю останется ВКЛЮЧЁН (брутфорс!)"
 fi
 
+if [ -f /tmp/awg-cascade-fail2ban.sh ]; then
+    install -m 755 -o root -g root /tmp/awg-cascade-fail2ban.sh \
+        /usr/local/sbin/awg-cascade-fail2ban.sh
+fi
+
 if [ -f /tmp/awg-cascade-exit-warp.sh ]; then
     install -m 755 -o root -g root /tmp/awg-cascade-exit-warp.sh \
         /usr/local/sbin/awg-cascade-exit-warp.sh
@@ -510,3 +515,11 @@ chmod 640 "$STATE_FILE"
 # Вывод JSON на stdout (бот парсит)
 header "Готово. JSON для RU:"
 cat "$STATE_FILE"
+
+# fail2ban на exit-е. Ставится последним: скрипту нужны поднятые интерфейсы —
+# он собирает адреса RU из endpoint-ов пиров, чтобы никогда их не забанить,
+# иначе бот потерял бы управление этим exit-ом.
+if [ -x /usr/local/sbin/awg-cascade-fail2ban.sh ]; then
+    /usr/local/sbin/awg-cascade-fail2ban.sh >/dev/null 2>&1 \
+        && ok "fail2ban настроен" || warn "fail2ban не настроен"
+fi

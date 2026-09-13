@@ -8,7 +8,7 @@
 #   • helper-скрипты /usr/local/sbin/awg-cascade-*.sh
 #   • код бота /opt/awg-cascade-bot/{*.py,handlers/*.py,requirements.txt}
 #     + provisioning-скрипты /opt/awg-cascade-bot/scripts/ (setup-exit, awg2-params,
-#     exit-warp, ssh-harden). При изменении кода бот перезапускается.
+#     exit-warp, ssh-harden, fail2ban). При изменении кода бот перезапускается.
 #   • systemd-юниты awg-cascade-*.service
 #   • каноничный sudoers awgbot (с visudo-валидацией)
 #   • идемпотентные guards: gai.conf IPv4, маскировка ifupdown, alerting-блок
@@ -132,6 +132,7 @@ else
     sync_file "$TMP/repo/awg2-params.sh"                     "$BOT_DIR/scripts/awg2-params.sh"                755 $BOT_OWN
     sync_file "$TMP/repo/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"      755 $BOT_OWN
     sync_file "$TMP/repo/watchdog/awg-cascade-ssh-harden.sh" "$BOT_DIR/scripts/awg-cascade-ssh-harden.sh"     755 $BOT_OWN
+    sync_file "$TMP/repo/watchdog/awg-cascade-fail2ban.sh"   "$BOT_DIR/scripts/awg-cascade-fail2ban.sh"       755 $BOT_OWN
 
     # Орфаны в handlers/: удалённый из репо хендлер иначе останется на ноде вместе
     # со своим .pyc и продолжит импортироваться.

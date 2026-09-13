@@ -878,6 +878,7 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
     setup_path = Path("/opt/awg-cascade-bot/scripts/setup-exit.sh")
     awg2_params_path = Path("/opt/awg-cascade-bot/scripts/awg2-params.sh")
     warp_helper_path = Path("/opt/awg-cascade-bot/scripts/awg-cascade-exit-warp.sh")
+    f2b_path = Path("/opt/awg-cascade-bot/scripts/awg-cascade-fail2ban.sh")
     ssh_harden_path = Path("/opt/awg-cascade-bot/scripts/awg-cascade-ssh-harden.sh")
     if not setup_path.exists():
         await update_status(f"❌ Не найден {setup_path}. Бот не может запровижить exit.")
@@ -895,6 +896,8 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
             await _asyncssh.scp(str(awg2_params_path), (conn, "/tmp/awg2-params.sh"))
             if warp_helper_path.exists():
                 await _asyncssh.scp(str(warp_helper_path), (conn, "/tmp/awg-cascade-exit-warp.sh"))
+            if f2b_path.exists():
+                await _asyncssh.scp(str(f2b_path), (conn, "/tmp/awg-cascade-fail2ban.sh"))
             # Наш ключ уже лежит в authorized_keys — setup-exit.sh закроет вход
             # по паролю, иначе свежий exit сразу тонет в SSH-брутфорсе.
             if ssh_harden_path.exists():

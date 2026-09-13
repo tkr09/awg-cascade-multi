@@ -402,11 +402,31 @@ PEER_IP="${CLIENT_NET_PREFIX}2"
 # Записываем awg0.conf
 # MTU=1280: двойная инкапсуляция (awg0 inside awgN inside eth0) + AWG 2.0 обфускация
 # съедает payload; 1280 эмпирически стабильнее на PPPoE/4G (= IPv6 min-MTU, безопасный минимум).
+# DisableCookies на клиентском интерфейсе.
+#
+# Флаг отключает ответ cookie-reply под нагрузкой. Смысл — защита от активного
+# зондирования: цензор может послать на подозрительный UDP-порт поток
+# handshake'ов и опознать сервер по тому, что тот ответил cookie'ом. С флагом
+# хост молчит, а порт awg0 торчит в интернет и принимает клиентов откуда угодно.
+#
+# Плата: вместе с cookie в ядре отключается и rate limiter (это один блок под
+# IsUnderLoad), то есть флудом handshake'ов сервер можно заставить считать
+# криптографию. Для клиентского порта размен принят.
+#
+# В клиентские конфиги строка НЕ попадает: это поведение отвечающей стороны,
+# клиент о нём не знает, и добавление сломало бы совместимость с 3.0.
+#
+# Подставляем пустую строку, если tools не умеют: на старых пакетах awg setconf
+# упал бы на незнакомом ключе и интерфейс не поднялся бы вовсе.
+DC_LINE=""
+awg set --help 2>&1 | grep -q "disable-cookies" && DC_LINE="DisableCookies = on"
+
 cat > $WG_DIR/awg0.conf <<EOF
 [Interface]
 Address = $SERVER_IP/24
 ListenPort = $AWG0_PORT
 MTU = 1280
+$DC_LINE
 PrivateKey = $SERVER_PRIVKEY
 Jc = $JC_VAL
 Jmin = $JMIN_VAL
@@ -739,6 +759,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-sync.sh             /usr/local/s
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-traffic-sample.sh    /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-backup.sh            /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-autoreboot.sh        /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-fail2ban.sh         /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-awg3.sh              /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-kernel-check.sh      /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-ssh-harden.sh        /usr/local/sbin/
@@ -757,6 +778,14 @@ ok "Helper-скрипты установлены в /usr/local/sbin/"
 /usr/local/sbin/awg-cascade-autoreboot.sh >/dev/null 2>&1 \
     && ok "Авто-ребут: $(/usr/local/sbin/awg-cascade-autoreboot.sh --show | awk -F= '/Reboot-Time/{print $2}')" \
     || warn "Авто-ребут не настроен (проверь: awg-cascade-autoreboot.sh --show)"
+
+# fail2ban: не защита от подбора (вход по паролю отключён), а способ перестать
+# тратить CPU и журнал на сканеров — их около 4 тысяч в сутки на ноду. Скрипт
+# сам собирает ignoreip из живого состояния, чтобы бан RU-адреса на exit-е не
+# отнял у бота управление этим exit-ом.
+/usr/local/sbin/awg-cascade-fail2ban.sh >/dev/null 2>&1 \
+    && ok "fail2ban настроен" \
+    || warn "fail2ban не настроен (проверь: awg-cascade-fail2ban.sh)"
 
 # SSH: отключаем вход по паролю — свежая нода иначе сразу тонет в брутфорсе.
 # Скрипт сам пропустит шаг, если в authorized_keys нет ключей (чтобы не запереть).

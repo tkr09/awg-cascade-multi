@@ -141,6 +141,11 @@ PUBKEY=$(echo "$PRIVKEY" | awg pubkey)
 HPK=$(openssl rand -base64 32)
 
 umask 077
+# DisableCookies — фича 3.1; на 3.0-инструментах awg setconf упал бы на
+# незнакомом ключе и интерфейс не поднялся бы. Подставляем только если умеют.
+DC_LINE=""
+awg set --help 2>&1 | grep -q "disable-cookies" && DC_LINE="DisableCookies = on"
+
 cat > "$WG_DIR/$IFACE.conf" <<EOF
 [Interface]
 Address = $SRV3/24
@@ -155,6 +160,7 @@ RekeyTimeout = $REKEY_TIMEOUT
 RejectAfterTime = $REJECT_AFTER
 KeepaliveTimeout = $KEEPALIVE_TO
 MaxHandshakeAttempts = $MAX_HS
+$DC_LINE
 EOF
 chmod 600 "$WG_DIR/$IFACE.conf"
 

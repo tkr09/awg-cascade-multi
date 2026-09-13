@@ -50,6 +50,17 @@ WARP на shared-exit управляется per-interface (RU не мешают
 
 ## Версия
 
+**v2.1.18** — репозиторий снова описывает продакшен. Две вещи работали на
+живых нодах, но в коде их не было, то есть свежая установка получилась бы
+другой: **fail2ban** (конфиг раскладывался руками) и **`DisableCookies` на
+клиентских интерфейсах** (`awg0`, второй интерфейс). Теперь оба в репо.
+`awg-cascade-fail2ban.sh` собирает `ignoreip` **из живого состояния** — на RU из
+`state.json`, на exit'е из endpoint'ов пиров, — потому что захардкоженный список
+адресов здесь протухал дважды, а бан RU-адреса на exit'е отнял бы у бота
+управление этим exit'ом. `DisableCookies` подставляется только если
+`awg set` его знает: на старых пакетах `setconf` упал бы на незнакомом ключе и
+интерфейс не поднялся бы вовсе.
+
 **v2.1.17** — текст выбора версии протокола в боте приведён к реальности.
 Кнопка называлась «3.0», хотя интерфейс давно работает на модуле **3.1**, а
 подсказка требовала «amnezia-client 3.x или AWG Manager ≥ 2.16.5» — верно, но
@@ -197,7 +208,7 @@ awg0). Туннели RU↔exit на 3.0 (`awg-cascade-awg3.sh`). Ставит `
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tkr09/awg-cascade-multi/main/install.sh \
-  | sudo REF=v2.1.17 bash
+  | sudo REF=v2.1.18 bash
 ```
 
 `install.sh` клонирует репо на нужном теге и запускает `setup.sh`, который спросит:
@@ -215,8 +226,8 @@ Phase 5 (серверный ключ/awg0.conf) под гардом идемпо
 **Только через drift-guard, НЕ повторным `setup.sh`:**
 
 ```bash
-sudo awg-cascade-sync.sh --check v2.1.17   # показать дрейф
-sudo awg-cascade-sync.sh v2.1.17           # привести ноду к тегу
+sudo awg-cascade-sync.sh --check v2.1.18   # показать дрейф
+sudo awg-cascade-sync.sh v2.1.18           # привести ноду к тегу
 ```
 
 (При смене логики самого `sync.sh` нужны два прогона: 1-й ставит новый sync, 2-й им работает.)
@@ -252,6 +263,7 @@ watchdog/
   awg-cascade-alert.sh              # ntfy + cooldown/дедуп
   awg-cascade-ssh-alert.sh          # SSH-login алерт (pam_exec)
   awg-cascade-backup.sh             # бэкап /etc/awg-cascade + ключи в tar.gz
+  awg-cascade-fail2ban.sh           # fail2ban для SSH, ignoreip из живого состояния
 bot/
   bot.py                # aiogram polling + resilience (retry/backoff)
   common.py             # config/state IO, SSH, форматтеры, helpers
