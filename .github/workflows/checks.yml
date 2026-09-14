@@ -42,15 +42,8 @@ jobs:
           echo "--- warning-уровень (не блокирует) ---"
           git ls-files '*.sh' | xargs shellcheck -S warning -e SC1091,SC2086 || true
 
-      - name: генерация inline-скриптов из setup.sh разбирается
-        run: |
-          # awg-cascade-iptables.sh собирается heredoc'ом внутри setup.sh и
-          # поэтому не покрыт проверкой файлов. Разворачиваем и проверяем.
-          tmp=$(mktemp -d)
-          sed -n '/^cat > \/usr\/local\/sbin\/awg-cascade-iptables.sh <<IPTEOF$/,/^IPTEOF$/p' setup.sh \
-            | sed "1s|.*|cat > $tmp/gen.sh <<IPTEOF|" > "$tmp/emit.sh"
-          CLIENT_NET=10.0.0.0/24 bash "$tmp/emit.sh"
-          bash -n "$tmp/gen.sh"
+      - name: продублированные блоки не разошлись
+        run: python3 .github/check-duplication.py
 
   python:
     runs-on: ubuntu-latest
