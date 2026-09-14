@@ -510,11 +510,78 @@ cat > /usr/local/sbin/awg-cascade-iptables.sh <<IPTEOF
 # AWG Cascade — apply iptables rules (idempotent)
 set -e
 
-# Очистка наших правил (по комментарию)
+. /etc/awg-cascade/config 2>/dev/null || true
+C3="\${CLIENT3_IFACE:-}"
+
+# ─── Барьер на время пересборки ──────────────────────────────────────────────
+# Пересборка снимает kill-switch и ставит правила по одному: сначала MARK, потом
+# MASQUERADE, и только в конце DROP. В промежутке клиентский пакет уже
+# замаскирован, но ещё не заблокирован, и если table 100 при этом пуста (все
+# exit'ы down, или мы на этапе загрузки), он уходит напрямую через WAN мимо
+# каскада. Окно короткое, но оно на каждой пересборке.
+#
+# Поэтому первым действием кладём DROP для клиентских интерфейсов в САМОЕ начало
+# FORWARD, а снимаем последним. Заодно это накрывает второй сценарий из аудита:
+# чужой ACCEPT, стоящий выше нашего DROP, наш барьер перекрывает — он идёт первым.
+#
+# Комментарий барьера намеренно НЕ содержит "awg-cascade": иначе его снёс бы
+# собственный flush_our_rules ниже.
+GUARD=awgc-rebuild-guard
+
+guard_up() {
+    iptables -C FORWARD -i awg0 -m comment --comment "\$GUARD" -j DROP 2>/dev/null         || iptables -I FORWARD 1 -i awg0 -m comment --comment "\$GUARD" -j DROP
+    if [ -n "\$C3" ]; then
+        iptables -C FORWARD -i "\$C3" -m comment --comment "\$GUARD" -j DROP 2>/dev/null             || iptables -I FORWARD 1 -i "\$C3" -m comment --comment "\$GUARD" -j DROP
+    fi
+    return 0
+}
+
+guard_down() {
+    local spec
+    while spec=\$(iptables -S FORWARD 2>/dev/null | grep -m1 -- "--comment \$GUARD"); do
+        [ -n "\$spec" ] || break
+        iptables \${spec/-A/-D} 2>/dev/null || break
+    done
+    return 0
+}
+
+# Оборвались на середине — барьер ОСТАЁТСЯ. Клиенты без интернета это плохо,
+# но утечка мимо каскада хуже: набор правил в этот момент заведомо неполон.
+# Чтобы это не осталось незамеченным, шлём алерт.
+APPLIED=0
+on_exit() {
+    if [ "\$APPLIED" = "1" ]; then
+        guard_down
+    else
+        logger -t awg-cascade "iptables.sh оборвался — барьер оставлен, клиенты заблокированы" 2>/dev/null || true
+        [ -x /usr/local/sbin/awg-cascade-alert.sh ] && /usr/local/sbin/awg-cascade-alert.sh             iptables-rebuild 900 "🛑 firewall не пересобрался" urgent warning             "awg-cascade-iptables.sh оборвался на середине. Клиентский трафик заблокирован барьером — это безопасный исход, но каскад не работает. Нужна ручная проверка."             >/dev/null 2>&1 || true
+    fi
+}
+trap on_exit EXIT
+
+guard_up
+
+# ─── Очистка ТОЛЬКО своих правил, по комментарию ─────────────────────────────
+# Раньше здесь было 'iptables-save | grep -v awg-cascade | iptables-restore' плюс
+# '-F mangle PREROUTING/OUTPUT'. Полная очистка общих цепочек сносила правила
+# любых других компонентов на ноде — комментарий при этом не спрашивали.
+# Все наши правила (включая c3-* из client3-fw.sh) помечены "awg-cascade*",
+# поэтому адресная чистка их покрывает целиком. Правила "awg-lan" не трогаем:
+# ими управляет awg-cascade-interclient.sh, он вызывается в конце и чистит сам.
+del_by_comment() {  # \$1 = -t табл. или пусто, \$2 = цепочка
+    local spec
+    while spec=\$(iptables \$1 -S "\$2" 2>/dev/null | grep -m1 -- '--comment awg-cascade'); do
+        [ -n "\$spec" ] || break
+        iptables \$1 \${spec/-A/-D} 2>/dev/null || break
+    done
+    return 0
+}
+
 flush_our_rules() {
-    iptables-save 2>/dev/null | grep -v 'awg-cascade' | iptables-restore 2>/dev/null || true
-    iptables -t mangle -F PREROUTING 2>/dev/null || true
-    iptables -t mangle -F OUTPUT 2>/dev/null || true
+    local ch
+    for ch in FORWARD INPUT OUTPUT;            do del_by_comment ""          "\$ch"; done
+    for ch in PREROUTING OUTPUT FORWARD;       do del_by_comment "-t mangle" "\$ch"; done
+    for ch in POSTROUTING PREROUTING;          do del_by_comment "-t nat"    "\$ch"; done
 }
 
 # Снять прошлые наши правила перед повторным применением — иначе они
@@ -562,7 +629,11 @@ iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --commen
 # Применяет правила awg-lan из peers.json поверх базовых (должно идти ПОСЛЕ MARK).
 [ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
 
-# Persist
+# Набор полон — барьер снимет trap на выходе.
+APPLIED=1
+
+# Persist. Барьер в rules.v4 не попадает: сохраняем ПОСЛЕ его снятия.
+guard_down
 iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 IPTEOF
 chmod +x /usr/local/sbin/awg-cascade-iptables.sh
@@ -655,7 +726,21 @@ chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/state.lock"
 chmod 666 "$CONFIG_DIR/state.lock"
 ok "state.lock pre-created с 0666 (shared между bot и root)"
 
-# Config-файл бота
+# Config-файл бота.
+#
+# ВНИМАНИЕ при правке этого блока. setup.sh запускают повторно — для обновления
+# или после смены параметров. Раньше файл перезаписывался фиксированным набором
+# полей, и повторный запуск СНОСИЛ всё, чего в шаблоне нет:
+#   • CLIENT3_IFACE/PORT/NET/NET_PREFIX/SERVER_IP — второй клиентский интерфейс
+#     продолжал работать, но helper'ы переставали о нём знать: firewall wgc3 без
+#     правил, peer-add без нужных параметров;
+#   • HC_PING_URL, пороги алертов, срок хранения трафика, час авто-ребута —
+#     обнулялись до дефолтов.
+# Защита двухслойная: (1) настраиваемые поля берутся из уже загруженного config
+# через ${VAR:-default}; (2) ниже идёт merge-проход, возвращающий ЛЮБЫЕ ключи,
+# которых в шаблоне нет вообще. Второй слой важнее первого: он не требует
+# помнить про новое поле при его добавлении.
+[ -f "$CONFIG_FILE" ] && cp -a "$CONFIG_FILE" "$CONFIG_FILE.prev"
 cat > "$CONFIG_FILE" <<EOF
 # AWG Cascade Multi — config (загружается ботом и скриптами)
 RU_PUBLIC_IP="$RU_PUBLIC_IP"
@@ -672,15 +757,15 @@ BOT_USER="$BOT_USER"
 
 # ─── Alerting (A) ───
 # HC_PING_URL: создай check на healthchecks.io → вставь ping-URL (dead-man). Пусто = выкл.
-HC_PING_URL=""
-DISK_ALERT_PCT=90
-RAM_ALERT_PCT=90
-LOAD_ALERT_MULT=2
-SSH_ALERT=1
+HC_PING_URL="${HC_PING_URL:-}"
+DISK_ALERT_PCT=${DISK_ALERT_PCT:-90}
+RAM_ALERT_PCT=${RAM_ALERT_PCT:-90}
+LOAD_ALERT_MULT=${LOAD_ALERT_MULT:-2}
+SSH_ALERT=${SSH_ALERT:-1}
 
 # ─── Traffic graphs (D) ───
 # Сколько суток хранить историю трафика per-peer (72 часа — минимум метаданных).
-TRAFFIC_RETENTION_DAYS=3
+TRAFFIC_RETENTION_DAYS=${TRAFFIC_RETENTION_DAYS:-3}
 
 # ─── Auto-reboot после unattended-upgrades ───
 # Срабатывает ТОЛЬКО при /var/run/reboot-required (обновление ядра), не ежедневно.
@@ -690,6 +775,36 @@ TRAFFIC_RETENTION_DAYS=3
 AUTO_REBOOT=${AUTO_REBOOT:-1}
 AUTO_REBOOT_HOUR="${AUTO_REBOOT_HOUR:-03}"
 EOF
+
+# Merge-проход: возвращаем ключи, которых в шаблоне выше нет вообще.
+# Пример из жизни — CLIENT3_*: их пишет awg-cascade-client3.sh, setup про них
+# не знает, и без этого прохода повторная установка их теряла.
+if [ -f "$CONFIG_FILE.prev" ]; then
+    _restored=""
+    while IFS= read -r _line; do
+        case "$_line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        _key=${_line%%=*}
+        # Пробелы/табы в начале ключа = не присваивание, пропускаем
+        case "$_key" in *[!A-Za-z0-9_]*) continue ;; esac
+        if ! grep -q "^${_key}=" "$CONFIG_FILE"; then
+            printf '%s
+' "$_line" >> "$CONFIG_FILE"
+            _restored="$_restored $_key"
+        fi
+    done < "$CONFIG_FILE.prev"
+    if [ -n "$_restored" ]; then
+        ok "Сохранены поля из прошлого config:$_restored"
+    fi
+    # Прошлая версия остаётся рядом до следующего запуска setup — если merge
+    # что-то не так понял, откатиться можно копированием .prev на место.
+    chmod 600 "$CONFIG_FILE.prev"
+    chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE.prev"
+fi
+
 chmod 600 "$CONFIG_FILE"
 chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
 ok "Config файл сохранён: $CONFIG_FILE"
@@ -804,11 +919,20 @@ ok "Bot файлы скопированы в $BOT_DIR"
 
 # Bot при провижне exit'а SCP-ит эти 3 скрипта на новый сервер. Без них
 # add-exit не работает.
-install -m 755 "$REPO_DIR/setup-exit.sh"                  "$BOT_DIR/scripts/setup-exit.sh"
-install -m 755 "$REPO_DIR/awg2-params.sh"                 "$BOT_DIR/scripts/awg2-params.sh"
+# Комплект, который бот и bootstrap-exit.sh SCP-ят на новый exit. Список ДОЛЖЕН
+# совпадать с одноимённым блоком в awg-cascade-sync.sh: он там уже расходился —
+# fail2ban был в sync и отсутствовал здесь, поэтому свежепоставленная RU молча
+# отдавала на новый exit комплект без fail2ban (передача условная, `[ -f ]`).
+install -m 755 "$REPO_DIR/setup-exit.sh"                      "$BOT_DIR/scripts/setup-exit.sh"
+install -m 755 "$REPO_DIR/awg2-params.sh"                     "$BOT_DIR/scripts/awg2-params.sh"
 install -m 755 "$REPO_DIR/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"
 install -m 755 "$REPO_DIR/watchdog/awg-cascade-ssh-harden.sh" "$BOT_DIR/scripts/awg-cascade-ssh-harden.sh"
-ok "Exit-provisioning скрипты в $BOT_DIR/scripts/ (setup-exit, awg2-params, warp, ssh-harden)"
+install -m 755 "$REPO_DIR/watchdog/awg-cascade-fail2ban.sh"   "$BOT_DIR/scripts/awg-cascade-fail2ban.sh"
+# Комплект неполон -> новый exit получит не то, что задумано. Это не warn.
+for _f in setup-exit.sh awg2-params.sh awg-cascade-exit-warp.sh           awg-cascade-ssh-harden.sh awg-cascade-fail2ban.sh; do
+    [ -x "$BOT_DIR/scripts/$_f" ] || err "provisioning-комплект неполон: нет $_f"
+done
+ok "Exit-provisioning комплект в $BOT_DIR/scripts/ (5 скриптов, проверен)"
 
 chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
 
@@ -830,10 +954,15 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 header "8d. systemd units + запуск"
 
-install -m 644 "$REPO_DIR/systemd/awg-cascade-watchdog.service" /etc/systemd/system/
-install -m 644 "$REPO_DIR/systemd/awg-cascade-postboot.service" /etc/systemd/system/
-install -m 644 "$REPO_DIR/systemd/awg-cascade-bot.service"      /etc/systemd/system/
-install -m 644 "$REPO_DIR/systemd/awg-cascade-alert@.service"   /etc/systemd/system/
+# Ставим ВСЁ из systemd/ глобом, как это делает sync.sh, а не поимённым списком.
+# Поимённый список пропускал awg-cascade-backup.service и .timer: юниты лежали в
+# репо, setup их не ставил, и свежая нода до первого sync жила вообще без
+# ежедневного бэкапа — при этом выглядела установленной.
+for _u in "$REPO_DIR"/systemd/awg-cascade-*.service "$REPO_DIR"/systemd/awg-cascade-*.timer; do
+    [ -e "$_u" ] || continue
+    install -m 644 "$_u" /etc/systemd/system/
+done
+ok "systemd-юниты установлены: $(ls -1 "$REPO_DIR"/systemd/awg-cascade-*.service "$REPO_DIR"/systemd/awg-cascade-*.timer 2>/dev/null | wc -l)"
 
 # SSH-логин алерт (pam_exec hook). optional = вход не блокируется если скрипт
 # отсутствует/упал. Только интерактив (pts), дедуп per user@host.
@@ -857,6 +986,18 @@ if systemctl is-active --quiet awg-cascade-watchdog.service; then
 else
     warn "Watchdog не стартанул, проверь: journalctl -u awg-cascade-watchdog -n 30"
 fi
+
+# Таймеры. Файл на месте, а таймер выключен — самый тихий способ остаться без
+# бэкапов: ошибок нет, drift нет, архивов нет.
+for _t in "$REPO_DIR"/systemd/awg-cascade-*.timer; do
+    [ -e "$_t" ] || continue
+    _tb=$(basename "$_t")
+    if systemctl enable --now "$_tb" >/dev/null 2>&1 && systemctl is-active --quiet "$_tb"; then
+        ok "таймер активен: $_tb"
+    else
+        warn "таймер НЕ включился: $_tb (проверь: systemctl status $_tb)"
+    fi
+done
 
 # Postboot — oneshot, сработает на следующем reboot (сейчас не запускаем)
 systemctl enable awg-cascade-postboot.service >/dev/null 2>&1

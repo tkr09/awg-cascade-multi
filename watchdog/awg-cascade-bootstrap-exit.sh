@@ -51,7 +51,14 @@ if [ -z "$EXIT_PASSWORD" ]; then
 fi
 [ -z "$EXIT_PASSWORD" ] && err "Пароль обязателен"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15"
+# Первый контакт со свежим сервером — и по этому же каналу уезжают RU_PSK и
+# приватный ключ туннеля. UserKnownHostsFile=/dev/null означало, что подмена
+# сервера на сетевом пути не будет замечена НИКОГДА, даже на повторном запуске.
+# accept-new: незнакомый хост принимаем и запоминаем в общий с ботом реестр,
+# изменившийся — отвергаем.
+KNOWN_HOSTS=/etc/awg-cascade/known_hosts
+mkdir -p "$(dirname "$KNOWN_HOSTS")"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=15"
 sshx() { sshpass -p "$EXIT_PASSWORD" ssh $SSH_OPTS "root@$EXIT_IP" "$@"; }
 scpx() { sshpass -p "$EXIT_PASSWORD" scp $SSH_OPTS "$@"; }
 

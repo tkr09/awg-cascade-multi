@@ -70,7 +70,8 @@ ROWS="$ROWS$(printf '%-16s %-20s %-20s %-14s %s' "$HOST*" "$L_RUN" "$L_NEW" "$L_
 
 # ─── exits ───────────────────────────────────────────────────────────────────
 if [ "$KERNEL_CHECK_EXITS" = "1" ] && [ -f "$STATE" ] && [ -f "$SSH_KEY" ]; then
-    SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
+    # Общий с ботом реестр ключей вместо отключённой проверки (см. awg3.sh).
+    SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/etc/awg-cascade/known_hosts -o ConnectTimeout=10 -o BatchMode=yes"
     while IFS=$'\t' read -r name ip; do
         [ -n "${ip:-}" ] || continue
         # -n обязателен: без него ssh съедает stdin цикла и обрабатывается

@@ -142,8 +142,11 @@ def _render_exit_status(e: dict) -> str:
 
 @router.callback_query(F.data.startswith("exit:menu:"))
 @admin_only
-async def cb_exit_menu(call: CallbackQuery) -> None:
+async def cb_exit_menu(call: CallbackQuery, state: FSMContext) -> None:
+    # Сюда ведут кнопки «Отмена» диалогов note/rename/веса — завершаем FSM,
+    # иначе следующее сообщение уедет в брошенный диалог (см. cb_main).
     await call.answer()
+    await state.clear()
     iface = call.data[len("exit:menu:"):]
     state = state_load()
     e = _get_exit(state, iface)
@@ -600,7 +603,10 @@ async def cb_exit_rm_yes(call: CallbackQuery) -> None:
     #    Primary awg-in (чужого RU) НИКОГДА не трогаем. Best-effort: если exit
     #    недоступен — удаление на RU всё равно состоялось.
     exit_cleanup = ""
-    if exit_ip and re.match(r"^awg-in-[2-9][0-9]?$", exit_iface):
+    # Диапазон слотов задан в setup-exit.sh как 2..99. Прежний шаблон
+    # `[2-9][0-9]?` покрывал 2-9 и 20-99, но не 10-19: при удалении такого exit'а
+    # интерфейс, конфиг и ключи молча оставались на сервере.
+    if exit_ip and re.match(r"^awg-in-([2-9]|[1-9][0-9])$", exit_iface):
         teardown = (
             f"/usr/local/sbin/awg-cascade-exit-warp.sh uninstall {exit_iface} >/dev/null 2>&1; "
             f"systemctl disable --now awg-quick@{exit_iface} >/dev/null 2>&1; "

@@ -324,8 +324,10 @@ async def cb_list(call: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("peer:menu:"))
 @admin_only
-async def cb_peer_menu(call: CallbackQuery) -> None:
+async def cb_peer_menu(call: CallbackQuery, state: FSMContext) -> None:
+    # Кнопки «Отмена» диалогов peer'а ведут сюда — завершаем FSM (см. cb_main).
     await call.answer()
+    await state.clear()
     name = call.data[len("peer:menu:"):]
     peer = next((p for p in peers_list() if p["name"] == name), None)
     if not peer:

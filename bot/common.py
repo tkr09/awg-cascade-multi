@@ -265,7 +265,17 @@ def host_key_known(host: str, port: int = 22) -> bool:
             if name in line.split()[0].split(","):
                 return True
     except OSError as e:
-        LOG.warning("known_hosts недоступен (%s) — работаем без пина", e)
+        # НЕ «работаем без пина». Отсутствие файла — это штатное «пина ещё нет»,
+        # и его ловит проверка .exists() выше. Сюда мы попадаем только когда файл
+        # ЕСТЬ, но прочитать его нельзя (права, ФС, битый носитель) — то есть
+        # ровно тогда, когда нельзя утверждать, что ключ хоста не менялся.
+        # Прежнее поведение возвращало False, и вызывающий ssh_exec шёл на хост
+        # с known_hosts=None, полностью отключая проверку: сбой чтения реестра
+        # снимал защиту. Возвращаем True — asyncssh получит путь к нечитаемому
+        # файлу и откажется соединяться. Отказ лучше незаметного даунгрейда.
+        LOG.error("known_hosts есть, но нечитаем (%s) — соединение без проверки "
+                  "ключа запрещено", e)
+        return True
     return False
 
 
@@ -455,25 +465,63 @@ def name_to_flag(name: str) -> str:
 # ─── Admin guard ─────────────────────────────────────────────────────────────
 
 _CFG_CACHE: Config | None = None
+_CFG_MTIME: float = -1.0
 
 def cfg() -> Config:
-    global _CFG_CACHE
-    if _CFG_CACHE is None:
-        _CFG_CACHE = Config.load()
+    """
+    Config с перечитыванием по mtime.
+
+    Раньше объект кешировался до конца процесса. Но config меняют скрипты,
+    а не бот: awg-cascade-client3.sh при включении второго интерфейса дописывает
+    в него CLIENT3_*. Бот этого не видел до ручного рестарта — включённый wgc3
+    не появлялся в меню, а выключенный продолжал в нём висеть.
+
+    Сравнение по mtime, а не reload на каждый вызов: cfg() дёргается из каждого
+    admin_only, то есть на каждое нажатие кнопки. stat дешевле парсинга, а при
+    неудачном чтении (файл в момент перезаписи) отдаём прошлый валидный объект —
+    остаться со свежим конфигом важнее, чем уронить хендлер.
+    """
+    global _CFG_CACHE, _CFG_MTIME
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        mtime = _CFG_MTIME
+    if _CFG_CACHE is None or mtime != _CFG_MTIME:
+        try:
+            _CFG_CACHE = Config.load()
+            _CFG_MTIME = mtime
+        except Exception as e:
+            if _CFG_CACHE is None:
+                raise
+            LOG.warning("config перечитать не удалось, работаю на прошлом: %s", e)
     return _CFG_CACHE
 
 
 def admin_only(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """
+    Пропускает только владельца И только в личном чате с ним.
+
+    Проверки id отправителя мало. Бот выдаёт клиентские конфиги и QR прямо в тот
+    чат, откуда пришла команда. Если бота добавить в группу, то сообщение или
+    callback от самого владельца проходило бы guard — и приватный ключ клиента
+    оказывался бы у всех участников группы. Поэтому чат сверяется отдельно:
+    TG_CHAT_ID — это id владельца, а в личном чате chat.id == from_user.id.
+    """
     @wraps(handler)
     async def wrapper(event: Message | CallbackQuery, *args, **kwargs):
         c = cfg()
         uid = event.from_user.id if event.from_user else 0
-        if uid != c.tg_chat_id:
-            LOG.warning("Rejected non-admin uid=%s", uid)
+        msg = event.message if isinstance(event, CallbackQuery) else event
+        chat_id = msg.chat.id if msg is not None and msg.chat is not None else 0
+        if uid != c.tg_chat_id or chat_id != c.tg_chat_id:
+            LOG.warning("Rejected uid=%s chat=%s (ожидался личный чат %s)",
+                        uid, chat_id, c.tg_chat_id)
             if isinstance(event, CallbackQuery):
-                await event.answer("⛔ Только для админа", show_alert=True)
+                await event.answer("⛔ Только в личном чате с админом", show_alert=True)
             elif isinstance(event, Message):
-                await event.answer("⛔ Доступ запрещён")
+                # В группе молчим: иначе бот отвечает на каждое чужое сообщение.
+                if chat_id == uid:
+                    await event.answer("⛔ Доступ запрещён")
             return
         return await handler(event, *args, **kwargs)
     return wrapper

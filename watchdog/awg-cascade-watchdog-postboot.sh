@@ -29,7 +29,7 @@ ntfy() {
     : "${NTFY_RETRIES:=3}"
     local attempt
     for attempt in $(seq 1 "$NTFY_RETRIES"); do
-        curl --interface "$MAIN_IFACE" -s --max-time "$NTFY_TIMEOUT" \
+        curl --interface "$MAIN_IFACE" -s --fail --max-time "$NTFY_TIMEOUT" \
             -H "Title: $title" -H "Priority: $priority" -H "Tags: $tags" \
             -d "$body" "$NTFY_URL" >/dev/null 2>&1 && return 0
         [ "$attempt" -lt "$NTFY_RETRIES" ] && sleep $(( attempt * 3 ))

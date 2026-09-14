@@ -7,6 +7,7 @@ import logging
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from common import (admin_only, cfg, fmt_age, html_escape, name_to_flag,
@@ -78,9 +79,10 @@ def render_main(state: dict) -> str:
 
 @router.message(CommandStart())
 @admin_only
-async def cmd_start(message: Message) -> None:
-    state = state_load()
-    await message.answer(render_main(state), parse_mode="HTML", reply_markup=main_kb(state))
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    st = state_load()
+    await message.answer(render_main(st), parse_mode="HTML", reply_markup=main_kb(st))
 
 
 @router.message(Command("status"))
@@ -92,10 +94,19 @@ async def cmd_status(message: Message) -> None:
 
 @router.callback_query(F.data == "main")
 @admin_only
-async def cb_main(call: CallbackQuery) -> None:
+async def cb_main(call: CallbackQuery, state: FSMContext) -> None:
+    """
+    Возврат в главное меню — он же кнопка «Отмена» половины диалогов.
+
+    state.clear() здесь обязателен. Без него отменённый диалог продолжал ждать
+    ввода: пользователь жал «Отмена» на шаге запроса root-пароля exit'а, а
+    следующее ЛЮБОЕ сообщение в чат подхватывал @router.message(waiting_password)
+    и начинал provisioning с этим текстом вместо пароля.
+    """
     await call.answer()
-    state = state_load()
-    await safe_edit_text(call.message, render_main(state), parse_mode="HTML", reply_markup=main_kb(state))
+    await state.clear()
+    st = state_load()
+    await safe_edit_text(call.message, render_main(st), parse_mode="HTML", reply_markup=main_kb(st))
 
 
 @router.callback_query(F.data == "close")

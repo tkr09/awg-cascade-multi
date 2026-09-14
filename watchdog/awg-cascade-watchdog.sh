@@ -138,7 +138,7 @@ ntfy() {
     (
         attempt=1
         while [ "$attempt" -le "$NTFY_RETRIES" ]; do
-            if curl --interface "$MAIN_IFACE" -s --max-time "$NTFY_TIMEOUT" \
+            if curl --interface "$MAIN_IFACE" -s --fail --max-time "$NTFY_TIMEOUT" \
                 -H "Title: $title" \
                 -H "Priority: $priority" \
                 -H "Tags: $tags" \
@@ -194,12 +194,25 @@ smart_ping() {
 }
 
 # Down + Up интерфейса. $2 — текущий интервал backoff, только для лога.
+# Поколение сетевого состояния. Инкрементируется при каждом пересоздании
+# интерфейса и входит в отпечаток peer-routing (см. ниже).
+#
+# Зачем. `awg-quick down` удаляет устройство, а вместе с ним — ВСЕ маршруты,
+# которые на него ссылались, включая наш `default dev awgN table 1NN`. Отпечаток
+# же смотрел только на имя интерфейса и на факт его существования. Если down/up
+# успевал пройти целиком между двумя расчётами отпечатка, тот не менялся,
+# apply_peer_routing не вызывался — и таблица пира оставалась пустой навсегда.
+# Пустая таблица поиск не прекращает: RPDB идёт дальше, до fwmark→table 100, и
+# «строго привязанный» клиент незаметно уезжал в ECMP на чужой exit.
+NET_GENERATION=0
+
 reconnect_iface() {
     local iface=$1 wait_s=${2:-}
     log "RECONNECT $iface (handshake stale${wait_s:+, следующая попытка не раньше чем через ${wait_s}s})"
     awg-quick down "$iface" >/dev/null 2>&1 || true
     sleep 1
     awg-quick up   "$iface" >/dev/null 2>&1 || true
+    NET_GENERATION=$(( NET_GENERATION + 1 ))
 }
 
 # Отпечаток желаемого состояния peer-routing: пары «ip>интерфейс» плюс живость
@@ -217,7 +230,7 @@ peer_routing_signature() {
     for iface in $(jq -r '[.[] | .pinned_exit // empty] | unique | .[]?' "$PEERS_JSON" 2>/dev/null); do
         ip link show "$iface" >/dev/null 2>&1 && up="$up$iface:1," || up="$up$iface:0,"
     done
-    echo "$pairs|$up"
+    echo "$pairs|$up|$NET_GENERATION"
 }
 
 # Применить per-peer routing rules: pinned peers → их exit (table 100+idx),
@@ -257,17 +270,34 @@ apply_peer_routing() {
         [ -z "$pinned" ] || [ "$pinned" = "null" ] && continue
 
         # pinned = interface name (awg1, awg2, ...)
-        if ! ip link show "$pinned" >/dev/null 2>&1; then
-            log "PIN $peer_ip → $pinned: интерфейс down, пропускаем"
-            continue
-        fi
-
         local idx ptid
         idx=$(echo "$pinned" | sed 's/awg//')
         [[ "$idx" =~ ^[0-9]+$ ]] || continue
         ptid=$((100 + idx))
 
-        ip route replace default dev "$pinned" table "$ptid"
+        # 253/254/255 — системные таблицы default/main/local. Индекс exit'а
+        # ограничен 1..255, поэтому 153/154/155 в них и попадают. Писать туда
+        # default-маршрут значит менять общую маршрутизацию ноды, а чистить их
+        # при удалении пина — ломать её. Пропускаем с явной жалобой в лог; сам
+        # запрет на такие индексы стоит при добавлении exit'а.
+        if [ "$ptid" -ge 253 ]; then
+            log "PIN $peer_ip → $pinned: table $ptid пересекается с системной, пропускаю"
+            continue
+        fi
+
+        # Интерфейс лежит — НЕ пропускаем пира, а кладём blackhole.
+        #
+        # Раньше здесь было `continue`. Но пропущенный пир не остаётся без
+        # маршрута: он проваливается на общее правило fwmark → table 100 и
+        # уезжает в ECMP через ЛЮБОЙ живой exit. Бот при этом обещает ровно
+        # обратное — «выбранный exit недоступен → интернета нет». Blackhole
+        # делает обещание правдой: трафик пира гасится здесь, а не утекает.
+        if ip link show "$pinned" >/dev/null 2>&1; then
+            ip route replace default dev "$pinned" table "$ptid"
+        else
+            ip route replace blackhole default table "$ptid"
+            log "PIN $peer_ip → $pinned: интерфейс down, трафик пира заблокирован (строгая привязка)"
+        fi
         ip rule add from "${peer_ip}/32" lookup "$ptid" priority 999 2>/dev/null
         case " $PEER_TABLES_APPLIED " in
             *" $ptid "*) ;;

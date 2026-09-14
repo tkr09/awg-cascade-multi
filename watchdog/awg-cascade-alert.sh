@@ -60,7 +60,11 @@ fi
 # сюда приходят диск, RAM, SSH-входы и упавшие юниты — то, что дедуплицируется
 # длинным cooldown'ом и потому повторится не скоро.
 for _attempt in $(seq 1 "$NTFY_RETRIES"); do
-    if curl --interface "$MAIN_IFACE" -s --max-time "$NTFY_TIMEOUT" \
+    # --fail обязателен: без него curl считает успехом ЛЮБОЙ HTTP-ответ, в том
+    # числе 429 (rate limit ntfy) и 5xx. Тогда stamp писался как при доставке, и
+    # алерт замолкал на весь cooldown, ни разу не дойдя. С --fail такой ответ —
+    # ошибка, а значит отрабатывает тот же retry с нарастающей паузой.
+    if curl --interface "$MAIN_IFACE" -s --fail --max-time "$NTFY_TIMEOUT" \
         -H "Title: $TITLE" \
         -H "Priority: $PRIO" \
         -H "Tags: $TAGS" \

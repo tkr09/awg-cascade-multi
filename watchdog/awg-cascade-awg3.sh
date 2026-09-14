@@ -33,7 +33,14 @@ set -u
 STATE=/etc/awg-cascade/state.json
 WG_DIR=/etc/amnezia/amneziawg
 SSH_KEY=/etc/awg-cascade/ssh/id_ed25519
-SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
+# Host-key проверяем по тому же реестру, что и бот (/etc/awg-cascade/known_hosts).
+# Было StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null — то есть проверка
+# отключена полностью, а через эти же сессии на exit уезжает HeaderProtectionKey.
+# accept-new даёт ту же семантику, что TOFU в боте: незнакомый хост принимаем и
+# запоминаем, ИЗМЕНИВШИЙСЯ — отвергаем. Реестр общий, поэтому хост, закреплённый
+# ботом, здесь уже проверяется, и наоборот.
+KNOWN_HOSTS=/etc/awg-cascade/known_hosts
+SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10 -o BatchMode=yes"
 
 : "${PAD_RANGE:=50-100}"
 : "${REKEY_AFTER:=100-140}"
@@ -104,18 +111,53 @@ if [ "$ACTION" = "on" ]; then
 fi
 
 # ─── remote-хелпер: правит конфиг exit-стороны и применяет ───────────────────
+# Уникальные имена временных файлов. Прежние имена (op.sh, l.conf и короткое имя
+# конфига на exit'е) были общими на все запуски: две операции по разным туннелям
+# затирали файлы друг друга, а имя было предсказуемым.
+RUNID="$$-$(date +%s)-$RANDOM"
+REMOTE_OP="/tmp/.awg3-op.$RUNID.sh"
+REMOTE_CONF="/tmp/.awg3-r.$RUNID.conf"
+LOCAL_CONF="/tmp/.awg3-l.$RUNID.conf"
+
+# Код возврата удалённой операции возвращаем НАРУЖУ.
+#
+# Раньше функция заканчивалась на удалении временного файла, и удалённая команда
+# тоже. Удаление почти всегда успешно, поэтому провал scp, ssh или самой операции
+# на exit'е превращался в код 0. Вызывающая сторона печатала «применено» и шла
+# дальше — при том, что локальный конфиг уже изменён, а удалённый нет.
+# Рассинхронизованные S/H — это поднятый туннель без трафика, причём без единого
+# сообщения об ошибке.
 run_remote() {  # $1 = shell-код
-    local tmp; tmp=$(mktemp)
+    local tmp rc
+    tmp=$(mktemp) || return 1
     printf '%s\n' "$1" > "$tmp"
-    scp $SSH_OPTS "$tmp" "root@$EXIT_IP:/tmp/.awg3-op.sh" >/dev/null 2>&1
-    ssh $SSH_OPTS "root@$EXIT_IP" 'bash /tmp/.awg3-op.sh; rm -f /tmp/.awg3-op.sh' 2>/dev/null
+    if ! scp $SSH_OPTS "$tmp" "root@$EXIT_IP:$REMOTE_OP" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        echo "  🔴 не удалось передать helper на exit ($EXIT_IP)" >&2
+        return 1
+    fi
     rm -f "$tmp"
+    # Код bash сохраняем ДО rm, иначе его затрёт код удаления файла.
+    ssh $SSH_OPTS "root@$EXIT_IP" "bash $REMOTE_OP; _rc=\$?; rm -f $REMOTE_OP; exit \$_rc"
+    rc=$?
+    [ "$rc" -ne 0 ] && echo "  🔴 удалённая операция вернула код $rc" >&2
+    return $rc
 }
 
 # umask 077 в субшелле: `awg-quick strip` печатает конфиг ВМЕСТЕ с приватным
 # ключом интерфейса, а /tmp доступен на чтение всем — при root-umask 022 файл
 # создавался с правами 0644 и ключ был читаем всем на время операции.
-sync_local()  { ( umask 077; awg-quick strip "$IFACE" > /tmp/.awg3-l.conf 2>/dev/null ) && awg syncconf "$IFACE" /tmp/.awg3-l.conf; rm -f /tmp/.awg3-l.conf; }
+# Та же болезнь, что у run_remote: функция заканчивалась на rm, и ошибка
+# awg syncconf наружу не выходила.
+sync_local() {
+    local rc
+    ( umask 077; awg-quick strip "$IFACE" > "$LOCAL_CONF" 2>/dev/null ) || {
+        rm -f "$LOCAL_CONF"; echo "  🔴 awg-quick strip $IFACE не отработал" >&2; return 1; }
+    awg syncconf "$IFACE" "$LOCAL_CONF"; rc=$?
+    rm -f "$LOCAL_CONF"
+    [ "$rc" -ne 0 ] && echo "  🔴 awg syncconf $IFACE вернул код $rc" >&2
+    return $rc
+}
 
 if [ "$ACTION" = "reroll-s" ]; then
     # Перегенерация S-параметров на живом туннеле: свежая уникальная сигнатура
@@ -135,8 +177,8 @@ if [ "$ACTION" = "reroll-s" ]; then
     done
     [ -z "$RSED" ] && { echo "    нечего менять"; exit 0; }
     run_remote "$RSED
-( umask 077; awg-quick strip $EXIT_IF > /tmp/.c 2>/dev/null ) && awg syncconf $EXIT_IF /tmp/.c && echo '  exit: применено'; rm -f /tmp/.c"
-    sync_local && echo "  RU: применено"
+( umask 077; awg-quick strip $EXIT_IF > $REMOTE_CONF 2>/dev/null ) && awg syncconf $EXIT_IF $REMOTE_CONF && echo '  exit: применено'; rm -f $REMOTE_CONF"
+    sync_local && echo "  RU: применено" || { echo "  🔴 RU: не применено — стороны рассинхронизованы, проверь конфиги"; exit 1; }
     sleep 6
     show_status "$IFACE"
     exit 0
@@ -191,8 +233,8 @@ apply_block() {  # вставить/заменить блок в конфиге 
 echo "  → пишу конфиги (ключ ${KEY:0:12}…)"
 apply_block "$CONF"
 run_remote "$(declare -f apply_block); BLOCK='$BLOCK'; apply_block $WG_DIR/$EXIT_IF.conf
-( umask 077; awg-quick strip $EXIT_IF > /tmp/.c 2>/dev/null ) && awg syncconf $EXIT_IF /tmp/.c && echo '  exit: применено'; rm -f /tmp/.c"
-sync_local && echo "  RU: применено"
+( umask 077; awg-quick strip $EXIT_IF > $REMOTE_CONF 2>/dev/null ) && awg syncconf $EXIT_IF $REMOTE_CONF && echo '  exit: применено'; rm -f $REMOTE_CONF"
+sync_local && echo "  RU: применено" || { echo "  🔴 RU: не применено — стороны рассинхронизованы, проверь конфиги"; exit 1; }
 
 sleep 6
 echo ""
