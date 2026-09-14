@@ -1079,46 +1079,29 @@ prompt "IP первого exit-сервера (Enter — пропустить): 
 if [ -n "$BOOTSTRAP_EXIT_IP" ]; then
     prompt "Имя exit'а (например NL-1): "; read_tty BOOTSTRAP_EXIT_NAME
 
-    # ─── Пароль или ключ ────────────────────────────────────────────────────
+    # ─── Способ входа выбирать не надо: bootstrap разберётся сам ─────────────
     #
-    # Раньше спрашивался только пароль, и это делало невозможным главный
-    # сценарий при заведении НОВОЙ RU: подключить к ней УЖЕ РАБОТАЮЩИЙ exit.
-    # На таком exit'е вход по паролю отключён нашим же ssh-harden, то есть
-    # установщик упирался в собственную защиту.
+    # Он перебирает доступные ключи и берёт первый рабочий, а пароль спрашивает
+    # только если ни один не подошёл. Это важно для двух разных случаев сразу:
+    # хостинг может раскладывать ключ владельца на все ноды сам (тогда спрашивать
+    # нечего), а на свежем сервере без такой автоматики ключей просто нет —
+    # и тогда нужен пароль. Раньше здесь было жёсткое меню и вопрос «ключ
+    # добавил?», который на первом хостинге был лишним, а на втором бесполезным.
     echo ""
-    echo -e "${BOLD}Как подключаться к exit'у?${NC}"
-    echo "  1) по паролю root — свежий, только что купленный сервер"
-    echo "  2) по ключу       — exit уже настроен, вход по паролю на нём закрыт"
-    prompt "Выбор [1/2, по умолчанию 1]: "; read_tty inp
-    if [ "$inp" = "2" ]; then
-        BOOTSTRAP_AUTH=key
-        RU_PUB=$(cat /etc/awg-cascade/ssh/id_ed25519.pub 2>/dev/null || echo "")
-        if [ -n "$RU_PUB" ]; then
-            echo ""
-            warn "Ключ ЭТОЙ ноды должен быть на exit'е. Если ещё не добавлен — выполни"
-            warn "с машины, у которой доступ туда уже есть:"
-            echo ""
-            echo "  ssh root@$BOOTSTRAP_EXIT_IP \"echo '$RU_PUB' >> ~/.ssh/authorized_keys\""
-            echo ""
-            prompt "Добавил? Enter чтобы продолжить: "; read_tty inp
-        fi
-    else
-        BOOTSTRAP_AUTH=password
-        prompt "Root пароль exit-сервера: "
-        if [ -r /dev/tty ] && [ -z "$BATCH" ]; then
-            read -rs BOOTSTRAP_EXIT_PASS </dev/tty; echo ""
-        else
-            read -r BOOTSTRAP_EXIT_PASS || true
-        fi
+    info "Подключение: сначала попробую ключом, при неудаче спрошу пароль."
+    if [ -f /etc/awg-cascade/ssh/id_ed25519.pub ]; then
+        info "Публичный ключ этой ноды (пригодится, если хостинг не ставит ключи сам):"
+        echo "  $(cat /etc/awg-cascade/ssh/id_ed25519.pub)"
     fi
+    echo ""
+
 
     BOOTSTRAP_OK=0
     if [ -z "$BOOTSTRAP_EXIT_NAME" ]; then
         warn "Имя exit'а пустое — пропускаю bootstrap"
-    elif [ "$BOOTSTRAP_AUTH" = "password" ] && [ -z "$BOOTSTRAP_EXIT_PASS" ]; then
-        warn "Пароль пустой — пропускаю bootstrap"
     else
-        if EXIT_AUTH="$BOOTSTRAP_AUTH" EXIT_PASSWORD="${BOOTSTRAP_EXIT_PASS:-}"             /usr/local/sbin/awg-cascade-bootstrap-exit.sh             "$BOOTSTRAP_EXIT_IP" "$BOOTSTRAP_EXIT_NAME"; then
+        # EXIT_AUTH не задаём — пусть работает auto: ключи, потом пароль.
+        if             /usr/local/sbin/awg-cascade-bootstrap-exit.sh             "$BOOTSTRAP_EXIT_IP" "$BOOTSTRAP_EXIT_NAME"; then
             BOOTSTRAP_OK=1
         else
             warn "Bootstrap exit'а не удался — добавишь позже через бота или повтори:"
