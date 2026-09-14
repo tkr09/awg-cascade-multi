@@ -70,7 +70,13 @@ fi
 
 rc_total=0
 
-while IFS='|' read -r IFACE IP NAME EIFACE; do
+# Цикл читает со СВОЕГО дескриптора 3, а не со stdin.
+#
+# Иначе первый же `ssh` внутри тела съедает остаток списка, и обновляется ровно
+# одна нода из всех — молча, с кодом 0. В этом проекте на том же самом уже
+# спотыкались (`ssh-keygen -lf -` в цикле по authorized_keys), так что ловушка
+# известная: любая команда в теле цикла, читающая stdin, ворует вход у read.
+while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
     [ -n "$IP" ] || continue
     echo "═══ $NAME ($IP, локально $IFACE, на exit'е $EIFACE) ═══"
 
@@ -180,7 +186,7 @@ while IFS='|' read -r IFACE IP NAME EIFACE; do
         echo "  🔴 проверка: у $EIFACE нет handshake"
         rc_total=1
     fi
-done <<TARGETS
+done 3<<TARGETS
 $targets
 TARGETS
 
