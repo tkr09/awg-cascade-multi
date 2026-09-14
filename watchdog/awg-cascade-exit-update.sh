@@ -56,7 +56,12 @@ done
 # Комплект, который живёт на exit'е. setup-exit.sh и awg2-params.sh нужны только
 # при заведении, но кладём и их: тогда добавление ещё одного shared-слота на этом
 # же сервере пойдёт актуальным кодом, а не тем, что приехал год назад.
-BUNDLE="awg-cascade-exit-warp.sh awg-cascade-fail2ban.sh awg-cascade-ssh-harden.sh setup-exit.sh awg2-params.sh"
+# cfg.sh идёт ПЕРВЫМ и не случайно: с v2.3.0 exit-side скрипты читают настройки
+# через него и фолбэка на `source` больше не имеют. На exit'е парсера не было
+# вовсе — например, awg-cascade-autoreboot.sh там есть, и без парсера он
+# молча не прочитал бы AUTO_REBOOT, то есть exit перестал бы сам
+# перезагружаться после обновления ядра.
+BUNDLE="awg-cascade-cfg.sh awg-cascade-exit-warp.sh awg-cascade-fail2ban.sh awg-cascade-ssh-harden.sh awg-cascade-autoreboot.sh setup-exit.sh awg2-params.sh"
 
 VER=$(cut -d' ' -f1 /etc/awg-cascade/version 2>/dev/null || echo unknown)
 COMMIT=$(cut -d' ' -f2 /etc/awg-cascade/version 2>/dev/null || echo "?")
@@ -96,12 +101,16 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
         # Отсутствующий локальный файл — это НЕПОЛНЫЙ комплект, а не «нечего
         # сравнивать». Прежний `continue` делал дыру незаметной: exit тихо
         # оставался со старым скриптом, а итог был успешным.
-        if [ ! -f "$BOT_SCRIPTS/$f" ]; then
-            echo "  🔴 нет локального $BOT_SCRIPTS/$f — комплект неполон"
+        # Часть комплекта лежит в $BOT_SCRIPTS (его собирают для provisioning),
+        # часть — только в /usr/local/sbin (общие helper'ы). Берём откуда есть.
+        src="$BOT_SCRIPTS/$f"
+        [ -f "$src" ] || src="/usr/local/sbin/$f"
+        if [ ! -f "$src" ]; then
+            echo "  🔴 нет локального $f (ни в scripts, ни в sbin) — комплект неполон"
             node_rc=1
             continue
         fi
-        lsum=$(sha256sum "$BOT_SCRIPTS/$f" | cut -d' ' -f1)
+        lsum=$(sha256sum "$src" | cut -d' ' -f1)
         rsum=$(ssh $SSH_OPTS "root@$IP" "sha256sum /usr/local/sbin/$f 2>/dev/null | cut -d' ' -f1")
         [ "$lsum" = "$rsum" ] || changed="$changed $f"
     done
@@ -123,7 +132,8 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
 
     # ─── заливка ─────────────────────────────────────────────────────────────
     for f in $changed; do
-        if ! scp $SSH_OPTS "$BOT_SCRIPTS/$f" "root@$IP:/tmp/.upd-$f" >/dev/null 2>&1; then
+        fsrc="$BOT_SCRIPTS/$f"; [ -f "$fsrc" ] || fsrc="/usr/local/sbin/$f"
+        if ! scp $SSH_OPTS "$fsrc" "root@$IP:/tmp/.upd-$f" >/dev/null 2>&1; then
             echo "  🔴 не передался $f"
             node_rc=1
             continue
