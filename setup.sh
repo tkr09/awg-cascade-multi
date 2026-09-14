@@ -151,11 +151,35 @@ fi
 [ -z "$NTFY_TOPIC" ] && err "ntfy topic обязателен"
 NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
 
+# ─── Версии протокола ───────────────────────────────────────────────────────
+#
+# Спрашиваем ЗАРАНЕЕ, потому что от ответа зависит порядок работ ниже: для 3.x
+# нужен отдельный интерфейс wgc3, а он поднимается после awg0, и первый peer
+# тогда надо выдавать уже на нём.
+echo ""
+echo -e "${BOLD}Версия протокола для КЛИЕНТОВ${NC}"
+echo "  1) 2.0 — интерфейс awg0. Понимают все клиенты, включая роутеры на NativeWG."
+echo "  2) 3.x — отдельный интерфейс wgc3: шифрование заголовков, набивка, случайные"
+echo "           таймеры. Роутеры на NativeWG его НЕ понимают и молча откатятся."
+prompt "Выбор [1/2, сейчас ${FIRST_PEER_VER:-1}]: "; read_tty inp
+case "$inp" in 2) FIRST_PEER_VER="3" ;; 1) FIRST_PEER_VER="2" ;; *) FIRST_PEER_VER="${FIRST_PEER_VER:-2}" ;; esac
+
+echo ""
+echo -e "${BOLD}Версия протокола между RU и EXIT${NC}"
+echo "  1) 2.0 — работает всегда."
+echo "  2) 3.1 — HeaderProtectionKey и набивка на туннеле до exit'а. Нужен"
+echo "           amneziawg 3.x на ОБЕИХ сторонах; включается после поднятия туннеля."
+prompt "Выбор [1/2, сейчас ${EXIT_PROTO:-2}]: "; read_tty inp
+case "$inp" in 1) EXIT_PROTO="2" ;; 2) EXIT_PROTO="3" ;; *) EXIT_PROTO="${EXIT_PROTO:-3}" ;; esac
+echo ""
+
 info "Параметры:"
 echo "  RU IP:         ${BOLD}$RU_PUBLIC_IP:$AWG0_PORT/udp${NC}"
 echo "  Клиенты:       ${BOLD}$CLIENT_NET${NC} (server $SERVER_IP)"
 echo "  Telegram chat: ${BOLD}$TG_CHAT_ID${NC}"
 echo "  ntfy:          ${BOLD}$NTFY_URL${NC}"
+echo "  Клиенты:       протокол ${BOLD}$([ "$FIRST_PEER_VER" = 3 ] && echo "3.x (wgc3)" || echo "2.0 (awg0)")${NC}"
+echo "  RU ↔ exit:     протокол ${BOLD}$([ "$EXIT_PROTO" = 3 ] && echo 3.1 || echo 2.0)${NC}"
 echo ""
 prompt "Всё верно? [Y/n]: "; read_tty inp
 [[ "$inp" =~ ^[Nn] ]] && err "Прервано пользователем"
@@ -610,6 +634,10 @@ TG_CHAT_ID="$TG_CHAT_ID"
 NTFY_URL="$NTFY_URL"
 NTFY_TOPIC="$NTFY_TOPIC"
 BOT_USER="$BOT_USER"
+# Выбранные при установке версии протокола. Нужны, чтобы повторный запуск
+# setup.sh предлагал прежний выбор, а не умолчание.
+FIRST_PEER_VER="${FIRST_PEER_VER:-2}"
+EXIT_PROTO="${EXIT_PROTO:-3}"
 
 # ─── Alerting (A) ───
 # HC_PING_URL: создай check на healthchecks.io → вставь ping-URL (dead-man). Пусто = выкл.
@@ -1050,24 +1078,112 @@ echo ""
 prompt "IP первого exit-сервера (Enter — пропустить): "; read_tty BOOTSTRAP_EXIT_IP
 if [ -n "$BOOTSTRAP_EXIT_IP" ]; then
     prompt "Имя exit'а (например NL-1): "; read_tty BOOTSTRAP_EXIT_NAME
-    prompt "Root пароль exit-сервера: "
-    if [ -r /dev/tty ] && [ -z "$BATCH" ]; then
-        read -rs BOOTSTRAP_EXIT_PASS </dev/tty; echo ""
+
+    # ─── Пароль или ключ ────────────────────────────────────────────────────
+    #
+    # Раньше спрашивался только пароль, и это делало невозможным главный
+    # сценарий при заведении НОВОЙ RU: подключить к ней УЖЕ РАБОТАЮЩИЙ exit.
+    # На таком exit'е вход по паролю отключён нашим же ssh-harden, то есть
+    # установщик упирался в собственную защиту.
+    echo ""
+    echo -e "${BOLD}Как подключаться к exit'у?${NC}"
+    echo "  1) по паролю root — свежий, только что купленный сервер"
+    echo "  2) по ключу       — exit уже настроен, вход по паролю на нём закрыт"
+    prompt "Выбор [1/2, по умолчанию 1]: "; read_tty inp
+    if [ "$inp" = "2" ]; then
+        BOOTSTRAP_AUTH=key
+        RU_PUB=$(cat /etc/awg-cascade/ssh/id_ed25519.pub 2>/dev/null || echo "")
+        if [ -n "$RU_PUB" ]; then
+            echo ""
+            warn "Ключ ЭТОЙ ноды должен быть на exit'е. Если ещё не добавлен — выполни"
+            warn "с машины, у которой доступ туда уже есть:"
+            echo ""
+            echo "  ssh root@$BOOTSTRAP_EXIT_IP \"echo '$RU_PUB' >> ~/.ssh/authorized_keys\""
+            echo ""
+            prompt "Добавил? Enter чтобы продолжить: "; read_tty inp
+        fi
     else
-        read -r BOOTSTRAP_EXIT_PASS || true
+        BOOTSTRAP_AUTH=password
+        prompt "Root пароль exit-сервера: "
+        if [ -r /dev/tty ] && [ -z "$BATCH" ]; then
+            read -rs BOOTSTRAP_EXIT_PASS </dev/tty; echo ""
+        else
+            read -r BOOTSTRAP_EXIT_PASS || true
+        fi
     fi
 
-    if [ -n "$BOOTSTRAP_EXIT_NAME" ] && [ -n "$BOOTSTRAP_EXIT_PASS" ]; then
-        EXIT_PASSWORD="$BOOTSTRAP_EXIT_PASS" \
-            /usr/local/sbin/awg-cascade-bootstrap-exit.sh \
-            "$BOOTSTRAP_EXIT_IP" "$BOOTSTRAP_EXIT_NAME" \
-            || warn "Bootstrap exit'а не удался — добавишь позже через бота или повтори: awg-cascade-bootstrap-exit.sh"
+    BOOTSTRAP_OK=0
+    if [ -z "$BOOTSTRAP_EXIT_NAME" ]; then
+        warn "Имя exit'а пустое — пропускаю bootstrap"
+    elif [ "$BOOTSTRAP_AUTH" = "password" ] && [ -z "$BOOTSTRAP_EXIT_PASS" ]; then
+        warn "Пароль пустой — пропускаю bootstrap"
     else
-        warn "Имя или пароль пустые — пропускаю bootstrap exit'а"
+        if EXIT_AUTH="$BOOTSTRAP_AUTH" EXIT_PASSWORD="${BOOTSTRAP_EXIT_PASS:-}"             /usr/local/sbin/awg-cascade-bootstrap-exit.sh             "$BOOTSTRAP_EXIT_IP" "$BOOTSTRAP_EXIT_NAME"; then
+            BOOTSTRAP_OK=1
+        else
+            warn "Bootstrap exit'а не удался — добавишь позже через бота или повтори:"
+            warn "  awg-cascade-bootstrap-exit.sh $BOOTSTRAP_EXIT_IP $BOOTSTRAP_EXIT_NAME"
+        fi
+    fi
+
+    # ─── Протокол 3.1 на туннеле до exit'а ───────────────────────────────────
+    # Включается ПОСЛЕ поднятия туннеля: awg3.sh правит конфиги обеих сторон и
+    # применяет их через syncconf, то есть туннель уже должен существовать.
+    if [ "$BOOTSTRAP_OK" = "1" ] && [ "$EXIT_PROTO" = "3" ]; then
+        EXIT_IFACE_NEW=$(jq -r '.exits[-1].interface // empty' "$STATE_FILE" 2>/dev/null)
+        if [ -n "$EXIT_IFACE_NEW" ]; then
+            info "Включаю протокол 3.1 на $EXIT_IFACE_NEW..."
+            # Через файл, а не через конвейер: `cmd | sed && ok || warn` проверял бы
+            # код sed, то есть всегда печатал успех. Ровно та ошибка, за которую
+            # аудит цеплял awg3.sh.
+            _a3=$(mktemp)
+            if /usr/local/sbin/awg-cascade-awg3.sh "$EXIT_IFACE_NEW" on --fix-s >"$_a3" 2>&1; then
+                sed "s/^/  /" "$_a3"; ok "Туннель до exit'а работает на 3.1"
+            else
+                sed "s/^/  /" "$_a3"
+                warn "3.1 не включился — туннель остался на 2.0. Позже:"
+                warn "  awg-cascade-awg3.sh $EXIT_IFACE_NEW on --fix-s"
+            fi
+            rm -f "$_a3"
+        fi
     fi
 else
     info "Exit не подключён. Добавь позже: ${BOLD}awg-cascade-bootstrap-exit.sh${NC} или через бота."
 fi
+
+
+# ─── Первый peer на 3.x, если выбран ────────────────────────────────────────
+#
+# Интерфейс wgc3 поднимается только здесь: раньше в установке его нет, поэтому
+# и спросить «2.0 или 3.x» на этапе создания peer'а было не у чего. Сам awg0
+# остаётся в любом случае — он нужен как интерфейс каскада и как запасной
+# вариант для роутеров на NativeWG, которые 3.x не понимают.
+if [ "$FIRST_PEER_VER" = "3" ]; then
+    header "Второй клиентский интерфейс (3.x)"
+    if /usr/local/sbin/awg-cascade-client3.sh up >/dev/null 2>&1; then
+        ok "wgc3 поднят"
+        C3_PEER="${FIRST_PEER}_wgc3"
+        if _out=$(/usr/local/sbin/awg-cascade-peer-add.sh "$C3_PEER" wgc3 2>&1); then
+            # Поле называется client_conf, а не conf — проверено по peer-add.sh.
+            C3_CONF=$(echo "$_out" | jq -r '.client_conf // empty' 2>/dev/null)
+            ok "Peer '$C3_PEER' создан на wgc3 (протокол 3.x)"
+            if [ -n "$C3_CONF" ] && command -v qrencode >/dev/null 2>&1; then
+                echo ""
+                echo -e "${BOLD}QR для $C3_PEER (3.x):${NC}"
+                printf '%s' "$C3_CONF" | qrencode -t ANSIUTF8
+            fi
+            echo ""
+            info "Конфиг 3.x: ${BOLD}/etc/awg-cascade/peers/${C3_PEER}.conf${NC}"
+            info "Peer '$FIRST_PEER' на awg0 (2.0) оставлен как запасной."
+        else
+            warn "Peer на wgc3 не создался — выдай через бота: $_out"
+        fi
+    else
+        warn "wgc3 не поднялся — клиенты пока только на awg0 (2.0)."
+        warn "Повторить: awg-cascade-client3.sh up"
+    fi
+fi
+
 
 header "Что дальше"
 

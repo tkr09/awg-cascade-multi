@@ -49,11 +49,43 @@ fi
 EXIT_NAME=$(echo "$EXIT_NAME" | tr -cd 'a-zA-Z0-9._-' | head -c 32)
 [ -z "$EXIT_NAME" ] && err "Имя exit'а обязательно"
 
-EXIT_PASSWORD="${EXIT_PASSWORD:-}"
-if [ -z "$EXIT_PASSWORD" ]; then
-    echo -en "${YELLOW}▶${NC} Root пароль exit-сервера: " >&2; read -rs EXIT_PASSWORD </dev/tty; echo >&2
+# ─── Способ подключения: пароль или ключ ─────────────────────────────────────
+#
+# Пароль годится только для СВЕЖЕГО сервера. На любом уже настроенном exit'е
+# вход по паролю отключён нашим же ssh-harden — и раньше это делало невозможным
+# главный сценарий: подключить существующий exit к НОВОЙ RU. Скрипт умел только
+# пароль и упирался в собственную защиту.
+#
+# EXIT_AUTH=password|key, EXIT_SSH_KEY=<путь>. По умолчанию для ключа берётся
+# СОБСТВЕННЫЙ ключ этой RU: его публичную часть достаточно один раз добавить в
+# authorized_keys на exit'е, не таская приватные ключи между машинами.
+EXIT_AUTH="${EXIT_AUTH:-}"
+EXIT_SSH_KEY="${EXIT_SSH_KEY:-/etc/awg-cascade/ssh/id_ed25519}"
+
+if [ -z "$EXIT_AUTH" ]; then
+    if [ -n "${EXIT_PASSWORD:-}" ]; then
+        EXIT_AUTH=password
+    else
+        echo    "" >&2
+        echo -e "${YELLOW}▶${NC} Как подключаться к $EXIT_IP?" >&2
+        echo    "    1) по паролю root — свежий, только что купленный сервер" >&2
+        echo    "    2) по ключу       — exit уже настроен, вход по паролю на нём закрыт" >&2
+        echo -en "${YELLOW}▶${NC} Выбор [1/2]: " >&2; read -r _a </dev/tty
+        case "$_a" in 2) EXIT_AUTH=key ;; *) EXIT_AUTH=password ;; esac
+    fi
 fi
-[ -z "$EXIT_PASSWORD" ] && err "Пароль обязателен"
+
+if [ "$EXIT_AUTH" = "key" ]; then
+    [ -f "$EXIT_SSH_KEY" ] || err "нет ключа $EXIT_SSH_KEY (задай EXIT_SSH_KEY=<путь>)"
+    info "Подключаюсь по ключу $EXIT_SSH_KEY"
+else
+    if [ -z "${EXIT_PASSWORD:-}" ]; then
+        echo -en "${YELLOW}▶${NC} Root пароль exit-сервера: " >&2
+        read -rs EXIT_PASSWORD </dev/tty; echo >&2
+    fi
+    [ -z "$EXIT_PASSWORD" ] && err "Пароль обязателен"
+    command -v sshpass >/dev/null 2>&1 || err "нет sshpass — поставь или подключайся ключом (EXIT_AUTH=key)"
+fi
 
 # Первый контакт со свежим сервером — и по этому же каналу уезжают RU_PSK и
 # приватный ключ туннеля. UserKnownHostsFile=/dev/null означало, что подмена
@@ -63,11 +95,26 @@ fi
 KNOWN_HOSTS=/etc/awg-cascade/known_hosts
 mkdir -p "$(dirname "$KNOWN_HOSTS")"
 SSH_OPTS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=15"
-sshx() { sshpass -p "$EXIT_PASSWORD" ssh $SSH_OPTS "root@$EXIT_IP" "$@"; }
-scpx() { sshpass -p "$EXIT_PASSWORD" scp $SSH_OPTS "$@"; }
+if [ "$EXIT_AUTH" = "key" ]; then
+    SSH_OPTS="$SSH_OPTS -i $EXIT_SSH_KEY -o BatchMode=yes -o PasswordAuthentication=no"
+    sshx() { ssh $SSH_OPTS "root@$EXIT_IP" "$@"; }
+    scpx() { scp $SSH_OPTS "$@"; }
+else
+    sshx() { sshpass -p "$EXIT_PASSWORD" ssh $SSH_OPTS "root@$EXIT_IP" "$@"; }
+    scpx() { sshpass -p "$EXIT_PASSWORD" scp $SSH_OPTS "$@"; }
+fi
 
 info "Проверяю SSH к $EXIT_IP..."
-sshx 'echo ok' >/dev/null 2>&1 || err "SSH не прошёл (проверь IP/пароль)"
+sshx 'echo ok' >/dev/null 2>&1 || {
+    if [ "$EXIT_AUTH" = "key" ]; then
+        echo "" >&2
+        err "SSH по ключу не прошёл. Публичную часть надо один раз добавить на exit:
+     с машины, у которой доступ к $EXIT_IP уже есть, выполнить
+       ssh root@$EXIT_IP \"echo '$(cat "${EXIT_SSH_KEY}.pub" 2>/dev/null || echo '<нет .pub>')' >> ~/.ssh/authorized_keys\""
+    else
+        err "SSH по паролю не прошёл. Если exit уже настроен, вход по паролю на нём закрыт — выбирай подключение по ключу."
+    fi
+}
 ok "SSH OK"
 
 # 1. Заливаем provisioning-скрипты на exit
