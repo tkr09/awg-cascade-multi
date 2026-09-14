@@ -181,7 +181,10 @@ if [ "$ACTION" = "reroll-s" ]; then
     done
     [ -z "$RSED" ] && { echo "    нечего менять"; exit 0; }
     run_remote "$RSED
-( umask 077; awg-quick strip $EXIT_IF > $REMOTE_CONF 2>/dev/null ) && awg syncconf $EXIT_IF $REMOTE_CONF && echo '  exit: применено'; rm -f $REMOTE_CONF"
+( umask 077; awg-quick strip $EXIT_IF > $REMOTE_CONF 2>/dev/null ) && awg syncconf $EXIT_IF $REMOTE_CONF && echo '  exit: применено'; _rc=\$?; rm -f $REMOTE_CONF; exit \$_rc" || {
+        echo "  🔴 exit-сторона не приняла изменения — прекращаю, чтобы не оставить стороны рассинхронизованными" >&2
+        exit 1
+    }
     sync_local && echo "  RU: применено" || { echo "  🔴 RU: не применено — стороны рассинхронизованы, проверь конфиги"; exit 1; }
     sleep 6
     show_status "$IFACE"
@@ -193,8 +196,25 @@ if [ "$ACTION" = "off" ]; then
     sed -i '/^HeaderProtectionKey/d;/^ContentPaddingAddition/d;/^RekeyAfterTime/d;/^RekeyTimeout/d;/^RejectAfterTime/d;/^KeepaliveTimeout/d;/^MaxHandshakeAttempts/d' "$CONF"
     run_remote "sed -i '/^HeaderProtectionKey/d;/^ContentPaddingAddition/d;/^RekeyAfterTime/d;/^RekeyTimeout/d;/^RejectAfterTime/d;/^KeepaliveTimeout/d;/^MaxHandshakeAttempts/d' $WG_DIR/$EXIT_IF.conf
 awg-quick down $EXIT_IF >/dev/null 2>&1; awg-quick up $EXIT_IF >/dev/null 2>&1 && echo '  exit: перезапущен'"
-    awg-quick down "$IFACE" >/dev/null 2>&1; awg-quick up "$IFACE" >/dev/null 2>&1
-    echo "  ✅ выключено (нужен полный down/up — syncconf не снимает параметры)"
+    # Код возврата удалённой стороны берём СРАЗУ после вызова. Раньше он не
+    # проверялся вовсе, а ниже безусловно печаталось «выключено» и возвращался 0.
+    # Снятое 3.0 на одной стороне при живом 3.0 на другой — это поднятый туннель
+    # без трафика, и узнать об этом было неоткуда.
+    _remote_rc=$?
+    if [ "$_remote_rc" -ne 0 ]; then
+        echo "  🔴 exit-сторона не приняла выключение (код $_remote_rc) — прекращаю," >&2
+        echo "     чтобы не оставить стороны в разной конфигурации" >&2
+        exit 1
+    fi
+
+    if ! awg-quick down "$IFACE" >/dev/null 2>&1; then
+        echo "  ⚠ down $IFACE не отработал, пробую поднять" >&2
+    fi
+    if ! awg-quick up "$IFACE" >/dev/null 2>&1; then
+        echo "  🔴 $IFACE не поднялся после выключения 3.0 — туннель лежит!" >&2
+        exit 1
+    fi
+    echo "  ✅ выключено на обеих сторонах (нужен полный down/up — syncconf не снимает параметры)"
     sleep 5; show_status "$IFACE"
     exit 0
 fi
@@ -234,19 +254,33 @@ apply_block() {  # вставить/заменить блок в конфиге 
     chmod 600 "$c"
 }
 
+# Отметка handshake ДО применения. Без неё «успех» определялся по handshake
+# не старше 200 секунд — а он вполне мог быть получен ДО миграции, то есть
+# подтверждал живость старой конфигурации, а не новой.
+HS_BEFORE=$(awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)
+HS_BEFORE=${HS_BEFORE:-0}
+
 echo "  → пишу конфиги (ключ ${KEY:0:12}…)"
 apply_block "$CONF"
 run_remote "$(declare -f apply_block); BLOCK='$BLOCK'; apply_block $WG_DIR/$EXIT_IF.conf
-( umask 077; awg-quick strip $EXIT_IF > $REMOTE_CONF 2>/dev/null ) && awg syncconf $EXIT_IF $REMOTE_CONF && echo '  exit: применено'; rm -f $REMOTE_CONF"
+( umask 077; awg-quick strip $EXIT_IF > $REMOTE_CONF 2>/dev/null ) && awg syncconf $EXIT_IF $REMOTE_CONF && echo '  exit: применено'; _rc=\$?; rm -f $REMOTE_CONF; exit \$_rc" || {
+    echo "  🔴 exit-сторона не приняла блок 3.0 — прекращаю." >&2
+    echo "     Локальный конфиг уже изменён: верни его через \"$0 $IFACE off\"" >&2
+    exit 1
+}
 sync_local && echo "  RU: применено" || { echo "  🔴 RU: не применено — стороны рассинхронизованы, проверь конфиги"; exit 1; }
 
 sleep 6
 echo ""
 show_status "$IFACE"
-HS=$(awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}')
-if [ -n "${HS:-}" ] && [ "$HS" != "0" ] && [ $(( $(date +%s) - HS )) -lt 200 ]; then
-    echo "  ✅ туннель жив на AWG 3.0"
+HS=$(awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{print $2}' | sort -rn | head -1)
+HS=${HS:-0}
+# Требуем handshake СТРОГО НОВЕЕ снятого до применения. Возраст сам по себе
+# ничего не доказывает: свежий handshake от старой конфигурации выглядит так же.
+if [ "$HS" != "0" ] && [ "$HS" -gt "$HS_BEFORE" ]; then
+    echo "  ✅ туннель жив на AWG 3.0 (новый handshake через $(( $(date +%s) - HS ))s)"
 else
-    echo "  ⚠ handshake ещё не обновился — подожди ~1 мин и проверь: $0 $IFACE status"
-    echo "     откат при необходимости: $0 $IFACE off"
+    echo "  ⚠ нового handshake ещё нет (был $HS_BEFORE, стал $HS)."
+    echo "     Подожди ~1 мин и проверь: $0 $IFACE status"
+    echo "     Откат при необходимости: $0 $IFACE off"
 fi

@@ -75,6 +75,40 @@ EXIT_IFACE=$(echo "$ARGS" | jq -r '.exit_info.exit_iface // "awg-in"')
 IFACE="awg${EXIT_INDEX}"
 
 # Сохраняем RU-ключи
+# ─── Preflight ПОД БЛОКИРОВКОЙ, до единого изменения на ноде ─────────────────
+#
+# Раньше проверки «индекс не занят» и «бронь наша» стояли в самом конце, внутри
+# блока записи state.json. К тому моменту скрипт уже перезаписал ${IFACE}.keys
+# и ${IFACE}.conf и сделал down/up интерфейса. То есть повтор команды, протухший
+# токен или ручной вызов с занятым индексом успевали СЛОМАТЬ работающий туннель
+# и только потом получить отказ.
+#
+# Блокировка берётся на весь остаток скрипта (fd 200 живёт до выхода): операция
+# короткая, вся сетевая часть уже выполнена ботом на стороне exit'а.
+FLOCK=/etc/awg-cascade/state.lock
+exec 200>"$FLOCK"
+flock -x 200
+
+if jq -e --argjson i "$EXIT_INDEX" 'any((.exits // [])[]; .index == $i)' "$STATE" >/dev/null 2>&1; then
+    printf '{"error":"exit_index %s уже занят — ничего не меняю"}
+' "$EXIT_INDEX" >&2
+    exit 1
+fi
+if [ -n "$RESERVE_TOKEN" ]; then
+    if ! jq -e --arg t "$RESERVE_TOKEN" --argjson i "$EXIT_INDEX" 'any((.exit_reservations // [])[]; .token == $t and .index == $i)' "$STATE" >/dev/null 2>&1; then
+        printf '{"error":"бронь на индекс %s не найдена (протухла?) — ничего не меняю"}
+' "$EXIT_INDEX" >&2
+        exit 1
+    fi
+fi
+# Интерфейс уже поднят, а в state его нет — индекс переиспользуют в обход
+# state.json. Останавливаемся, а не переписываем чужой туннель.
+if [ -f "$WG_DIR/${IFACE}.conf" ] && ip link show "$IFACE" >/dev/null 2>&1; then
+    printf '{"error":"%s уже существует, а в state его нет — разберись вручную"}
+' "$IFACE" >&2
+    exit 1
+fi
+
 mkdir -p /etc/awg-cascade/exits
 cat > "/etc/awg-cascade/exits/${IFACE}.keys" <<EOF
 RU_PRIVKEY=$RU_PRIVKEY
@@ -137,26 +171,7 @@ systemctl enable "awg-quick@${IFACE}" >/dev/null 2>&1 || true
 # Добавляем в state.json (atomic)
 FLOCK=/etc/awg-cascade/state.lock
 (
-    flock -x 200
-
-    # Повторная проверка ПОД блокировкой, непосредственно перед записью.
-    # Индекс выбирается задолго до этого момента (provisioning свежего сервера —
-    # до десяти минут), поэтому к моменту записи его мог занять кто-то ещё.
-    if jq -e --argjson i "$EXIT_INDEX" 'any((.exits // [])[]; .index == $i)' \
-            "$STATE" >/dev/null 2>&1; then
-        echo "{\"error\":\"exit_index $EXIT_INDEX уже занят — добавление отменено\"}" >&2
-        exit 1
-    fi
-    # Бронь: если она выдавалась, она должна быть нашей и на этот индекс.
-    if [ -n "$RESERVE_TOKEN" ]; then
-        if ! jq -e --arg t "$RESERVE_TOKEN" --argjson i "$EXIT_INDEX" \
-                'any((.exit_reservations // [])[]; .token == $t and .index == $i)' \
-                "$STATE" >/dev/null 2>&1; then
-            echo "{\"error\":\"бронь на индекс $EXIT_INDEX не найдена (протухла?)\"}" >&2
-            exit 1
-        fi
-    fi
-
+    # Блокировка уже взята в preflight выше — повторный flock не нужен.
     TMP=$(mktemp)
     EXIT_OBJ=$(jq -n \
         --arg name        "$NAME" \
@@ -186,7 +201,7 @@ FLOCK=/etc/awg-cascade/state.lock
     mv "$TMP" "$STATE"
     chown "$BOT_USER:$BOT_USER" "$STATE"
     chmod 644 "$STATE"
-) 200>"$FLOCK"
+)
 
 # Список доверенных адресов fail2ban на RU строится из state.json и потому
 # является снимком на момент запуска: добавили/удалили exit — он протух.
