@@ -264,9 +264,25 @@ ADD_ARGS=$(RU_PRIVKEY="$RU_PRIVKEY" RU_PSK="$RU_PSK" jq -n \
       ru_privkey: $ENV.RU_PRIVKEY, ru_pubkey: $pub, ru_psk: $ENV.RU_PSK,
       exit_info: $info}')
 
+# Сохраняем параметры ДО последнего шага. Если он упадёт, вся проделанная на
+# exit'е работа (пакеты, ключи, интерфейс) останется валидной, и повторять её
+# незачем — достаточно повторить добавление на RU этими же данными.
+RETRY_FILE="/etc/awg-cascade/exits/.pending-${NEXT_IDX}.json"
+mkdir -p /etc/awg-cascade/exits
+printf '%s' "$ADD_ARGS" > "$RETRY_FILE"
+chmod 600 "$RETRY_FILE"
+
 info "Создаю awg${NEXT_IDX} на RU + добавляю в state.json..."
 # ADD_ARGS содержит приватный ключ и PSK — через stdin, не через argv.
-RESULT=$(printf '%s' "$ADD_ARGS" | /usr/local/sbin/awg-cascade-exit-add-ru.sh -)     || err "awg-cascade-exit-add-ru.sh упал"
+RESULT=$(printf '%s' "$ADD_ARGS" | /usr/local/sbin/awg-cascade-exit-add-ru.sh -) || {
+    echo "" >&2
+    warn "Добавление на RU не удалось, но EXIT УЖЕ НАСТРОЕН — переделывать его не нужно."
+    warn "Параметры сохранены. Повторить только последний шаг:"
+    echo "" >&2
+    echo "  sudo /usr/local/sbin/awg-cascade-exit-add-ru.sh - < $RETRY_FILE" >&2
+    echo "" >&2
+    err "awg-cascade-exit-add-ru.sh упал"
+}
 echo "$RESULT" | jq -e '.ok == true' >/dev/null 2>&1 || err "exit-add-ru вернул ошибку: $RESULT"
 ok "awg${NEXT_IDX} ($EXIT_NAME) поднят и добавлен в каскад"
 # Бронь уже снята внутри exit-add-ru.sh той же записью, что добавила exit.
