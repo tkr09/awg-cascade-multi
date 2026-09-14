@@ -830,6 +830,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-remove.sh       /usr/local/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-peer-rotate.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-add-ru.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-reserve.sh      /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-update.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-exit-remove.sh       /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-bootstrap-exit.sh    /usr/local/sbin/
 ok "Helper-скрипты установлены в /usr/local/sbin/"
