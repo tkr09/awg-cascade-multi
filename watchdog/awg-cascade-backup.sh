@@ -46,7 +46,10 @@ umask 077
 # архив и говорим об этом вслух.
 FLOCK=/etc/awg-cascade/state.lock
 CONSISTENT=yes
-exec 200>"$FLOCK" 2>/dev/null || true
+# Без `2>/dev/null` здесь намеренно: exec без команды применяет перенаправления
+# к САМОМУ шеллу, и такой глушитель заодно отключил бы весь вывод об ошибках
+# ниже — включая сообщения tar, ради которых их перестали прятать.
+exec 200>"$FLOCK" || CONSISTENT=no
 if ! flock -w 120 -x 200 2>/dev/null; then
     CONSISTENT=no
     echo "⚠️  state.lock не взят за 120с — снимаю бэкап без блокировки" >&2
