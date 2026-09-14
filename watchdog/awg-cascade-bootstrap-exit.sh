@@ -104,7 +104,7 @@ elif [ "$EXIT_AUTH" = "key" ]; then
      Если хостинг не раскладывает ключи сам, добавь публичную часть ЭТОЙ ноды
      с машины, у которой доступ к exit'у уже есть:
 
-       ssh root@$EXIT_IP \"echo '$_pub' >> ~/.ssh/authorized_keys\"
+       ssh root@$EXIT_IP \"printf '\\n%s\\n' '$_pub' >> ~/.ssh/authorized_keys\"
 
      Либо укажи другой ключ: EXIT_SSH_KEY=<путь> $0 $EXIT_IP $EXIT_NAME"
 else
@@ -196,10 +196,34 @@ info "Локальный интерфейс будет awg${NEXT_IDX} (брон�
 # что-то отключено.
 if [ -f "$SSH_DIR/id_ed25519.pub" ]; then
     BOT_PUB=$(cat "$SSH_DIR/id_ed25519.pub")
-    sshx "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
-        grep -qxF '$BOT_PUB' ~/.ssh/authorized_keys 2>/dev/null || \
-        echo '$BOT_PUB' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys" \
-        >/dev/null 2>&1 || err "не удалось добавить ключ бота на exit"
+
+    # ─── Дописывать в authorized_keys можно ТОЛЬКО с гарантией перевода строки ──
+    #
+    # Образ хостера вправе оставить authorized_keys без завершающего \n — так
+    # делает, например, HOSTKEY. Тогда `echo key >> file` приклеивает наш ключ
+    # к КОММЕНТАРИЮ предыдущей строки:
+    #
+    #   ssh-ed25519 AAAA...  awg-admin@tkr-20260824ssh-ed25519 AAAA... bot@ru.srv
+    #
+    # Файл при этом выглядит правильным, права правильные, ключ «на месте» —
+    # а sshd видит на один ключ меньше и отвечает «Permission denied
+    # (publickey)». Диагноз неочевиден настолько, что этот шаг обрывал установку
+    # дважды подряд, и оба раза на полностью исправном ключе.
+    #
+    # Поэтому: последний байт не \n — сначала добавляем его, и только потом ключ.
+    # Проверка через `[ -n "$(tail -c1 …)" ]`: подстановка съедает завершающие
+    # переводы строки, значит пусто ⇔ файл уже кончается переводом строки.
+    _ak_out=$(sshx "set -e
+        umask 077
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+        if [ -s ~/.ssh/authorized_keys ] && [ -n \"\$(tail -c1 ~/.ssh/authorized_keys)\" ]; then
+            echo >> ~/.ssh/authorized_keys
+        fi
+        grep -qxF '$BOT_PUB' ~/.ssh/authorized_keys || printf '%s\n' '$BOT_PUB' >> ~/.ssh/authorized_keys
+        echo \"ключей в authorized_keys: \$(ssh-keygen -lf ~/.ssh/authorized_keys 2>/dev/null | wc -l)\"" 2>&1) \
+        || err "не удалось добавить ключ бота на exit: $_ak_out"
+    info "$(echo "$_ak_out" | tail -1)"
 
     # Проверка входа ИМЕННО этим ключом, до отключения пароля. С ретраями и с
     # ВИДИМЫМ выводом ssh.
@@ -212,7 +236,9 @@ if [ -f "$SSH_DIR/id_ed25519.pub" ]; then
     _kv_out=""
     _kv_ok=0
     for _try in 1 2 3; do
-        if _kv_out=$(ssh -i "$SSH_DIR/id_ed25519" $SSH_OPTS                 -o BatchMode=yes -o PasswordAuthentication=no                 "root@$EXIT_IP" 'echo ok' 2>&1); then
+        if _kv_out=$(ssh -i "$SSH_DIR/id_ed25519" $SSH_OPTS \
+                -o BatchMode=yes -o PasswordAuthentication=no \
+                "root@$EXIT_IP" 'echo ok' 2>&1); then
             _kv_ok=1
             break
         fi
@@ -221,11 +247,14 @@ if [ -f "$SSH_DIR/id_ed25519.pub" ]; then
     if [ "$_kv_ok" != "1" ]; then
         echo "" >&2
         echo "  Вывод ssh:" >&2
-        printf '%s
-' "$_kv_out" | tail -5 | sed 's/^/    /' >&2
+        printf '%s\n' "$_kv_out" | tail -5 | sed 's/^/    /' >&2
+        # Диагностику даём по ОТПЕЧАТКУ, а не по grep'у строки: если ключ снова
+        # склеился с соседним, grep его найдёт, а sshd — нет, и подсказка соврёт.
         err "ключ бота добавлен, но вход по нему не работает — прерываю ДО отключения пароля.
-     Ключ на exit'е проверить так (с машины, где доступ есть):
-       grep -c '$(awk '{print $NF}' "$SSH_DIR/id_ed25519.pub" 2>/dev/null)' /root/.ssh/authorized_keys"
+     Проверить на exit'е (с машины, где доступ есть), ищем СВОЙ отпечаток:
+       ssh-keygen -lf /root/.ssh/authorized_keys
+       наш: $(ssh-keygen -lf "$SSH_DIR/id_ed25519.pub" 2>/dev/null | awk '{print $2}')
+     Нет его в списке при наличии ключа в файле — строка склеена с соседней."
     fi
     ok "Ключ бота добавлен и проверен"
 else

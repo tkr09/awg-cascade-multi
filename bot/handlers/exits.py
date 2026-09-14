@@ -743,7 +743,7 @@ async def cb_auth_keyadded(call: CallbackQuery, state: FSMContext) -> None:
         f"<b>Положи мой публичный ключ</b> на exit-сервере:\n\n"
         f"<pre>{pub}</pre>\n\n"
         f"Команда для exit'а:\n"
-        f"<pre>echo '{pub}' >> ~/.ssh/authorized_keys</pre>\n\n"
+        f"<pre>printf '\\n%s\\n' '{pub}' >> ~/.ssh/authorized_keys</pre>\n\n"
         f"После этого нажми ▶️.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[

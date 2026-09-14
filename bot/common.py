@@ -420,11 +420,19 @@ async def ssh_exec(
 async def ssh_copy_id(host: str, password: str, pubkey: str, *, port: int = 22) -> tuple[bool, str]:
     """Добавляет наш публичный ключ в ~/.ssh/authorized_keys на удалённом хосте."""
     pub_escaped = pubkey.replace('"', '\\"')
+    # Ключ дописываем ТОЛЬКО после гарантии перевода строки: образ хостера
+    # может оставить authorized_keys без завершающего \n (HOSTKEY так и делает),
+    # и тогда echo приклеивает наш ключ к КОММЕНТАРИЮ предыдущего. Файл при
+    # этом выглядит нормально, а sshd видит на один ключ меньше и отвечает
+    # «Permission denied (publickey)» на полностью исправном ключе.
     cmd = (
-        'mkdir -p ~/.ssh && chmod 700 ~/.ssh && '
-        f'grep -qxF "{pub_escaped}" ~/.ssh/authorized_keys 2>/dev/null || '
-        f'echo "{pub_escaped}" >> ~/.ssh/authorized_keys && '
-        'chmod 600 ~/.ssh/authorized_keys && echo OK'
+        'umask 077; mkdir -p ~/.ssh && chmod 700 ~/.ssh && '
+        'touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && '
+        'if [ -s ~/.ssh/authorized_keys ] && [ -n "$(tail -c1 ~/.ssh/authorized_keys)" ]; '
+        'then echo >> ~/.ssh/authorized_keys; fi && '
+        f'{{ grep -qxF "{pub_escaped}" ~/.ssh/authorized_keys '
+        f'|| printf "%s\\n" "{pub_escaped}" >> ~/.ssh/authorized_keys; }} && '
+        'echo OK'
     )
     out, err, rc = await ssh_exec(host, cmd, password=password, port=port, timeout=20)
     return rc == 0 and "OK" in out, (err or out)
