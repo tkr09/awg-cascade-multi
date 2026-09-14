@@ -49,6 +49,18 @@ def upgrade_block(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+def kernel_block(text: str) -> str | None:
+    """Секция «ядро + сборка DKMS под все ядра» — тоже в двух файлах."""
+    m = re.search(r"# ─── Ядро: модуль нужен под то ядро.*?\nfi\n", text, re.S)
+    return m.group(0) if m else None
+
+
+def dkms_verify_block(text: str) -> str | None:
+    """Проверка «модуль есть под новейшее ядро» — тоже в двух файлах."""
+    m = re.search(r"# ─── Модуль под ВСЕ установленные ядра.*?\nfi\n", text, re.S)
+    return m.group(0) if m else None
+
+
 def check_config_before_helpers() -> int:
     """
     config должен записываться РАНЬШЕ, чем запускается что-либо его читающее.
@@ -125,6 +137,20 @@ def main() -> int:
         fail("блок обновления пакетов в setup.sh и setup-exit.sh разошёлся")
         bad = 1
 
+    # ─── 2b. ядро и DKMS ─────────────────────────────────────────────────────
+    # Разойдутся — и одна из ролей начнёт собирать модуль только под текущее
+    # ядро. Заметно это станет после первой перезагрузки: нода без amneziawg.
+    for what, fn in (("секция ядра", kernel_block),
+                     ("проверка DKMS под новейшее ядро", dkms_verify_block)):
+        u, v = fn(setup), fn(setup_exit)
+        if u is None or v is None:
+            missing = [n for n, val in (("setup.sh", u), ("setup-exit.sh", v)) if val is None]
+            fail("%s не найдена в: %s" % (what, ", ".join(missing)))
+            bad = 1
+        elif u != v:
+            fail("%s в setup.sh и setup-exit.sh разошлась" % what)
+            bad = 1
+
     bad |= check_config_before_helpers()
 
     # ─── 3. комплект provisioning ────────────────────────────────────────────
@@ -142,7 +168,7 @@ def main() -> int:
             bad = 1
 
     if not bad:
-        print("сошлось: sudoers, блок apt upgrade, комплект provisioning, "
+        print("сошлось: sudoers, apt upgrade, ядро+DKMS, комплект provisioning, "
               "порядок «config раньше helper'ов»")
     return bad
 

@@ -318,6 +318,52 @@ ok "awg${NEXT_IDX} ($EXIT_NAME) поднят и добавлен в каскад
 # Обнуляем токен, чтобы trap на выходе не отпустил чужую бронь.
 RESERVE_TOKEN=""
 
+# ─── 7b. Перезагрузка exit'а в новое ядро ────────────────────────────────────
+#
+# setup-exit.sh обновил образ вместе с ядром и собрал модуль под все ядра, но
+# работает exit до сих пор на старом. Перезагрузка делается ЗДЕСЬ, а не внутри
+# setup-exit.sh: тот запускается по SSH и обязан вернуть JSON — ребут оборвал бы
+# его вывод на полуслове, и провижининг выглядел бы как упавший.
+#
+# Момент выбран намеренно: туннель уже поднят, клиентов на нём ещё нет, и
+# возвращение проверяется по handshake'у. Отложить — значит отдать первую
+# перезагрузку ноде с трафиком, без наблюдения.
+#
+# Ходим ключом, а не паролем: setup-exit.sh к этому моменту уже отключил вход
+# по паролю, и sshx (он мог быть парольным) здесь больше не работает.
+_ssh_key_exit() {
+    ssh -i "$SSH_DIR/id_ed25519" $SSH_OPTS_BASE \
+        -o BatchMode=yes -o PasswordAuthentication=no "root@$EXIT_IP" "$@"
+}
+if _ssh_key_exit 'test -f /var/run/reboot-required' 2>/dev/null; then
+    _knew=$(_ssh_key_exit 'ls -1 /boot/vmlinuz-* | sed "s|.*/vmlinuz-||" | sort -V | tail -1' 2>/dev/null)
+    info "На exit'е новое ядро (${_knew:-?}) — перезагружаю его"
+    _ssh_key_exit 'systemctl reboot' >/dev/null 2>&1 || true
+    sleep 20
+    _back=0
+    for _i in $(seq 1 24); do            # до ~4 минут
+        _ssh_key_exit 'test -d /etc/awg-cascade-exit' >/dev/null 2>&1 && { _back=1; break; }
+        sleep 10
+    done
+    if [ "$_back" = 1 ]; then
+        ok "Exit вернулся, ядро: $(_ssh_key_exit 'uname -r' 2>/dev/null)"
+        # Ждём handshake: интерфейс на RU остался поднятым, но пира не было.
+        _hs_ok=0
+        for _i in $(seq 1 12); do
+            _hs=$(awg show "awg${NEXT_IDX}" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+            if [ -n "$_hs" ] && [ "$_hs" != "0" ] && [ $(( $(date +%s) - _hs )) -lt 180 ]; then
+                _hs_ok=1; break
+            fi
+            sleep 10
+        done
+        [ "$_hs_ok" = 1 ] \
+            && ok "Туннель до $EXIT_NAME восстановился после перезагрузки" \
+            || warn "Туннель до $EXIT_NAME пока без handshake'а — watchdog дожмёт, но проверь"
+    else
+        warn "Exit не ответил за 4 минуты после перезагрузки — проверь его в панели хостера"
+    fi
+fi
+
 # 8. Перезапускаем бота — теперь у него есть egress через этот exit
 info "Перезапускаю бота (теперь будет egress через $EXIT_NAME)..."
 systemctl restart awg-cascade-bot 2>/dev/null || true
