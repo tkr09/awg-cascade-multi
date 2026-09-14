@@ -65,7 +65,9 @@ case "${1:-}" in
 acquire)
     OWNER="${2:-unknown}"
     exec 200>"$FLOCK" || { echo "не открыть $FLOCK" >&2; exit 1; }
-    flock -x 200 || { echo "не взять блокировку" >&2; exit 1; }
+    # -w 30: без таймаута вызывающий (в т.ч. trap на выходе bootstrap) мог бы
+    # ждать чужую блокировку бесконечно и выглядеть как зависание.
+    flock -w 30 -x 200 || { echo "не взять блокировку state.lock за 30с" >&2; exit 1; }
     [ -f "$STATE" ] || { echo "нет $STATE" >&2; exit 1; }
     _gc
     IDX=$(jq -r --argjson max "$MAX_INDEX" '
@@ -86,7 +88,7 @@ release)
     TOKEN="${2:-}"
     [ -n "$TOKEN" ] || { echo "нужен token" >&2; exit 1; }
     exec 200>"$FLOCK" || exit 1
-    flock -x 200 || exit 1
+    flock -w 30 -x 200 || { echo "не взять блокировку state.lock за 30с" >&2; exit 1; }
     TMP=$(mktemp)
     jq --arg t "$TOKEN" \
        '.exit_reservations = [ (.exit_reservations // [])[] | select(.token != $t) ]' \

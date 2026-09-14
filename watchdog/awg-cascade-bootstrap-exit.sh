@@ -165,7 +165,19 @@ NEXT_IDX=$(echo "$RESERVE" | awk '{print $1}')
 RESERVE_TOKEN=$(echo "$RESERVE" | awk '{print $2}')
 [ -n "$NEXT_IDX" ] || err "бронь вернула пустой индекс"
 # Оборвались на provisioning — бронь не должна держать индекс до TTL.
-trap '[ -n "${RESERVE_TOKEN:-}" ] && /usr/local/sbin/awg-cascade-exit-reserve.sh release "$RESERVE_TOKEN" >/dev/null 2>&1 || true' EXIT
+# Освобождение брони на выходе. Вывод НЕ глушим: прошлая версия прятала его в
+# /dev/null, и когда на реальном заведении exit'а бронь осталась висеть, понять
+# по логу было нечего — вплоть до того, отработал ли trap вообще.
+release_reserve() {
+    [ -n "${RESERVE_TOKEN:-}" ] || return 0
+    if /usr/local/sbin/awg-cascade-exit-reserve.sh release "$RESERVE_TOKEN"; then
+        info "бронь индекса освобождена"
+    else
+        warn "бронь $RESERVE_TOKEN освободить не удалось — снимется сама через TTL,"
+        warn "или вручную: awg-cascade-exit-reserve.sh release $RESERVE_TOKEN"
+    fi
+}
+trap release_reserve EXIT
 info "Локальный интерфейс будет awg${NEXT_IDX} (бронь взята)"
 
 # 4. Ключ бота ставим ДО provisioning — и проверяем, что он работает.
