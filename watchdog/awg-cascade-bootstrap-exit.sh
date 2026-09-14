@@ -189,9 +189,32 @@ if [ -f "$SSH_DIR/id_ed25519.pub" ]; then
         echo '$BOT_PUB' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys" \
         >/dev/null 2>&1 || err "не удалось добавить ключ бота на exit"
 
-    ssh -i "$SSH_DIR/id_ed25519" $SSH_OPTS -o BatchMode=yes -o PasswordAuthentication=no \
-        "root@$EXIT_IP" 'echo ok' >/dev/null 2>&1 \
-        || err "ключ бота добавлен, но вход по нему не работает — прерываю ДО отключения пароля"
+    # Проверка входа ИМЕННО этим ключом, до отключения пароля. С ретраями и с
+    # ВИДИМЫМ выводом ssh.
+    #
+    # Прежний вариант делал одну попытку и прятал вывод в /dev/null. При сбое
+    # оператор получал «вход по нему не работает» и ноль сведений о причине, а
+    # запуск обрывался — при том что ключ мог быть на месте и рабочим. Ровно та
+    # болезнь, за которую аудит цеплял другие места: диагностика, которая молчит
+    # именно тогда, когда нужна.
+    _kv_out=""
+    _kv_ok=0
+    for _try in 1 2 3; do
+        if _kv_out=$(ssh -i "$SSH_DIR/id_ed25519" $SSH_OPTS                 -o BatchMode=yes -o PasswordAuthentication=no                 "root@$EXIT_IP" 'echo ok' 2>&1); then
+            _kv_ok=1
+            break
+        fi
+        [ "$_try" -lt 3 ] && { info "вход по ключу с попытки $_try не прошёл, повтор через 3с"; sleep 3; }
+    done
+    if [ "$_kv_ok" != "1" ]; then
+        echo "" >&2
+        echo "  Вывод ssh:" >&2
+        printf '%s
+' "$_kv_out" | tail -5 | sed 's/^/    /' >&2
+        err "ключ бота добавлен, но вход по нему не работает — прерываю ДО отключения пароля.
+     Ключ на exit'е проверить так (с машины, где доступ есть):
+       grep -c '$(awk '{print $NF}' "$SSH_DIR/id_ed25519.pub" 2>/dev/null)' /root/.ssh/authorized_keys"
+    fi
     ok "Ключ бота добавлен и проверен"
 else
     warn "$SSH_DIR/id_ed25519.pub не найден — бот не сможет управлять этим exit'ом"
