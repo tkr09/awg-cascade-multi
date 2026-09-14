@@ -82,17 +82,25 @@ rc_total=0
 while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
     [ -n "$IP" ] || continue
     echo "═══ $NAME ($IP, локально $IFACE, на exit'е $EIFACE) ═══"
+    node_rc=0
 
     if ! ssh $SSH_OPTS "root@$IP" 'echo ok' >/dev/null 2>&1; then
         echo "  🔴 SSH недоступен — пропускаю"
-        rc_total=1
+        node_rc=1
         continue
     fi
 
     # ─── что расходится ──────────────────────────────────────────────────────
     changed=""
     for f in $BUNDLE; do
-        [ -f "$BOT_SCRIPTS/$f" ] || continue
+        # Отсутствующий локальный файл — это НЕПОЛНЫЙ комплект, а не «нечего
+        # сравнивать». Прежний `continue` делал дыру незаметной: exit тихо
+        # оставался со старым скриптом, а итог был успешным.
+        if [ ! -f "$BOT_SCRIPTS/$f" ]; then
+            echo "  🔴 нет локального $BOT_SCRIPTS/$f — комплект неполон"
+            node_rc=1
+            continue
+        fi
         lsum=$(sha256sum "$BOT_SCRIPTS/$f" | cut -d' ' -f1)
         rsum=$(ssh $SSH_OPTS "root@$IP" "sha256sum /usr/local/sbin/$f 2>/dev/null | cut -d' ' -f1")
         [ "$lsum" = "$rsum" ] || changed="$changed $f"
@@ -107,7 +115,9 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
     fi
 
     if [ "$CHECK" = "1" ]; then
-        [ -n "$changed" ] && rc_total=2
+        # Расхождением считаем и разницу версий, а не только файлов: одинаковые
+        # байты при разном штампе означают, что нода не проходила обновление.
+        { [ -n "$changed" ] || [ "$remote_ver" != "$VER" ]; } && rc_total=2
         continue
     fi
 
@@ -115,14 +125,14 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
     for f in $changed; do
         if ! scp $SSH_OPTS "$BOT_SCRIPTS/$f" "root@$IP:/tmp/.upd-$f" >/dev/null 2>&1; then
             echo "  🔴 не передался $f"
-            rc_total=1
+            node_rc=1
             continue
         fi
         if ssh $SSH_OPTS "root@$IP" "install -m 755 -o root -g root /tmp/.upd-$f /usr/local/sbin/$f && rm -f /tmp/.upd-$f"; then
             echo "  обновлён: $f"
         else
             echo "  🔴 не установился $f"
-            rc_total=1
+            node_rc=1
         fi
     done
 
@@ -134,7 +144,7 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
         echo "  fail2ban переприменён"
     else
         echo "  ⚠️ fail2ban вернул ошибку — проверь на exit'е"
-        rc_total=1
+        node_rc=1
     fi
 
     # WARP: restore сам разбирается, включён он здесь или нет. Включён —
@@ -146,7 +156,7 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
         failed=$(echo "$warp_out" | jq -r '.failed // 0' 2>/dev/null)
         if [ "${failed:-0}" -gt 0 ]; then
             echo "  🔴 WARP: восстановлено ${restored:-0}, не удалось $failed"
-            rc_total=1
+            node_rc=1
         elif [ "${restored:-0}" -gt 0 ]; then
             echo "  WARP: переприменён на $restored интерфейсе(ах), юнит восстановления установлен"
         else
@@ -165,30 +175,39 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
         echo "$os_out" | grep -q "ОШИБКА" && rc_total=1
     fi
 
-    # ─── штамп версии ────────────────────────────────────────────────────────
-    # Без него exit в сводке каскада значится с пустой версией, и понять, какой
-    # на нём код, можно было только сравнением файлов руками. Путь тот же, что
-    # у RU (/etc/awg-cascade/version) — его и читает диагностика.
-    if ssh $SSH_OPTS "root@$IP" "mkdir -p /etc/awg-cascade && printf '%s %s %s\n' '$VER' '$COMMIT' \"\$(date -Iseconds)\" > /etc/awg-cascade/version"; then
-        echo "  version-stamp: $VER ($COMMIT)"
-    else
-        echo "  ⚠️ не удалось записать version-stamp"
-        rc_total=1
-    fi
-
     # ─── проверка, что ничего не уронили ─────────────────────────────────────
     hs=$(ssh $SSH_OPTS "root@$IP" "awg show $EIFACE latest-handshakes 2>/dev/null | awk '{print \$2}' | sort -rn | head -1")
-    if [ -n "${hs:-}" ] && [ "$hs" != "0" ]; then
+    if [ -z "${hs:-}" ] || [ "$hs" = "0" ]; then
+        echo "  🔴 проверка: у $EIFACE нет handshake"
+        node_rc=1
+    else
         age=$(( $(date +%s) - hs ))
         echo "  проверка: $EIFACE handshake ${age}s назад"
         if [ "$age" -gt 300 ]; then
             echo "  🔴 handshake старше 5 минут — посмотри туннель"
-            rc_total=1
+            node_rc=1
+        fi
+    fi
+
+    # ─── штамп версии ────────────────────────────────────────────────────────
+    # Пишем ПОСЛЕ проверки туннеля и только если по этой ноде не было отказов.
+    # Иначе нода с частично залитым комплектом помечается целевой версией — та
+    # же болезнь, что лечили в sync.sh. Путь тот же, что у RU
+    # (/etc/awg-cascade/version): его читает диагностика, поэтому exit'ы
+    # перестают значиться в сводке с пустой версией.
+    if [ "$node_rc" -eq 0 ]; then
+        if ssh $SSH_OPTS "root@$IP" "mkdir -p /etc/awg-cascade && printf '%s %s %s\n' '$VER' '$COMMIT' \"\$(date -Iseconds)\" > /etc/awg-cascade/version"; then
+            echo "  version-stamp: $VER ($COMMIT)"
+        else
+            echo "  ⚠️ не удалось записать version-stamp"
+            node_rc=1
         fi
     else
-        echo "  🔴 проверка: у $EIFACE нет handshake"
-        rc_total=1
+        echo "  version-stamp НЕ обновлён: по этой ноде были ошибки"
     fi
+
+    [ "$node_rc" -ne 0 ] && rc_total=1
+
 done 3<<TARGETS
 $targets
 TARGETS

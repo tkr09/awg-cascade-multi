@@ -197,6 +197,16 @@ fi
 # Сначала прописываем вызов client3-fw в inline-генерируемый iptables.sh
 # (он не синкается из репо), потом пересобираем цепочки целиком.
 /usr/local/sbin/awg-cascade-client3-fw.sh --hook 2>&1 | sed 's/^/  /'
+
+# ip rule тоже надо переприменить, а не только firewall.
+#
+# Правило priority 997 «to CLIENT3_NET lookup main» создаётся helper'ом iprule
+# и зависит от набора клиентских сетей. Включение второго интерфейса этот набор
+# меняет, но iprule раньше не вызывался: watchdog пересоздаёт общие правила
+# только если пропало правило fwmark, поэтому нового 997 могло не быть до
+# перезапуска. Последствие — разрешённый LAN-трафик pinned-клиента awg0 к новой
+# подсети уходил в exit вместо соседа.
+[ -x /usr/local/sbin/awg-cascade-iprule.sh ] && /usr/local/sbin/awg-cascade-iprule.sh || true
 /usr/local/sbin/awg-cascade-iptables.sh >/dev/null 2>&1 || true
 
 echo ""

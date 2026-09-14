@@ -67,6 +67,10 @@ drift=0
 # релиз, и мониторинг по stamp этого не видел — то есть ровно то, ради чего stamp
 # и заводился, переставало работать именно в тот момент, когда нужно.
 errors=0
+# Что именно поменялось — нужно, чтобы понять, какие компоненты требуют
+# АКТИВАЦИИ. Файл на диске и работающий процесс — разные вещи (см. ниже).
+CHANGED=""
+note_changed() { case " $CHANGED " in *" $1 "*) ;; *) CHANGED="$CHANGED $1" ;; esac; }
 fail() { errors=$(( errors + 1 )); echo "  🔴 $1" >&2; }
 
 sync_file() {  # <src> <dst> <mode> [доп. аргументы install, например -o awgbot -g awgbot]
@@ -99,9 +103,12 @@ sync_file() {  # <src> <dst> <mode> [доп. аргументы install, нап�
     if [ "$CHECK" = "1" ]; then
         echo "  ДРЕЙФ: $dst (отличается от репо $VER)"
     else
-        install -m "$mode" "$@" "$src" "$dst" \
-            && echo "  обновлён: $dst" \
-            || fail "не удалось установить: $dst"
+        if install -m "$mode" "$@" "$src" "$dst"; then
+            echo "  обновлён: $dst"
+            note_changed "$(basename "$dst")"
+        else
+            fail "не удалось установить: $dst"
+        fi
     fi
 }
 
@@ -361,6 +368,43 @@ else
             >/dev/null 2>&1 || true
         exit 1
     fi
+    # ─── Активация: файл на диске ≠ работающий код ───────────────────────────
+    #
+    # Раньше sync перезапускал только бота. Уже запущенный watchdog продолжал
+    # исполнять ПРЕЖНИЙ код, а firewall не переприменялся вовсе — при этом
+    # version-stamp писался новый. Нода отчитывалась о версии, которой в runtime
+    # на ней не было. Это ровно тот способ, которым «репо = прод» расходится
+    # снова, только уже незаметно.
+    case " $CHANGED " in
+        *" awg-cascade-watchdog.sh "*)
+            # Перезапуск watchdog обратим и клиентского трафика не трогает.
+            if systemctl restart awg-cascade-watchdog 2>/dev/null; then
+                sleep 2
+                if systemctl is-active --quiet awg-cascade-watchdog; then
+                    echo "  watchdog перезапущен (код изменился)"
+                else
+                    fail "watchdog не поднялся после обновления кода"
+                fi
+            else
+                fail "watchdog не перезапустился"
+            fi
+            ;;
+    esac
+
+    # Firewall и policy routing автоматически НЕ переприменяем: это данные-путь,
+    # решение принимает оператор. Но и молчать нельзя — иначе новые правила лежат
+    # файлом и не действуют до перезагрузки, а stamp уже новый.
+    ACTIVATION=""
+    for _c in awg-cascade-iptables.sh awg-cascade-client3-fw.sh               awg-cascade-interclient.sh awg-cascade-iprule.sh; do
+        case " $CHANGED " in *" $_c "*) ACTIVATION="$ACTIVATION $_c" ;; esac
+    done
+    if [ -n "$ACTIVATION" ]; then
+        mkdir -p /etc/awg-cascade
+        echo "$VER$ACTIVATION" > /etc/awg-cascade/activation-pending
+    else
+        rm -f /etc/awg-cascade/activation-pending 2>/dev/null || true
+    fi
+
     printf '%s %s %s\n' "$VER" "$COMMIT" "$(date -Iseconds)" > /etc/awg-cascade/version
     echo "✅ Синхронизировано с $VER ($COMMIT). Изменений: $drift. version-stamp обновлён."
     echo "   проверено:     $SCOPE"
@@ -371,7 +415,14 @@ else
         echo "       sudo -u $BOT_USER $BOT_DIR/venv/bin/pip install -r $BOT_DIR/requirements.txt"
         echo "       sudo systemctl restart awg-cascade-bot"
     fi
-    [ "$drift" -gt 0 ] && echo "ℹ️  Watchdog при необходимости: systemctl restart awg-cascade-watchdog"
+    if [ -n "${ACTIVATION:-}" ]; then
+        echo ""
+        echo "⚠️  ТРЕБУЕТСЯ АКТИВАЦИЯ. Обновлены, но НЕ применены:$ACTIVATION"
+        echo "    Новые правила лежат файлами и вступят в силу при следующей загрузке."
+        echo "    Применить сейчас (кратко прервёт клиентский трафик):"
+        echo "      sudo /usr/local/sbin/awg-cascade-iptables.sh"
+        echo "    Отметка сохранена в /etc/awg-cascade/activation-pending."
+    fi
     # Без явного exit 0 скрипт возвращал rc=1 при drift=0 (последней командой
     # оказывался ложный тест выше) — вызывающая сторона читала это как сбой.
     exit 0
