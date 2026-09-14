@@ -278,6 +278,24 @@ else
     else
         _upg_mode="dist-upgrade"; _upg_what="пакеты образа вместе с ядром"
     fi
+    # needrestart на Ubuntu 24.04 интерактивен по умолчанию, и NEEDRESTART_MODE=a
+    # снимает только вопрос «какие сервисы перезапустить». ОТДЕЛЬНО от него есть
+    # экран «Pending kernel upgrade», который показывается при установке нового
+    # ядра и ждёт Enter — то есть ровно в том случае, ради которого мы сюда и
+    # шли. Через env его не закрыть, только конфигом. В провижининге по SSH без
+    # терминала этот экран означал бы зависание до таймаута.
+    #
+    # Файл остаётся на ноде намеренно: он же спасает от зависания
+    # unattended-upgrades. reboot-required при этом продолжает выставляться,
+    # и awg-cascade-autoreboot.sh его видит — гасится диалог, а не сигнал.
+    mkdir -p /etc/needrestart/conf.d
+    cat > /etc/needrestart/conf.d/99-awg-cascade.conf <<'NRCONF'
+# Ставит установщик awg-cascade: провижининг идёт без терминала,
+# любой интерактивный экран здесь — это зависание до таймаута.
+$nrconf{restart} = 'a';
+$nrconf{kernelhints} = -1;
+NRCONF
+
     _pending=$(apt-get -s -q "$_upg_mode" 2>/dev/null | grep -cE '^Inst ' || true)
     if [ "${_pending:-0}" -gt 0 ]; then
         info "Обновляю $_upg_what: $_pending шт. (может занять несколько минут)..."
