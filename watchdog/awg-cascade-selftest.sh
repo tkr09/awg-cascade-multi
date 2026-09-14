@@ -90,10 +90,23 @@ if [ -f "$STATE" ]; then
     done < <(jq -c '.exits[]' "$STATE" 2>/dev/null)
 fi
 
-# ─── Egress бота → Telegram (через каскад) ───────────────────────────────────
+# ─── Egress бота → Telegram (и ПУТЬ, а не только доступность) ────────────────
+#
+# Один только HTTP-код ничего не говорит о маршруте: при пустой таблице 100
+# запрос бота уходит напрямую через WAN и точно так же возвращает 200. Проверка
+# рапортовала «каскад жив» ровно в той аварии, которую должна была ловить.
+# Поэтому отдельно сверяем ФАКТИЧЕСКИЙ внешний адрес с адресами exit'ов.
 code=$(sudo -u "$BOT_USER" curl -s -o /dev/null -w '%{http_code}' --max-time 12 https://api.telegram.org 2>/dev/null)
 if [ -n "$code" ] && [ "$code" != "000" ]; then
-    emit OK "Egress бота" "Telegram HTTP $code (каскад жив)"
+    seen=$(sudo -u "$BOT_USER" curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null)
+    own=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+    if [ -z "$seen" ]; then
+        emit WARN "Egress бота" "Telegram HTTP $code, но внешний IP определить не удалось"
+    elif echo "$own" | grep -qxF "$seen"; then
+        emit FAIL "Egress бота" "выходит НАПРЯМУЮ ($seen — адрес самой ноды), мимо каскада"
+    else
+        emit OK "Egress бота" "Telegram HTTP $code, внешний IP $seen (не адрес ноды)"
+    fi
 else
     emit FAIL "Egress бота" "Telegram HTTP ${code:-timeout} — бот не выходит!"
 fi

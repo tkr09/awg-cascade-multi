@@ -577,11 +577,21 @@ del_by_comment() {  # \$1 = -t табл. или пусто, \$2 = цепочка
     return 0
 }
 
+del6_by_comment() {  # \$1 = цепочка ip6tables
+    local spec
+    while spec=\$(ip6tables -S "\$1" 2>/dev/null | grep -m1 -- '--comment awg-cascade'); do
+        [ -n "\$spec" ] || break
+        ip6tables \${spec/-A/-D} 2>/dev/null || break
+    done
+    return 0
+}
+
 flush_our_rules() {
     local ch
     for ch in FORWARD INPUT OUTPUT;            do del_by_comment ""          "\$ch"; done
     for ch in PREROUTING OUTPUT FORWARD;       do del_by_comment "-t mangle" "\$ch"; done
     for ch in POSTROUTING PREROUTING;          do del_by_comment "-t nat"    "\$ch"; done
+    for ch in FORWARD OUTPUT;                  do del6_by_comment            "\$ch"; done
 }
 
 # Снять прошлые наши правила перед повторным применением — иначе они
@@ -628,6 +638,35 @@ iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --commen
 # --- per-peer inter-client LAN access (whitelist src→dst + default-deny /24) ---
 # Применяет правила awg-lan из peers.json поверх базовых (должно идти ПОСЛЕ MARK).
 [ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
+
+# --- IPv6: каскад IPv4-only, значит IPv6 обязан быть закрыт явно ---
+#
+# До сих пор про IPv6 не было ни одного правила — только предпочтение IPv4 в
+# gai.conf. Но предпочтение это не запрет: на ноде с рабочим IPv6 политика
+# ip6tables FORWARD по умолчанию ACCEPT, а kill-switch описан только для IPv4.
+# То есть весь разбор «клиент может выйти только через awg+» к IPv6 не относился
+# вообще. Для бота то же самое: правило uidrange выбирает IPv4-таблицу 100 и к
+# IPv6-маршруту отношения не имеет, поэтому запрос к Telegram по IPv6 ушёл бы
+# напрямую — причём не только в аварии, а всегда.
+#
+# Сейчас это скорее закрытие дыры на будущее, чем исправление наблюдаемой утечки:
+# клиентские туннели IPv4-only, и IPv6-трафику внутри них взяться неоткуда. Но
+# зависеть это должно от правил, а не от того, что адрес некому выдать.
+# || true на каждом правиле: set -e активен, а ip6tables на ноде без модуля
+# ip6_tables падает уже на первом вызове. Оборвать из-за этого всю пересборку
+# нельзя — барьер останется поднятым и клиенты окажутся отрезаны совсем.
+if command -v ip6tables >/dev/null 2>&1 && ip6tables -S >/dev/null 2>&1; then
+    ip6tables -A FORWARD -i awg0 -m comment --comment "awg-cascade-killsw6" -j DROP || true
+    ip6tables -A FORWARD -o awg0 -m comment --comment "awg-cascade-killsw6" -j DROP || true
+    if [ -n "\$C3" ]; then
+        ip6tables -A FORWARD -i "\$C3" -m comment --comment "awg-cascade-killsw6" -j DROP || true
+        ip6tables -A FORWARD -o "\$C3" -m comment --comment "awg-cascade-killsw6" -j DROP || true
+    fi
+    # Бот: REJECT, а не DROP — быстрый отказ, чтобы getaddrinfo сразу перешёл на
+    # IPv4, а не ждал таймаута.
+    BOT_UID6=\$(id -u "\${BOT_USER:-awgbot}" 2>/dev/null || echo "")
+    [ -n "\$BOT_UID6" ] && ip6tables -A OUTPUT -m owner --uid-owner "\$BOT_UID6"         -m comment --comment "awg-cascade-bot6" -j REJECT 2>/dev/null || true
+fi
 
 # Набор полон — барьер снимет trap на выходе.
 APPLIED=1

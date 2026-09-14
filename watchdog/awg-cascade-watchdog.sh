@@ -351,9 +351,24 @@ apply_route() {
         # shellcheck disable=SC2086
         ip route replace default table 100 $nexthops 2>&1 \
             || log "ERROR: ip route replace failed (nexthops=$nexthops)"
+        # Каскад снова есть — следующее опустошение должно снова прозвучать.
+        ECMP_EMPTY_ANNOUNCED=0
     else
         ip route flush table 100 2>/dev/null
-        log "ECMP empty — table 100 flushed (kill-switch ACTIVE)"
+        # Формулировка важна. Прежняя строка «kill-switch ACTIVE» верна только
+        # для клиентов: их закрывает DROP в FORWARD. Для БОТА пустая таблица
+        # поиск не прекращает — RPDB идёт дальше и находит main, то есть запросы
+        # к Telegram уходят напрямую с IP этой ноды. Прямой доступ здесь нужен
+        # (иначе каскад нечем чинить), но он должен быть видимым режимом, а не
+        # побочным эффектом, который читается как «всё заблокировано».
+        log "ECMP empty — table 100 flushed. Клиенты отрезаны (kill-switch), бот работает НАПРЯМУЮ"
+        if [ "${ECMP_EMPTY_ANNOUNCED:-0}" = "0" ]; then
+            ECMP_EMPTY_ANNOUNCED=1
+            [ -x /usr/local/sbin/awg-cascade-alert.sh ] && /usr/local/sbin/awg-cascade-alert.sh \
+                ecmp-empty 1800 "🛑 Каскад пуст" urgent rotating_light \
+                "Живых exit'ов не осталось: клиенты отрезаны kill-switch'ем. Бот продолжает работать, но его трафик идёт НАПРЯМУЮ — Telegram видит IP этой ноды." \
+                >/dev/null 2>&1 || true
+        fi
     fi
 
     # Обновляем state
