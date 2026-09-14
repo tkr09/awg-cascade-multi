@@ -968,10 +968,14 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
                 f"RU_PSK='{ru_psk}' "
                 f"bash /root/setup-exit.sh"
             )
-            # 900 sec = 15 min. На fresh Ubuntu VPS первые 5-10 мин держится
+            # 1200 sec = 20 min. На fresh Ubuntu VPS первые 5-10 мин держится
             # apt-lock от unattended-upgrades (setup-exit.sh ждёт через
             # wait_apt_lock). Плюс компиляция amneziawg-dkms кушает ещё 2-3 мин.
-            result = await asyncio.wait_for(conn.run(cmd, check=False), timeout=900)
+            # Было 900; поднято в v2.2.1 setup-exit.sh сначала приводит образ к
+            # актуальному состоянию (apt upgrade), и на отставшем образе это
+            # несколько минут сверху. Запас нужен, иначе провижининг обрывается
+            # на середине — с уже настроенным сервером и без JSON для RU.
+            result = await asyncio.wait_for(conn.run(cmd, check=False), timeout=1200)
             stdout_text = result.stdout if isinstance(result.stdout, str) else \
                           (result.stdout.decode() if result.stdout else "")
             stderr_text = result.stderr if isinstance(result.stderr, str) else \
