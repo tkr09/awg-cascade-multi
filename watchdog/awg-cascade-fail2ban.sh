@@ -19,7 +19,10 @@
 # Идемпотентен: можно вызывать повторно, в том числе после добавления exit'а.
 # =============================================================================
 set -u
-. /etc/awg-cascade/config 2>/dev/null || true
+# Config читаем строгим разбором, а не source: файл принадлежит боту, и
+# source превращал бы любую его правку в выполнение кода от root.
+# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
 
 CONF=/etc/fail2ban/jail.d/awg-cascade.conf
 

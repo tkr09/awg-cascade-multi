@@ -29,7 +29,10 @@
 # туннелях само по себе стало бы сигнатурой для DPI.
 # =============================================================================
 set -u
-. /etc/awg-cascade/config 2>/dev/null || true
+# Config читаем строгим разбором, а не source: файл принадлежит боту, и
+# source превращал бы любую его правку в выполнение кода от root.
+# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
 STATE=/etc/awg-cascade/state.json
 WG_DIR=/etc/amnezia/amneziawg
 SSH_KEY=/etc/awg-cascade/ssh/id_ed25519

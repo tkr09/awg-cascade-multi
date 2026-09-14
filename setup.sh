@@ -108,7 +108,10 @@ ok "Старые amnezia-контейнеры удалены"
 header "1. Параметры установки"
 
 # Загружаем предыдущие если есть
-[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+# Прошлый config читаем разбором, а не source: он принадлежит боту.
+if [ -f "$CONFIG_FILE" ]; then
+    . "$REPO_DIR/watchdog/awg-cascade-cfg.sh" && awgc_load_config "$CONFIG_FILE" || . "$CONFIG_FILE"
+fi
 
 # Public IP (для endpoint в клиентских конфигах)
 DETECTED_IP=$(curl -fsS --max-time 5 -4 https://ifconfig.me 2>/dev/null || curl -fsS --max-time 5 -4 https://icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}')
@@ -277,16 +280,28 @@ else
     ok "Пользователь $BOT_USER уже существует"
 fi
 
-# Sudoers. Wildcard на awg-cascade-*.sh — чтобы не ловить рассинхрон имён
-# (бот зовёт exit-add-ru.sh / exit-remove.sh / peer-rotate.sh — их легко забыть
-# перечислить поимённо). Это выделенный appliance с нашим доверенным кодом бота,
-# поэтому даём широкий systemctl/ip — бот и так управляет WG/iptables/routing.
-# Команда без аргументов в sudoers = разрешён любой набор аргументов.
+# Sudoers. Список сведён к тому, что бот действительно вызывает.
+#
+# Было четыре строки с awg-quick, wg-quick, systemctl, ip, iptables и ip6tables
+# БЕЗ аргументов, то есть с любыми. Обоснование звучало как «это выделенный
+# appliance с нашим доверенным кодом» — но sudoers защищает не от нашего кода, а
+# от захвата процесса бота, и при таком наборе разница между awgbot и root
+# исчезала: `sudo systemctl link` на подсунутый юнит — уже произвольный root.
+#
+# По коду бот зовёт через sudo ровно три вещи: helper-скрипты, `awg show` и
+# SIGUSR1 watchdog'у. ip/iptables/awg-quick он не вызывает вообще — helper'ы
+# сами работают от root, им sudo не нужен. Поэтому здесь остаётся только это.
+#
+# Важно: этот блок ДОЛЖЕН совпадать с каноном в awg-cascade-sync.sh — синк
+# приводит файл к своему варианту и стирает всё лишнее.
 cat > /etc/sudoers.d/$BOT_USER <<SUDOEOF
 # AWG Cascade Multi — bot privileges
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg, /usr/bin/awg-quick, /usr/bin/wg-quick
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl
-$BOT_USER ALL=(root) NOPASSWD: /sbin/ip, /sbin/iptables, /sbin/ip6tables
+# Чтение состояния туннелей (awg show <iface> dump).
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg show *
+# Разбудить watchdog после смены pin/веса.
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl kill -s SIGUSR1 awg-cascade-watchdog
+# Helper'ы каскада. Wildcard по имени — чтобы не ловить рассинхрон при
+# добавлении нового helper'а; аргументы проверяет сам helper.
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-*.sh
 SUDOEOF
 chmod 440 /etc/sudoers.d/$BOT_USER
@@ -510,7 +525,7 @@ cat > /usr/local/sbin/awg-cascade-iptables.sh <<IPTEOF
 # AWG Cascade — apply iptables rules (idempotent)
 set -e
 
-. /etc/awg-cascade/config 2>/dev/null || true
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
 C3="\${CLIENT3_IFACE:-}"
 
 # ─── Барьер на время пересборки ──────────────────────────────────────────────
@@ -902,6 +917,7 @@ header "8b. Deploy watchdog + helper-скрипты"
 [ -d "$REPO_DIR/systemd" ]  || err "Не найдена директория $REPO_DIR/systemd"
 
 # Копируем все helper-скрипты в /usr/local/sbin (перетирая stub'ы и старые версии)
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-cfg.sh               /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog-postboot.sh /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-iprule.sh            /usr/local/sbin/

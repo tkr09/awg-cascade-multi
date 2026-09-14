@@ -27,7 +27,10 @@
 # =============================================================================
 set -u
 REPO_URL="https://github.com/tkr09/awg-cascade-multi.git"
-. /etc/awg-cascade/config 2>/dev/null || true
+# Config читаем строгим разбором, а не source: файл принадлежит боту, и
+# source превращал бы любую его правку в выполнение кода от root.
+# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
 : "${BOT_USER:=awgbot}"
 
 CHECK=0
@@ -212,13 +215,18 @@ for dst in /etc/systemd/system/awg-cascade-*.service /etc/systemd/system/awg-cas
     fi
 done
 
+# Канон ДОЛЖЕН совпадать с блоком в setup.sh: синк стирает всё, чего здесь нет.
+# Набор сведён к тому, что бот реально зовёт — см. пояснение в setup.sh.
 echo "=== sudoers (каноничный) ==="
 SUD="/etc/sudoers.d/$BOT_USER"
 cat > "$TMP/sud" <<EOF
 # AWG Cascade Multi — $BOT_USER privileges
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg, /usr/bin/awg-quick, /usr/bin/wg-quick
-$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl
-$BOT_USER ALL=(root) NOPASSWD: /sbin/ip, /sbin/iptables, /sbin/ip6tables
+# Чтение состояния туннелей (awg show <iface> dump).
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg show *
+# Разбудить watchdog после смены pin/веса.
+$BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl kill -s SIGUSR1 awg-cascade-watchdog
+# Helper'ы каскада. Wildcard по имени — чтобы не ловить рассинхрон при
+# добавлении нового helper'а; аргументы проверяет сам helper.
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-*.sh
 EOF
 if [ ! -f "$SUD" ] || ! cmp -s "$TMP/sud" "$SUD"; then

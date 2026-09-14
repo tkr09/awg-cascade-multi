@@ -4,7 +4,10 @@
 # Если что-то не так — ntfy + попытка recovery.
 
 set -u
-. /etc/awg-cascade/config
+# Config читаем строгим разбором, а не source: файл принадлежит боту, и
+# source превращал бы любую его правку в выполнение кода от root.
+# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
+. /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config || . /etc/awg-cascade/config
 
 STATE=/etc/awg-cascade/state.json
 LOG=/var/log/awg-cascade-watchdog.log

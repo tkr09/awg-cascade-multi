@@ -642,6 +642,16 @@ async def fsm_peer_name(message: Message, state: FSMContext) -> None:
     if not name:
         await message.answer("Имя пустое после очистки. Попробуй ещё раз.")
         return
+    # Длину ограничиваем ДО создания peer'а. Имя уходит в имя файла конфига и в
+    # callback_data кнопок, а у callback_data жёсткий лимит 64 байта: слишком
+    # длинное имя ломает меню уже СОЗДАННОГО клиента, то есть чинить приходится
+    # руками. 32 символа с запасом влезают в "peer:rotate:<name>".
+    if len(name) > 32:
+        await message.answer(
+            f"Имя длиннее 32 символов ({len(name)}). Оно идёт в кнопки меню, "
+            f"где лимит жёсткий. Сократи."
+        )
+        return
     if any(p["name"] == name for p in peers_list()):
         await message.answer(f"Peer с именем <b>{name}</b> уже есть.", parse_mode="HTML")
         return

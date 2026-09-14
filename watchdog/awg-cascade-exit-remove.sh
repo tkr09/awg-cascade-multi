@@ -2,7 +2,10 @@
 # Удаляет exit с RU: down интерфейс + удаляет conf + убирает из state.json.
 # Вызывается ботом через sudo. argv: $1 = interface (awg<N>).
 set -e
-. /etc/awg-cascade/config
+# Config читаем строгим разбором, а не source: файл принадлежит боту, и
+# source превращал бы любую его правку в выполнение кода от root.
+# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
+. /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config || . /etc/awg-cascade/config
 STATE=/etc/awg-cascade/state.json
 PEERS_JSON=/etc/awg-cascade/peers.json
 WG_DIR=/etc/amnezia/amneziawg
