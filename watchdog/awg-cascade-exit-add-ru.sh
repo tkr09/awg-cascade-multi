@@ -5,6 +5,7 @@
 # JSON формат:
 # {
 #   "exit_index": 2,
+#   "reserve_token": "...",   // бронь awg-cascade-exit-reserve.sh (может отсутствовать)
 #   "name": "DE-1",
 #   "ru_privkey": "...",
 #   "ru_pubkey":  "...",
@@ -20,6 +21,18 @@ ARGS="${1:-}"
 [ -z "$ARGS" ] && { echo '{"error":"empty args"}'; exit 1; }
 
 EXIT_INDEX=$(echo "$ARGS" | jq -r .exit_index)
+RESERVE_TOKEN=$(echo "$ARGS" | jq -r '.reserve_token // empty')
+
+# Индекс должен быть в том же диапазоне, что выдаёт awg-cascade-exit-reserve.sh.
+# 100+index — это и номер таблицы маршрутизации, и октет shared-подсети: при
+# index 153-155 таблица совпала бы с системными default/main/local, а при
+# index > 155 октет вышел бы за байт. Проверяем ДО того, как что-то создавать.
+case "$EXIT_INDEX" in
+    ''|*[!0-9]*) echo '{"error":"exit_index не число"}'; exit 1 ;;
+esac
+if [ "$EXIT_INDEX" -lt 1 ] || [ "$EXIT_INDEX" -gt 99 ]; then
+    echo "{\"error\":\"exit_index $EXIT_INDEX вне диапазона 1..99\"}"; exit 1
+fi
 NAME=$(echo "$ARGS" | jq -r .name)
 RU_PRIVKEY=$(echo "$ARGS" | jq -r .ru_privkey)
 RU_PUBKEY=$(echo "$ARGS" | jq -r .ru_pubkey)
@@ -111,6 +124,25 @@ systemctl enable "awg-quick@${IFACE}" >/dev/null 2>&1 || true
 FLOCK=/etc/awg-cascade/state.lock
 (
     flock -x 200
+
+    # Повторная проверка ПОД блокировкой, непосредственно перед записью.
+    # Индекс выбирается задолго до этого момента (provisioning свежего сервера —
+    # до десяти минут), поэтому к моменту записи его мог занять кто-то ещё.
+    if jq -e --argjson i "$EXIT_INDEX" 'any((.exits // [])[]; .index == $i)' \
+            "$STATE" >/dev/null 2>&1; then
+        echo "{\"error\":\"exit_index $EXIT_INDEX уже занят — добавление отменено\"}" >&2
+        exit 1
+    fi
+    # Бронь: если она выдавалась, она должна быть нашей и на этот индекс.
+    if [ -n "$RESERVE_TOKEN" ]; then
+        if ! jq -e --arg t "$RESERVE_TOKEN" --argjson i "$EXIT_INDEX" \
+                'any((.exit_reservations // [])[]; .token == $t and .index == $i)' \
+                "$STATE" >/dev/null 2>&1; then
+            echo "{\"error\":\"бронь на индекс $EXIT_INDEX не найдена (протухла?)\"}" >&2
+            exit 1
+        fi
+    fi
+
     TMP=$(mktemp)
     EXIT_OBJ=$(jq -n \
         --arg name        "$NAME" \
@@ -131,11 +163,21 @@ FLOCK=/etc/awg-cascade/state.lock
             weight: 10, warp_state: $warp, note: "",
             added_at: now|todate
         }')
-    jq --argjson e "$EXIT_OBJ" '.exits += [$e] | .last_update = (now|todate)' "$STATE" > "$TMP"
+    # Добавление exit'а и снятие брони — одной записью: иначе между ними есть
+    # момент, когда индекс не занят ни тем, ни другим.
+    jq --argjson e "$EXIT_OBJ" --arg t "$RESERVE_TOKEN" \
+       '.exits += [$e]
+        | .exit_reservations = [ (.exit_reservations // [])[] | select(.token != $t) ]
+        | .last_update = (now|todate)' "$STATE" > "$TMP"
     mv "$TMP" "$STATE"
     chown "$BOT_USER:$BOT_USER" "$STATE"
     chmod 644 "$STATE"
 ) 200>"$FLOCK"
+
+# Список доверенных адресов fail2ban на RU строится из state.json и потому
+# является снимком на момент запуска: добавили/удалили exit — он протух.
+# Пересобираем здесь же, чтобы бан нового exit-адреса не отнял управление им.
+/usr/local/sbin/awg-cascade-fail2ban.sh >/dev/null 2>&1 || true
 
 # Сохраняем SSH-доступ — копируем bot pubkey на exit (для будущих операций)
 # (бот уже имеет ssh-доступ к exit на этом этапе — наш ключ положен setup-exit.sh'ом

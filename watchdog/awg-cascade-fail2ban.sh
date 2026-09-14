@@ -39,6 +39,32 @@ add_ip() {
 
 IGNORE="127.0.0.1/8 ::1"
 
+# Адреса, которые нельзя вывести из живого состояния. Два источника:
+#
+#   EXTRA_IGNOREIP — передаётся вызывающим. Главный случай: setup-exit.sh знает
+#   RU_PUBLIC_IP нового RU, но на момент его запуска туннель ещё не поднят с той
+#   стороны, peer создан без Endpoint — и прочитать этот адрес из awg show
+#   физически неоткуда. Без явной передачи новый RU в ignoreip не попадал вообще.
+#
+#   Файл $EXTRA_FILE — то же самое, но сохранённое. Скрипт идемпотентный и
+#   запускается повторно (после добавления exit'а, из sync, руками), поэтому
+#   переданное однажды должно пережить запуск без аргументов. Сюда же оператор
+#   дописывает свои адреса — их мы не теряем.
+EXTRA_FILE=/etc/awg-cascade/fail2ban-extra
+mkdir -p "$(dirname "$EXTRA_FILE")" 2>/dev/null || true
+
+if [ -n "${EXTRA_IGNOREIP:-}" ]; then
+    for _a in $EXTRA_IGNOREIP; do
+        grep -qxF "$_a" "$EXTRA_FILE" 2>/dev/null || echo "$_a" >> "$EXTRA_FILE"
+    done
+fi
+if [ -f "$EXTRA_FILE" ]; then
+    while IFS= read -r _a; do
+        case "$_a" in ''|'#'*) continue ;; esac
+        add_ip "$_a"
+    done < "$EXTRA_FILE"
+fi
+
 # Собственные ПУБЛИЧНЫЕ адреса ноды. Внутренние адреса туннелей отбрасываем:
 # в ignoreip они бесполезны (по ним никто не ломится в SSH) и только зашумляют
 # список, из-за чего в нём труднее заметить лишнее.
@@ -105,5 +131,21 @@ else
 fi
 
 sleep 2
+
+# Результат проверяем, а не декларируем.
+#
+# Раньше ошибки start/reload гасились в /dev/null, а последней командой скрипта
+# был pipeline с grep — он возвращает 0 даже когда jail не поднялся, и вызывающая
+# сторона печатала «fail2ban настроен» при неработающем fail2ban. Это ровно тот
+# случай, когда молчание в логе неотличимо от защиты.
+RC=0
+if ! systemctl is-active --quiet fail2ban; then
+    echo "🔴 fail2ban не запущен (systemctl status fail2ban)" >&2
+    RC=1
+elif ! fail2ban-client status sshd >/dev/null 2>&1; then
+    echo "🔴 fail2ban работает, но jail sshd не поднялся" >&2
+    RC=1
+fi
 echo "fail2ban: $(systemctl is-active fail2ban), в исключениях $(echo $IGNORE | wc -w) адресов"
-fail2ban-client status sshd 2>/dev/null | grep -E "Currently banned|Total banned" | tr -s ' '
+fail2ban-client status sshd 2>/dev/null | grep -E "Currently banned|Total banned" | tr -s ' ' || true
+exit $RC

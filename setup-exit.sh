@@ -520,6 +520,12 @@ cat "$STATE_FILE"
 # он собирает адреса RU из endpoint-ов пиров, чтобы никогда их не забанить,
 # иначе бот потерял бы управление этим exit-ом.
 if [ -x /usr/local/sbin/awg-cascade-fail2ban.sh ]; then
-    /usr/local/sbin/awg-cascade-fail2ban.sh >/dev/null 2>&1 \
-        && ok "fail2ban настроен" || warn "fail2ban не настроен"
+    # RU_PUBLIC_IP передаём ЯВНО. Скрипт собирает доверенные адреса из живых
+    # endpoint-ов awg-in*, но сейчас туннель с той стороны ещё не поднят и peer
+    # создан без Endpoint — прочитать адрес нового RU неоткуда. Без этого он в
+    # ignoreip не попадал, и правило «бот никогда не банит свой RU» держалось на
+    # том, что RU успеет подключиться раньше, чем наберёт 5 неудачных входов.
+    EXTRA_IGNOREIP="$RU_PUBLIC_IP" /usr/local/sbin/awg-cascade-fail2ban.sh >/dev/null 2>&1 \
+        && ok "fail2ban настроен (RU $RU_PUBLIC_IP в исключениях)" \
+        || warn "fail2ban не настроен — проверь: awg-cascade-fail2ban.sh"
 fi

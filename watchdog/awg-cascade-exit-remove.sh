@@ -68,3 +68,8 @@ rm -f "$UNPIN_F"
 systemctl kill -s SIGUSR1 awg-cascade-watchdog 2>/dev/null || true
 
 echo "{\"ok\":true,\"interface\":\"$IFACE\",\"unpinned\":${UNPINNED:-0}}"
+
+# Список доверенных адресов fail2ban на RU строится из state.json и потому
+# является снимком на момент запуска: добавили/удалили exit — он протух.
+# Пересобираем здесь же, чтобы бан нового exit-адреса не отнял управление им.
+/usr/local/sbin/awg-cascade-fail2ban.sh >/dev/null 2>&1 || true

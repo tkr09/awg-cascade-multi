@@ -4,6 +4,7 @@ Exits — список, статус, добавление, удаление, WA
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -842,10 +843,41 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
             await update_status(f"❌ Не удалось залогиниться:\n<pre>{err[:300]}</pre>")
             return
 
-    # 2. Определяем EXIT_INDEX (следующий свободный)
-    st = state_load()
-    used = {e["index"] for e in st.get("exits", [])}
-    EXIT_INDEX = next(i for i in range(1, 256) if i not in used)
+    # 2. Резервируем EXIT_INDEX атомарно, а не «берём свободный из снимка».
+    #
+    # Снимок state.json читался здесь, а использовался после provisioning —
+    # то есть через десять минут. Резервирования не было, FSM очищается сразу,
+    # поэтому два добавления, запущенные кнопками подряд, получали ОДИН индекс:
+    # второе переписывало ключи и конфиг первого и опускало уже поднятый туннель.
+    # Теперь индекс выдаётся под общей блокировкой вместе с токеном брони,
+    # который exit-add-ru.sh проверит перед тем, как что-то менять на RU.
+    r_out, r_err, r_rc = await sudo_run(
+        "/usr/local/sbin/awg-cascade-exit-reserve.sh", "acquire",
+        f"bot:{name}", timeout=20,
+    )
+    if r_rc != 0 or not r_out.strip():
+        await update_status(
+            "❌ Не удалось зарезервировать индекс exit'а:\n"
+            f"<pre>{html_escape((r_err or r_out)[:300])}</pre>"
+        )
+        return
+    try:
+        _idx_s, RESERVE_TOKEN = r_out.strip().split()
+        EXIT_INDEX = int(_idx_s)
+    except ValueError:
+        await update_status(f"❌ Непонятный ответ брони: <pre>{html_escape(r_out[:200])}</pre>")
+        return
+
+    async def release_reserve() -> None:
+        """Отпустить бронь на любом пути неуспеха.
+
+        Без этого оборванное добавление держит индекс до истечения TTL (45 мин),
+        и повторная попытка получает СЛЕДУЮЩИЙ индекс — в state постепенно
+        появляются дыры, а awgN перестаёт соответствовать порядку добавления.
+        """
+        with contextlib.suppress(Exception):
+            await sudo_run("/usr/local/sbin/awg-cascade-exit-reserve.sh",
+                           "release", RESERVE_TOKEN, timeout=15)
 
     # 3. Генерим RU-side ключи для awg<EXIT_INDEX>
     proc = await asyncio.create_subprocess_exec(
@@ -888,9 +920,11 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
     ssh_harden_path = Path("/opt/awg-cascade-bot/scripts/awg-cascade-ssh-harden.sh")
     if not setup_path.exists():
         await update_status(f"❌ Не найден {setup_path}. Бот не может запровижить exit.")
+        await release_reserve()
         return
     if not awg2_params_path.exists():
         await update_status(f"❌ Не найден {awg2_params_path}. v2.0 generator отсутствует.")
+        await release_reserve()
         return
 
     # Копируем через scp через SSH (asyncssh умеет copy)
@@ -935,6 +969,7 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
                     f"❌ setup-exit.sh exit_code={rc}:\n<pre>"
                     f"{html_escape((stderr_text or stdout_text)[-500:])}</pre>"
                 )
+                await release_reserve()
                 return
 
             # 5. Парсим JSON из stdout setup-exit.sh. Все логи скрипт шлёт в
@@ -948,6 +983,7 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
                     f"❌ Не нашёл JSON в выводе setup-exit.sh:\n"
                     f"<pre>{html_escape(stdout_text[-400:])}</pre>"
                 )
+                await release_reserve()
                 return
             try:
                 exit_info = json.loads(m.group(0))
@@ -955,9 +991,11 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
                 await update_status(
                     f"❌ info JSON невалиден: {e}\n<pre>{html_escape(m.group(0)[:400])}</pre>"
                 )
+                await release_reserve()
                 return
     except Exception as e:
         await update_status(f"❌ Ошибка SSH/scp: {html_escape(str(e))}")
+        await release_reserve()
         return
 
     await update_status(
@@ -971,6 +1009,7 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
     # 6. Создаём awg<N>.conf на RU и поднимаем (через helper-скрипт)
     helper_args = json.dumps({
         "exit_index": EXIT_INDEX,
+        "reserve_token": RESERVE_TOKEN,
         "name": name,
         "ru_privkey": ru_privkey,
         "ru_pubkey": ru_pubkey,
@@ -981,6 +1020,7 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
         "/usr/local/sbin/awg-cascade-exit-add-ru.sh", helper_args, timeout=30,
     )
     if rc != 0:
+        await release_reserve()
         await update_status(f"❌ RU-side setup failed:\n<pre>{(err or out)[:400]}</pre>")
         return
 
