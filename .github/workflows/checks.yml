@@ -1,0 +1,100 @@
+# Минимальные проверки репозитория.
+#
+# Заведены по итогам стороннего аудита: в проекте не было ни одной автоматической
+# проверки, а `bash -n` и ShellCheck в Windows-среде аудитора не запускались
+# вовсе (Git Bash падал на создании signal pipe). Здесь Linux, поэтому и то и
+# другое работает.
+#
+# Это НЕ замена интеграционным тестам на сетевых namespace — те по-прежнему
+# нужны для kill-switch, pin и пересборки firewall. Но синтаксическая ошибка в
+# helper'е больше не доедет до ноды.
+name: checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n на всех скриптах
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "::error file=$f::синтаксическая ошибка"; fail=1; }
+          done < <(git ls-files '*.sh')
+          exit $fail
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1091 — source файлов, которых нет в репо (/etc/awg-cascade/config).
+          # SC2086 — намеренный word splitting в списках nexthop'ов ECMP и SSH_OPTS.
+          #
+          # Блокирует сборку только уровень error. На warning прогон
+          # информационный: гейт, красный с первого дня из-за накопленных
+          # замечаний, читать перестают через неделю. Разбирать их надо, но
+          # отдельной задачей, а не ценой неработающего CI.
+          git ls-files '*.sh' | xargs shellcheck -S error -e SC1091,SC2086
+          echo "--- warning-уровень (не блокирует) ---"
+          git ls-files '*.sh' | xargs shellcheck -S warning -e SC1091,SC2086 || true
+
+      - name: генерация inline-скриптов из setup.sh разбирается
+        run: |
+          # awg-cascade-iptables.sh собирается heredoc'ом внутри setup.sh и
+          # поэтому не покрыт проверкой файлов. Разворачиваем и проверяем.
+          tmp=$(mktemp -d)
+          sed -n '/^cat > \/usr\/local\/sbin\/awg-cascade-iptables.sh <<IPTEOF$/,/^IPTEOF$/p' setup.sh \
+            | sed "1s|.*|cat > $tmp/gen.sh <<IPTEOF|" > "$tmp/emit.sh"
+          CLIENT_NET=10.0.0.0/24 bash "$tmp/emit.sh"
+          bash -n "$tmp/gen.sh"
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: компиляция файлов бота
+        run: python -m compileall -q bot
+
+      - name: встроенные в shell python-блоки компилируются
+        run: |
+          python - <<'PY'
+          import re, pathlib, sys
+          bad = 0
+          for f in pathlib.Path(".").rglob("*.sh"):
+              s = f.read_text(encoding="utf-8", errors="replace")
+              for m in re.finditer(r"<<'PYEOF'\n(.*?)\nPYEOF", s, re.S):
+                  try:
+                      compile(m.group(1), str(f), "exec")
+                  except SyntaxError as e:
+                      print(f"::error file={f}::встроенный python: {e}"); bad = 1
+          sys.exit(bad)
+          PY
+
+      - name: у всех хендлеров бота есть admin_only
+        run: |
+          python - <<'PY'
+          import ast, glob, sys
+          bad = []
+          for f in glob.glob("bot/handlers/*.py"):
+              t = ast.parse(open(f, encoding="utf-8").read(), f)
+              for n in ast.walk(t):
+                  if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                      continue
+                  names = [d.func.attr if isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+                           else getattr(d, "id", getattr(getattr(d, "func", None), "attr", ""))
+                           for d in n.decorator_list]
+                  routed = any(x in ("callback_query", "message") for x in names)
+                  if routed and "admin_only" not in names:
+                      bad.append(f"{f}:{n.lineno} {n.name}")
+          for b in bad:
+              print(f"::error::хендлер без admin_only: {b}")
+          sys.exit(1 if bad else 0)
+          PY
