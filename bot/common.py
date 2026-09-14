@@ -397,23 +397,34 @@ async def ssh_copy_id(host: str, password: str, pubkey: str, *, port: int = 22) 
 
 # ─── Local helpers (для команд на самом RU) ──────────────────────────────────
 
-async def local_run(*args: str, timeout: float = 30) -> tuple[str, str, int]:
-    """Запуск локальной команды. Бот работает под awgbot, sudo для нужных команд."""
+async def local_run(*args: str, timeout: float = 30,
+                    stdin_data: str | None = None) -> tuple[str, str, int]:
+    """
+    Запуск локальной команды. Бот работает под awgbot, sudo для нужных команд.
+
+    stdin_data — для секретов. Аргументы процесса видны в /proc/<pid>/cmdline и
+    попадают в process accounting и диагностику; права 0600 на итоговом файле
+    от этого не защищают. Всё, что содержит приватный ключ или PSK, надо
+    передавать сюда, а не в argv.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        payload = stdin_data.encode() if stdin_data is not None else None
+        out, err = await asyncio.wait_for(proc.communicate(payload), timeout=timeout)
         return out.decode(errors="replace"), err.decode(errors="replace"), proc.returncode or 0
     except asyncio.TimeoutError:
         proc.kill()
         return "", f"Timeout after {timeout}s", -1
 
 
-async def sudo_run(*args: str, timeout: float = 30) -> tuple[str, str, int]:
-    return await local_run("sudo", *args, timeout=timeout)
+async def sudo_run(*args: str, timeout: float = 30,
+                   stdin_data: str | None = None) -> tuple[str, str, int]:
+    return await local_run("sudo", *args, timeout=timeout, stdin_data=stdin_data)
 
 
 # ─── Geo IP ──────────────────────────────────────────────────────────────────

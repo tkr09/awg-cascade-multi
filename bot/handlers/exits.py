@@ -1016,8 +1016,10 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
         "ru_psk": ru_psk,
         "exit_info": exit_info,
     })
+    # helper_args содержит ru_privkey и ru_psk — передаём через stdin, не argv.
     out, err, rc = await sudo_run(
-        "/usr/local/sbin/awg-cascade-exit-add-ru.sh", helper_args, timeout=30,
+        "/usr/local/sbin/awg-cascade-exit-add-ru.sh", "-",
+        timeout=30, stdin_data=helper_args,
     )
     if rc != 0:
         await release_reserve()

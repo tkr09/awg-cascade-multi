@@ -145,18 +145,22 @@ SHARED=$(echo "$EXIT_JSON" | jq -r '.shared_mode // 0')
 ok "Exit provisioned: iface=$EXIT_IFACE port=$EXIT_PORT shared=$SHARED"
 
 # 7. Собираем args для awg-cascade-exit-add-ru.sh и создаём awg<N> на RU
-ADD_ARGS=$(jq -n \
+# Приватный ключ и PSK берём через $ENV, а не через --arg: аргументы jq
+# попадают в /proc/<pid>/cmdline, который читается любым локальным
+# пользователем. Переменные окружения процесса — только владельцем и root.
+ADD_ARGS=$(RU_PRIVKEY="$RU_PRIVKEY" RU_PSK="$RU_PSK" jq -n \
     --argjson idx "$NEXT_IDX" \
     --arg name    "$EXIT_NAME" \
-    --arg priv    "$RU_PRIVKEY" \
     --arg pub     "$RU_PUBKEY" \
-    --arg psk     "$RU_PSK" \
     --argjson info "$EXIT_JSON" \
     --arg tok     "$RESERVE_TOKEN" \
-    '{exit_index: $idx, reserve_token: $tok, name: $name, ru_privkey: $priv, ru_pubkey: $pub, ru_psk: $psk, exit_info: $info}')
+    '{exit_index: $idx, reserve_token: $tok, name: $name,
+      ru_privkey: $ENV.RU_PRIVKEY, ru_pubkey: $pub, ru_psk: $ENV.RU_PSK,
+      exit_info: $info}')
 
 info "Создаю awg${NEXT_IDX} на RU + добавляю в state.json..."
-RESULT=$(/usr/local/sbin/awg-cascade-exit-add-ru.sh "$ADD_ARGS") || err "awg-cascade-exit-add-ru.sh упал"
+# ADD_ARGS содержит приватный ключ и PSK — через stdin, не через argv.
+RESULT=$(printf '%s' "$ADD_ARGS" | /usr/local/sbin/awg-cascade-exit-add-ru.sh -)     || err "awg-cascade-exit-add-ru.sh упал"
 echo "$RESULT" | jq -e '.ok == true' >/dev/null 2>&1 || err "exit-add-ru вернул ошибку: $RESULT"
 ok "awg${NEXT_IDX} ($EXIT_NAME) поднят и добавлен в каскад"
 # Бронь уже снята внутри exit-add-ru.sh той же записью, что добавила exit.

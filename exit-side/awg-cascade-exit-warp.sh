@@ -18,6 +18,8 @@
 #   status    — JSON статус для iface
 #   rekey     — пересоздать WARP-аккаунт (новый exit IP) — влияет на все iface
 #   uninstall — убрать routing для iface; полный снос если iface не осталось
+#   restore   — восстановить WARP после загрузки по сохранённому состоянию
+#               (вызывается юнитом awg-cascade-warp-restore.service)
 #
 # iface по умолчанию = awg-in (обратная совместимость со старым ботом).
 # Stdout всегда JSON.
@@ -143,6 +145,7 @@ EOF
 
     jq -n --arg t "$(date -Iseconds)" \
         '{installed:true, running:false, installed_at:$t}' > $WARP_STATE
+    install_restore_unit
     log "INSTALL OK"
     jq -n '{ok:true, installed:true}'
 }
@@ -168,6 +171,10 @@ cmd_on() {
     # ip rule: fwmark → table 200 (per-iface priority)
     ip rule del fwmark $MARK lookup $TABLE 2>/dev/null || true
     ip rule add fwmark $MARK lookup $TABLE priority $RULE_PRIO
+
+    # Юнит восстановления ставим и здесь: exit мог быть заведён до его появления,
+    # и тогда включение WARP снова не пережило бы перезагрузку.
+    install_restore_unit
 
     sleep 2
     local exit_ip
@@ -249,6 +256,11 @@ cmd_uninstall() {
         iptables -t mangle -D FORWARD -o warp0 -p tcp --tcp-flags SYN,RST SYN \
                  -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
         rm -f $WARP_CONF $WARP_DIR/wgcf-account.toml $WARP_DIR/wgcf-profile.conf
+        # Восстанавливать больше нечего — юнит убираем вместе с остальным,
+        # иначе он останется падать на каждой загрузке.
+        systemctl disable --now awg-cascade-warp-restore.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/awg-cascade-warp-restore.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
         log "UNINSTALL — полный снос (последний iface)"
     else
         log "UNINSTALL — убран только $IFACE (ещё $remain используют warp0)"
@@ -257,10 +269,78 @@ cmd_uninstall() {
     jq -n '{ok:true}'
 }
 
+# ─── restore (загрузка) ───────────────────────────────────────────────────────
+#
+# ЗАЧЕМ. cmd_on создаёт только runtime-состояние: поднимает warp0, кладёт
+# default в table 200 и ставит ip rule по fwmark. Сохранялись же лишь iptables и
+# JSON-файл состояния, а ip rule и маршрут после перезагрузки исчезали. WARP при
+# этом «оставался включённым» по всем показаниям — файл состояния говорит
+# running:true, бот на RU показывает warp on — а трафик выходил с обычного IP
+# exit'а. Расхождение желаемого и фактического, которое ничем не обнаруживалось.
+#
+# Восстанавливаем ЖЕЛАЕМОЕ состояние: для каждого интерфейса, у которого в
+# state-файле running:true, повторяем ту же операцию on.
+cmd_restore() {
+    local f iface n=0 failed=0 waited
+    for f in "$WARP_DIR"/warp-*.state; do
+        [ -e "$f" ] || continue
+        jq -e '.running == true' "$f" >/dev/null 2>&1 || continue
+        iface=$(basename "$f"); iface=${iface#warp-}; iface=${iface%.state}
+
+        # Интерфейс поднимает awg-quick@, и на загрузке мы можем прийти раньше.
+        # Ждём ограниченно, а не пропускаем молча: тихий пропуск здесь неотличим
+        # от того самого дефекта, который мы чиним.
+        waited=0
+        while ! ip link show "$iface" >/dev/null 2>&1 && [ "$waited" -lt 60 ]; do
+            sleep 2; waited=$(( waited + 2 ))
+        done
+        if ! ip link show "$iface" >/dev/null 2>&1; then
+            log "RESTORE: $iface не появился за ${waited}s — WARP для него НЕ восстановлен"
+            failed=$(( failed + 1 ))
+            continue
+        fi
+
+        if "$0" on "$iface" >/dev/null 2>&1; then
+            n=$(( n + 1 )); log "RESTORE: $iface восстановлен"
+        else
+            failed=$(( failed + 1 )); log "RESTORE: $iface НЕ восстановлен (on вернул ошибку)"
+        fi
+    done
+    log "RESTORE: восстановлено $n, не удалось $failed"
+    jq -n --argjson n "$n" --argjson f "$failed" '{ok: ($f == 0), restored: $n, failed: $f}'
+    [ "$failed" -eq 0 ]
+}
+
+# Юнит генерируем здесь, а не кладём файлом в systemd/ репозитория: тот каталог
+# целиком разворачивается на RU, где этого скрипта нет и юнит только падал бы.
+install_restore_unit() {
+    cat > /etc/systemd/system/awg-cascade-warp-restore.service <<UNIT
+[Unit]
+Description=AWG Cascade Exit — восстановление WARP после загрузки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/awg-cascade-exit-warp.sh restore
+# Интерфейсы поднимает awg-quick@, скрипт ждёт их появления сам (до 60с на
+# интерфейс), поэтому таймаут юнита должен быть заведомо больше.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable awg-cascade-warp-restore.service >/dev/null 2>&1 || true
+    log "restore-юнит установлен и включён"
+}
+
 # ─── dispatch ────────────────────────────────────────────────────────────────
 
 case "${1:-status}" in
     install)   cmd_install ;;
+    restore)   cmd_restore ;;
     on)        cmd_on ;;
     off)       cmd_off ;;
     status)    cmd_status ;;

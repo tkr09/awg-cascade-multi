@@ -172,5 +172,5 @@ jq -n \
     --arg ip      "$PEER_IP" \
     --arg pubkey  "$PUBKEY" \
     --arg iface   "$IFACE" \
-    --arg conf    "$(cat "$CLIENT_CONF")" \
+    --rawfile conf "$CLIENT_CONF" \
     '{ok: true, name: $name, ip: $ip, pubkey: $pubkey, iface: $iface, client_conf: $conf}'

@@ -17,7 +17,17 @@ set -e
 STATE=/etc/awg-cascade/state.json
 WG_DIR=/etc/amnezia/amneziawg
 
-ARGS="${1:-}"
+# JSON принимаем со stdin при argv "-".
+#
+# В нём лежат ru_privkey и ru_psk. Аргументы процесса читаются из
+# /proc/<pid>/cmdline и попадают в process accounting; права 0600 на конечном
+# файле к argv отношения не имеют. Форма с argv оставлена для совместимости —
+# на неё могут звать старые вызовы, — но бот и bootstrap используют stdin.
+if [ "${1:-}" = "-" ]; then
+    ARGS=$(cat)
+else
+    ARGS="${1:-}"
+fi
 [ -z "$ARGS" ] && { echo '{"error":"empty args"}'; exit 1; }
 
 EXIT_INDEX=$(echo "$ARGS" | jq -r .exit_index)

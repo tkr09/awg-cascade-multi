@@ -97,9 +97,17 @@ fi
     # 3. Пересобираем конфиг интерфейса — удаляем старый [Peer] блок, добавляем новый
     NEW_WG_TMP=$(mktemp)
     # Используем python для корректного парсинга — bash sed на блоках хрупкий
-    python3 - "$WG_CONF" "$OLD_PUBKEY" "$NEW_PUBKEY" "$NEW_PSK" "$PEER_IP" "$NAME" "$NEW_WG_TMP" <<'PYEOF'
-import re, sys
-path, old_pub, new_pub, new_psk, peer_ip, name, out_path = sys.argv[1:]
+    # PSK передаём переменной окружения, а не аргументом.
+    #
+    # /proc/<pid>/cmdline читается любым локальным пользователем, поэтому PSK в
+    # argv виден в обычном `ps` и попадает в process accounting. /proc/<pid>/environ
+    # доступен только владельцу процесса и root — это не идеальная изоляция
+    # (stdin занят самим текстом скрипта), но принципиально другой уровень
+    # доступности.
+    AWGC_NEW_PSK="$NEW_PSK"     python3 - "$WG_CONF" "$OLD_PUBKEY" "$NEW_PUBKEY" "$PEER_IP" "$NAME" "$NEW_WG_TMP" <<'PYEOF'
+import os, re, sys
+path, old_pub, new_pub, peer_ip, name, out_path = sys.argv[1:]
+new_psk = os.environ["AWGC_NEW_PSK"]
 text = open(path).read()
 # Разбиваем по [Peer]
 blocks = re.split(r'(?=^\[Peer\])', text, flags=re.MULTILINE)
@@ -155,6 +163,6 @@ EOF
     chmod 644 "$PEERS_JSON"
 
     # Output
-    jq -n --arg n "$NAME" --arg ip "$PEER_IP" --arg conf "$(cat "$CLIENT_CONF")" \
+    jq -n --arg n "$NAME" --arg ip "$PEER_IP" --rawfile conf "$CLIENT_CONF" \
         '{ok:true, name:$n, ip:$ip, conf:$conf}'
 )
