@@ -214,14 +214,48 @@ else
         # интерактивен и спрашивает, какие сервисы перезапустить. В
         # провижининге по SSH без терминала этот вопрос означает зависание до
         # таймаута. Здесь нода ещё пустая, перезапускать безопасно.
-        NEEDRESTART_MODE=a apt-get -y -qq \
-            -o Dpkg::Options::=--force-confdef \
-            -o Dpkg::Options::=--force-confold \
-            upgrade >/dev/null \
-            && ok "Пакеты обновлены ($_pending)" \
-            || warn "apt upgrade завершился с ошибкой — проверь: apt-get upgrade"
+        if NEEDRESTART_MODE=a apt-get -y -qq \
+                -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold \
+                upgrade >/dev/null; then
+            ok "Пакеты обновлены ($_pending)"
+        else
+            # Ненулевой код здесь ЧАЩЕ ВСЕГО не означает сломанный apt.
+            # Постинсталл-скрипты пытаются ЗАПУСТИТЬ сервисы, и часть из них
+            # на виртуалке не стартует в принципе: fwupd — демон обновления
+            # прошивок, а прошивок у VPS нет. Пакет при этом распакован и
+            # настроен. Валить из-за этого установку нельзя, но и молча
+            # считать успехом тоже.
+            warn "apt upgrade вернул ошибку — до-настраиваю пакеты"
+            dpkg --configure -a 2>&1 | tail -5 | sed 's/^/    /' || true
+            if apt-get -s -q -y check >/dev/null 2>&1; then
+                ok "Пакеты настроены; ошибка была в запуске сервиса, не в установке"
+            else
+                err "apt остался в нерабочем состоянии. Почини вручную и повтори:
+     apt-get -f install; dpkg --configure -a"
+            fi
+        fi
     else
         ok "Пакеты образа уже актуальны"
+    fi
+fi
+
+
+# ─── fwupd на виртуалке ──────────────────────────────────────────────────────
+#
+# fwupd — демон обновления ПРОШИВОК. У виртуальной машины прошивок нет, и он
+# падает при каждом запуске: сначала в постинсталле apt (это видно как
+# «Job for fwupd.service failed»), потом висит в systemctl --failed навсегда.
+# Это не наша поломка, но она создаёт ровно тот шум, из-за которого перестают
+# читать список упавших юнитов — а там могут оказаться наши.
+#
+# Маскируем ТОЛЬКО на виртуалке и только сам fwupd: на железе он осмыслен.
+if systemd-detect-virt --quiet 2>/dev/null; then
+    if systemctl list-unit-files fwupd.service >/dev/null 2>&1; then
+        systemctl stop fwupd.service >/dev/null 2>&1 || true
+        systemctl mask fwupd.service fwupd-refresh.service >/dev/null 2>&1 || true
+        systemctl reset-failed fwupd.service >/dev/null 2>&1 || true
+        ok "fwupd замаскирован (виртуалка: $(systemd-detect-virt 2>/dev/null), прошивок нет)"
     fi
 fi
 
