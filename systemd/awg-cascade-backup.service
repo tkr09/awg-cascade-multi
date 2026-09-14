@@ -2,6 +2,11 @@
 Description=AWG Cascade Multi — бэкап состояния
 Documentation=https://github.com/tkr09/awg-cascade-multi
 # После сети не требуется: бэкап локальный и никуда не ходит.
+#
+# OnFailure был только у bot и watchdog. Провал бэкапа — ровно тот отказ, о
+# котором узнаёшь позже всех: ошибок никто не читает, архив просто не появляется,
+# а обнаруживается это в момент восстановления.
+OnFailure=awg-cascade-alert@%n.service
 
 [Service]
 Type=oneshot

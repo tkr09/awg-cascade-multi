@@ -21,6 +21,27 @@ FLOCK=/etc/awg-cascade/state.lock
 NAME="${1:-}"
 [ -z "$NAME" ] && { echo '{"ok":false,"error":"empty name"}'; exit 1; }
 
+# Новые ключи peer'а генерим ДО lock: это чистая энтропия, ни от чего не зависит
+# и держать под блокировкой её незачем.
+NEW_PRIVKEY=$(awg genkey)
+NEW_PUBKEY=$(echo "$NEW_PRIVKEY" | awg pubkey)
+NEW_PSK=$(awg genpsk)
+
+# ─── Всё остальное — под общим lock ─────────────────────────────────────────
+# Состояние peer'а читается ВНУТРИ блокировки, непосредственно перед изменением.
+#
+# Раньше OLD_PUBKEY, IP и интерфейс читались снаружи. Две ротации одного клиента
+# успевали прочитать один и тот же OLD, потом по очереди войти в lock: первая
+# меняла OLD на NEW_A, вторая снова удаляла уже отсутствующий OLD, не трогала
+# NEW_A и добавляла NEW_B. В конфиге оставались ДВА [Peer] с одним AllowedIPs.
+# Пересечение с удалением давало ещё хуже: ротация возвращала в runtime и в
+# конфиг клиента, которого в peers.json уже нет.
+#
+# Блокировка берётся на весь остаток скрипта (fd 200 живёт до выхода), поэтому
+# отдельный субшелл с flock ниже больше не нужен.
+exec 200>"$FLOCK"
+flock -x 200
+
 # Текущий peer
 PEER=$(jq --arg n "$NAME" '.[] | select(.name==$n)' "$PEERS_JSON")
 [ -z "$PEER" ] && { echo "{\"ok\":false,\"error\":\"peer $NAME not found\"}"; exit 1; }
@@ -35,11 +56,6 @@ if [ "$IFACE" = "awg0" ]; then
 else
     PORT="${CLIENT3_PORT:-$AWG0_PORT}"
 fi
-
-# Новые ключи peer'а
-NEW_PRIVKEY=$(awg genkey)
-NEW_PUBKEY=$(echo "$NEW_PRIVKEY" | awg pubkey)
-NEW_PSK=$(awg genpsk)
 
 # Server-side params (берём из существующего конфига интерфейса — не меняем)
 SERVER_PUB=$(awg show "$IFACE" public-key)
@@ -68,8 +84,6 @@ $_k = $_v"
 fi
 
 (
-    flock -x 200
-
     # 1. Удаляем старого peer'а из runtime
     awg set "$IFACE" peer "$OLD_PUBKEY" remove
 
@@ -143,5 +157,4 @@ EOF
     # Output
     jq -n --arg n "$NAME" --arg ip "$PEER_IP" --arg conf "$(cat "$CLIENT_CONF")" \
         '{ok:true, name:$n, ip:$ip, conf:$conf}'
-
-) 200>"$FLOCK"
+)

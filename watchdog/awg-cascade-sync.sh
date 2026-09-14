@@ -53,15 +53,48 @@ COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
 echo "→ Версия в репо: $VER ($COMMIT)"
 
 drift=0
+# Счётчик НЕуспешных действий. Отдельно от drift: drift — это «сколько нашли
+# отличий», errors — «сколько не смогли устранить». Раньше их не различали, и
+# провал install, restart или enable не мешал записать version-stamp и напечатать
+# «Синхронизировано». На ноде оставалась смесь версий, помеченная как целевой
+# релиз, и мониторинг по stamp этого не видел — то есть ровно то, ради чего stamp
+# и заводился, переставало работать именно в тот момент, когда нужно.
+errors=0
+fail() { errors=$(( errors + 1 )); echo "  🔴 $1" >&2; }
+
 sync_file() {  # <src> <dst> <mode> [доп. аргументы install, например -o awgbot -g awgbot]
     local src="$1" dst="$2" mode="$3"; shift 3
     [ -f "$src" ] || return 0
-    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then return 0; fi
+
+    # Сравниваем не только содержимое, но и права с владельцем. Файл с верными
+    # байтами и mode 777 или чужим владельцем — это тоже дрейф, а cmp его не
+    # видит. Для приватных ключей и sudoers разница принципиальна.
+    local want_own="" cur_mode="" cur_own=""
+    case " $* " in *" -o "*) want_own=$(echo "$*" | sed -n 's/.*-o \([^ ]*\).*/\1/p') ;; esac
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        cur_mode=$(stat -c '%a' "$dst" 2>/dev/null || echo "")
+        cur_own=$(stat -c '%U' "$dst" 2>/dev/null || echo "")
+        if [ "$cur_mode" = "$mode" ] && { [ -z "$want_own" ] || [ "$cur_own" = "$want_own" ]; }; then
+            return 0
+        fi
+        drift=$(( drift + 1 ))
+        if [ "$CHECK" = "1" ]; then
+            echo "  ДРЕЙФ ПРАВ: $dst (mode $cur_mode, владелец $cur_own; ожидалось $mode${want_own:+/$want_own})"
+            return 0
+        fi
+        install -m "$mode" "$@" "$src" "$dst" \
+            && echo "  права исправлены: $dst" \
+            || fail "не удалось исправить права: $dst"
+        return 0
+    fi
+
     drift=$(( drift + 1 ))
     if [ "$CHECK" = "1" ]; then
         echo "  ДРЕЙФ: $dst (отличается от репо $VER)"
     else
-        install -m "$mode" "$@" "$src" "$dst" && echo "  обновлён: $dst"
+        install -m "$mode" "$@" "$src" "$dst" \
+            && echo "  обновлён: $dst" \
+            || fail "не удалось установить: $dst"
     fi
 }
 
@@ -193,9 +226,10 @@ if [ ! -f "$SUD" ] || ! cmp -s "$TMP/sud" "$SUD"; then
     if [ "$CHECK" = "1" ]; then
         echo "  ДРЕЙФ: $SUD"
     elif visudo -c -f "$TMP/sud" >/dev/null 2>&1; then
-        install -m 440 "$TMP/sud" "$SUD" && echo "  обновлён: $SUD"
+        install -m 440 "$TMP/sud" "$SUD" && echo "  обновлён: $SUD" \
+            || fail "не удалось установить $SUD"
     else
-        echo "  🔴 sudoers не прошёл visudo — пропускаю"
+        fail "sudoers не прошёл visudo — пропускаю (бот останется на прежних правах)"
     fi
 fi
 
@@ -263,23 +297,54 @@ else
     [ "$units_changed" = "1" ] && { systemctl daemon-reload; echo "  systemctl daemon-reload"; }
     # Таймеры надо не только положить, но и включить — иначе файл на месте, а
     # бэкапов нет, и это самый неприятный вид тишины.
+    # Проверяем is-enabled И is-active. Раньше при enabled-но-остановленном
+    # таймере срабатывал `continue`, и такой таймер оставался мёртвым навсегда:
+    # файл на месте, enabled на месте, задача не выполняется.
     for t in "$TMP"/repo/systemd/awg-cascade-*.timer; do
         [ -e "$t" ] || continue
         tb=$(basename "$t")
-        systemctl is-enabled "$tb" >/dev/null 2>&1 && continue
-        systemctl enable --now "$tb" >/dev/null 2>&1             && echo "  таймер включён: $tb"             || echo "  ⚠️ не удалось включить таймер: $tb"
+        if systemctl is-enabled "$tb" >/dev/null 2>&1 && systemctl is-active --quiet "$tb"; then
+            continue
+        fi
+        if systemctl enable --now "$tb" >/dev/null 2>&1 && systemctl is-active --quiet "$tb"; then
+            echo "  таймер включён: $tb"
+        else
+            fail "таймер не запустился: $tb (systemctl status $tb)"
+        fi
     done
     if [ "$bot_changed" = "1" ]; then
         # Устаревший .pyc может пережить замену .py — чистим кеш перед рестартом.
         find "$BOT_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+        # Мало запустить — надо убедиться, что он остался жив. Бот, упавший на
+        # новом коде через секунду после старта, для systemctl restart успех.
         if systemctl restart awg-cascade-bot 2>/dev/null; then
-            echo "  бот перезапущен (код изменился)"
+            sleep 2
+            if systemctl is-active --quiet awg-cascade-bot; then
+                echo "  бот перезапущен (код изменился)"
+            else
+                fail "бот упал после обновления кода (journalctl -u awg-cascade-bot -n 50)"
+            fi
         else
-            echo "  ⚠️ бот не перезапустился — проверь: systemctl status awg-cascade-bot"
+            fail "бот не перезапустился (systemctl status awg-cascade-bot)"
         fi
     fi
-    printf '%s %s %s\n' "$VER" "$COMMIT" "$(date -Iseconds)" > /etc/awg-cascade/version
+
     echo "─────────────────────────────"
+    # version-stamp пишем ТОЛЬКО при полном успехе. Иначе нода с частично
+    # применённым обновлением помечена как целевой релиз, и дрейф-мониторинг
+    # рапортует «всё сошлось» именно там, где сошлось не всё.
+    if [ "$errors" -gt 0 ]; then
+        echo "🔴 Синхронизация НЕ завершена: неуспешных действий — $errors (из $drift изменений)."
+        echo "   version-stamp НЕ обновлён, нода осталась помечена как $(cat /etc/awg-cascade/version 2>/dev/null | awk '{print $1}')."
+        echo "   проверено:     $SCOPE"
+        echo "   вне проверки:  $UNCHECKED"
+        [ -x /usr/local/sbin/awg-cascade-alert.sh ] && /usr/local/sbin/awg-cascade-alert.sh \
+            sync-failed 1800 "🛑 sync не завершился" urgent warning \
+            "awg-cascade-sync.sh на $(hostname -s): $errors неуспешных действий при переходе на $VER. Нода в смешанном состоянии." \
+            >/dev/null 2>&1 || true
+        exit 1
+    fi
+    printf '%s %s %s\n' "$VER" "$COMMIT" "$(date -Iseconds)" > /etc/awg-cascade/version
     echo "✅ Синхронизировано с $VER ($COMMIT). Изменений: $drift. version-stamp обновлён."
     echo "   проверено:     $SCOPE"
     echo "   вне проверки:  $UNCHECKED"
