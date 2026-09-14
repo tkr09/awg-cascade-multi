@@ -39,9 +39,40 @@ C3="${CLIENT3_IFACE:-}"
 #
 # Комментарий барьера намеренно НЕ содержит "awg-cascade": иначе его снёс бы
 # собственный flush_our_rules ниже.
+# ─── Общая блокировка на всё применение ─────────────────────────────────────
+#
+# Барьер один на всех (GUARD — фиксированная строка), поэтому два одновременных
+# запуска мешали друг другу разрушительно: первый завершившийся снимал барьер,
+# пока второй ещё удалял и добавлял правила. Окно без защиты возвращалось ровно
+# тем механизмом, который его закрывает.
+#
+# Тот же lock берёт awg-cascade-interclient.sh при самостоятельном запуске
+# (кнопка LAN в боте): он тоже сносит и заново ставит правила.
+FWLOCK=/run/awg-cascade-fw.lock
+exec 9>"$FWLOCK" || true
+if ! flock -w 120 -x 9; then
+    echo "awg-cascade-iptables: не дождался блокировки firewall за 120с" >&2
+    exit 1
+fi
+
 GUARD=awgc-rebuild-guard
 
+# Барьер ставится и для IPv6: его набор перестраивался вообще без защиты.
+guard6() {  # $1 = -C|-I|-D
+    command -v ip6tables >/dev/null 2>&1 && ip6tables -S >/dev/null 2>&1 || return 0
+    if [ "$1" = "-I" ]; then
+        ip6tables -C FORWARD -i awg0 -m comment --comment "$GUARD" -j DROP 2>/dev/null             || ip6tables -I FORWARD 1 -i awg0 -m comment --comment "$GUARD" -j DROP 2>/dev/null || true
+    else
+        while ip6tables -S FORWARD 2>/dev/null | grep -q -- "--comment $GUARD"; do
+            spec=$(ip6tables -S FORWARD | grep -m1 -- "--comment $GUARD") || break
+            ip6tables ${spec/-A/-D} 2>/dev/null || break
+        done
+    fi
+    return 0
+}
+
 guard_up() {
+    guard6 -I
     iptables -C FORWARD -i awg0 -m comment --comment "$GUARD" -j DROP 2>/dev/null         || iptables -I FORWARD 1 -i awg0 -m comment --comment "$GUARD" -j DROP
     if [ -n "$C3" ]; then
         iptables -C FORWARD -i "$C3" -m comment --comment "$GUARD" -j DROP 2>/dev/null             || iptables -I FORWARD 1 -i "$C3" -m comment --comment "$GUARD" -j DROP
@@ -50,6 +81,7 @@ guard_up() {
 }
 
 guard_down() {
+    guard6 -D
     local spec
     while spec=$(iptables -S FORWARD 2>/dev/null | grep -m1 -- "--comment $GUARD"); do
         [ -n "$spec" ] || break
@@ -146,11 +178,22 @@ iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --commen
 # No-op без CLIENT3_IFACE в config. ДОЛЖЕН идти после kill-switch'а awg0: тот
 # закрывает awg0 → C3 (имя C3 намеренно вне маски awg+), а этот — обратную
 # сторону. И ДО interclient: тот вставляет исключения через -I 1, то есть выше.
-[ -x /usr/local/sbin/awg-cascade-client3-fw.sh ] && /usr/local/sbin/awg-cascade-client3-fw.sh || true
+# Результат helper'ов ПРОВЕРЯЕТСЯ. Раньше стояло `|| true`, и при неудаче
+# правил второго интерфейса или LAN-ACL скрипт всё равно выставлял APPLIED=1 и
+# снимал барьер — то есть публиковал как готовую заведомо неполную защиту.
+HELPERS_OK=1
+if [ -x /usr/local/sbin/awg-cascade-client3-fw.sh ]; then
+    /usr/local/sbin/awg-cascade-client3-fw.sh || {
+        echo "awg-cascade-iptables: client3-fw вернул ошибку" >&2; HELPERS_OK=0; }
+fi
 
 # --- per-peer inter-client LAN access (whitelist src→dst + default-deny /24) ---
 # Применяет правила awg-lan из peers.json поверх базовых (должно идти ПОСЛЕ MARK).
-[ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
+if [ -x /usr/local/sbin/awg-cascade-interclient.sh ]; then
+    # Он берёт тот же lock; мы его уже держим, поэтому передаём флаг.
+    AWGC_FW_LOCK_HELD=1 /usr/local/sbin/awg-cascade-interclient.sh || {
+        echo "awg-cascade-iptables: interclient вернул ошибку" >&2; HELPERS_OK=0; }
+fi
 
 # --- IPv6: каскад IPv4-only, значит IPv6 обязан быть закрыт явно ---
 #
@@ -181,9 +224,16 @@ if command -v ip6tables >/dev/null 2>&1 && ip6tables -S >/dev/null 2>&1; then
     [ -n "$BOT_UID6" ] && ip6tables -A OUTPUT -m owner --uid-owner "$BOT_UID6"         -m comment --comment "awg-cascade-bot6" -j REJECT 2>/dev/null || true
 fi
 
-# Набор полон — барьер снимет trap на выходе.
-APPLIED=1
+# Барьер снимаем ТОЛЬКО если полон весь набор, включая helper'ы.
+if [ "$HELPERS_OK" = "1" ]; then
+    APPLIED=1
+else
+    echo "awg-cascade-iptables: набор правил неполон — барьер оставлен" >&2
+    exit 1
+fi
 
 # Persist. Барьер в rules.v4 не попадает: сохраняем ПОСЛЕ его снятия.
 guard_down
+# Сохраняем ПОСЛЕ снятия барьера и только при полном наборе: иначе временный
+# DROP уехал бы в rules.v4 и восстанавливался при загрузке как постоянный.
 iptables-save > /etc/iptables/rules.v4 2>/dev/null || true

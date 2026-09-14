@@ -50,6 +50,19 @@ $CLIENT3_IFACE $CLIENT3_NET"
 fi
 ALL_NETS=$(printf '%s\n' "$IF_NETS" | awk '{print $2}')
 
+# ─── Общая блокировка firewall ───────────────────────────────────────────────
+# Тот же lock, что берёт awg-cascade-iptables.sh. Этот скрипт запускается и
+# самостоятельно — по кнопке LAN в боте, — и тогда он сносит и заново ставит
+# правила без всякого барьера, параллельно возможной пересборке.
+# AWGC_FW_LOCK_HELD=1 ставит вызывающий, который lock уже держит.
+if [ "${AWGC_FW_LOCK_HELD:-0}" != "1" ]; then
+    exec 9>/run/awg-cascade-fw.lock || true
+    if ! flock -w 120 -x 9; then
+        log "не дождался блокировки firewall за 120с — выхожу"
+        exit 1
+    fi
+fi
+
 # ─── 1. Flush наших прошлых правил (по комментарию awg-lan / awg-lan-deny) ────
 flush_chain() {
     local table_flag="$1" chain="$2" line

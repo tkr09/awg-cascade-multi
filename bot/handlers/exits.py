@@ -17,8 +17,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 
-from common import (admin_only, cfg, fmt_age, format_geo, geoip_lookup,
-                    host_key_forget, html_escape, local_run, name_to_flag,
+from common import (KNOWN_HOSTS_PATH, admin_only, cfg, fmt_age, format_geo,
+                    geoip_lookup, host_key_forget, host_key_known,
+                    _host_key_remember, html_escape, local_run, name_to_flag,
                     peers_list, ping_bar, safe_edit_text, ssh_copy_id, ssh_exec,
                     state_load, state_locked, status_icon, sudo_run, SSH_KEY)
 
@@ -944,8 +945,18 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
     # Копируем через scp через SSH (asyncssh умеет copy)
     import asyncssh as _asyncssh
     try:
-        async with _asyncssh.connect(ip, username="root", client_keys=[str(SSH_KEY)],
-                                      known_hosts=None, connect_timeout=15) as conn:
+        # known_hosts НЕ None. Через это соединение на exit уезжают RU_PSK и
+        # блок provisioning, а прежний код отключал проверку ключа целиком —
+        # даже когда предыдущее соединение (ssh_copy_id) хост уже запомнило.
+        # Пин есть — сверяемся по нему; нет — первый контакт, запомним после.
+        _pinned = host_key_known(ip, 22)
+        async with _asyncssh.connect(
+            ip, username="root", client_keys=[str(SSH_KEY)],
+            known_hosts=str(KNOWN_HOSTS_PATH) if _pinned else None,
+            connect_timeout=15,
+        ) as conn:
+            if not _pinned:
+                _host_key_remember(ip, 22, conn.get_server_host_key())
             await _asyncssh.scp(str(setup_path), (conn, "/root/setup-exit.sh"))
             await _asyncssh.scp(str(awg2_params_path), (conn, "/tmp/awg2-params.sh"))
             if warp_helper_path.exists():

@@ -249,65 +249,95 @@ peer_routing_signature() {
 apply_peer_routing() {
     [ -f "$PEERS_JSON" ] || return 0
 
-    # 1. Удаляем все наши per-peer rules (priority 999, from <ip>/32)
-    while ip rule show priority 999 2>/dev/null | grep -q "^999:"; do
-        ip rule del priority 999 2>/dev/null || break
-    done
+    # ─── Инкрементально, а не «снести всё и построить заново» ────────────────
+    #
+    # Прежняя версия первым делом удаляла ВСЕ правила priority 999, потом
+    # чистила таблицы и только затем строила набор заново. Всё это время
+    # pinned-клиенты проваливались на общее правило fwmark → table 100 и уезжали
+    # в ECMP через чужой exit. Окно открывалось на каждой перестройке, в том
+    # числе по SIGUSR1 — то есть смена пина ОДНОГО клиента временно снимала
+    # привязку у ВСЕХ. Blackhole из v2.2.0 здесь не помогал: он живёт в таблице,
+    # а провал происходил оттого, что правила, ведущего в эту таблицу, уже нет.
+    #
+    # Теперь считаем желаемый набор, сравниваем с фактическим и трогаем только
+    # различия. Для неизменившихся пиров правило не снимается ни на мгновение.
+    local desired="" tid ptid peer peer_ip pinned idx
+    local tables_wanted=""
 
-    # 2. Чистим только те персональные таблицы, которые сами же и наполняли в
-    #    прошлый раз. Слепой проход по 101..199 не нужен: чужого там быть не
-    #    может, а свои мы помним.
-    local tid
-    for tid in $PEER_TABLES_APPLIED; do
-        ip route flush table "$tid" 2>/dev/null
-    done
-    PEER_TABLES_APPLIED=""
-
-    # 3. Для каждого pinned peer'а:
-    #    - table = 100 + exit_index
-    #    - в табле: default dev awgN (single)
-    #    - ip rule: from peer_ip/32 lookup table priority 999
     while IFS= read -r peer; do
-        local peer_ip pinned
-        peer_ip=$(jq -r .ip            <<<"$peer")
+        peer_ip=$(jq -r .ip <<<"$peer")
         pinned=$(jq -r '.pinned_exit // empty' <<<"$peer")
         [ -z "$pinned" ] || [ "$pinned" = "null" ] && continue
 
-        # pinned = interface name (awg1, awg2, ...)
-        local idx ptid
         idx=$(echo "$pinned" | sed 's/awg//')
         [[ "$idx" =~ ^[0-9]+$ ]] || continue
         ptid=$((100 + idx))
 
         # 253/254/255 — системные таблицы default/main/local. Индекс exit'а
-        # ограничен 1..255, поэтому 153/154/155 в них и попадают. Писать туда
-        # default-маршрут значит менять общую маршрутизацию ноды, а чистить их
-        # при удалении пина — ломать её. Пропускаем с явной жалобой в лог; сам
-        # запрет на такие индексы стоит при добавлении exit'а.
+        # ограничен 1..99 при добавлении, но старая запись в peers.json могла
+        # остаться от прежних версий: писать в системную таблицу нельзя.
         if [ "$ptid" -ge 253 ]; then
             log "PIN $peer_ip → $pinned: table $ptid пересекается с системной, пропускаю"
             continue
         fi
 
-        # Интерфейс лежит — НЕ пропускаем пира, а кладём blackhole.
+        # Содержимое таблицы обновляем ВСЕГДА и ДО правила: ip route replace
+        # атомарен, поэтому пир, чьё правило уже стоит, в этот момент ничего не
+        # теряет — он просто начинает ходить по обновлённому маршруту.
         #
-        # Раньше здесь было `continue`. Но пропущенный пир не остаётся без
-        # маршрута: он проваливается на общее правило fwmark → table 100 и
-        # уезжает в ECMP через ЛЮБОЙ живой exit. Бот при этом обещает ровно
-        # обратное — «выбранный exit недоступен → интернета нет». Blackhole
-        # делает обещание правдой: трафик пира гасится здесь, а не утекает.
+        # Интерфейс лежит — кладём blackhole, а не пропускаем пира. Пропуск не
+        # оставляет его без маршрута: он сваливается в ECMP через любой живой
+        # exit, тогда как бот обещает обратное — «выбранный exit недоступен,
+        # интернета нет». Blackhole делает обещание правдой.
         if ip link show "$pinned" >/dev/null 2>&1; then
-            ip route replace default dev "$pinned" table "$ptid"
+            ip route replace default dev "$pinned" table "$ptid" 2>/dev/null \
+                || log "PIN $peer_ip → $pinned: ip route replace не отработал"
         else
-            ip route replace blackhole default table "$ptid"
+            ip route replace blackhole default table "$ptid" 2>/dev/null \
+                || log "PIN $peer_ip → $pinned: blackhole не установился"
             log "PIN $peer_ip → $pinned: интерфейс down, трафик пира заблокирован (строгая привязка)"
         fi
-        ip rule add from "${peer_ip}/32" lookup "$ptid" priority 999 2>/dev/null
-        case " $PEER_TABLES_APPLIED " in
+
+        desired="$desired ${peer_ip}=${ptid}"
+        case " $tables_wanted " in
             *" $ptid "*) ;;
-            *) PEER_TABLES_APPLIED="$PEER_TABLES_APPLIED $ptid" ;;
+            *) tables_wanted="$tables_wanted $ptid" ;;
         esac
     done < <(jq -c '.[]' "$PEERS_JSON" 2>/dev/null)
+
+    # ─── Фактический набор правил ────────────────────────────────────────────
+    # Строки вида "999:\tfrom 10.0.0.2 lookup 101"
+    local current
+    current=$(ip rule show priority 999 2>/dev/null \
+              | sed -n 's/^999:[[:space:]]*from \([0-9.]*\)\(\/32\)\{0,1\} lookup \([0-9]*\).*/\1=\3/p')
+
+    # 1. Лишние и устаревшие правила — удаляем поимённо, а не все подряд.
+    local rule
+    for rule in $current; do
+        case " $desired " in
+            *" $rule "*) continue ;;
+        esac
+        ip rule del from "${rule%%=*}/32" lookup "${rule##*=}" priority 999 2>/dev/null \
+            || log "PIN: не удалось снять правило $rule"
+    done
+
+    # 2. Недостающие — добавляем.
+    for rule in $desired; do
+        case " $current " in
+            *" $rule "*) continue ;;
+        esac
+        ip rule add from "${rule%%=*}/32" lookup "${rule##*=}" priority 999 2>/dev/null \
+            || log "PIN: не удалось поставить правило $rule"
+    done
+
+    # 3. Таблицы, которые мы наполняли, но которые больше не нужны.
+    for tid in $PEER_TABLES_APPLIED; do
+        case " $tables_wanted " in
+            *" $tid "*) continue ;;
+        esac
+        ip route flush table "$tid" 2>/dev/null
+    done
+    PEER_TABLES_APPLIED="$tables_wanted"
 }
 
 # Перестроить peer-routing, только если желаемое состояние изменилось.

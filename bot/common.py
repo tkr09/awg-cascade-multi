@@ -4,8 +4,12 @@ Shared helpers — config loader, state IO, SSH helper, admin guard, format util
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import fcntl
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -252,6 +256,37 @@ def _kh_name(host: str, port: int = 22) -> str:
     return host if port == 22 else "[{}]:{}".format(host, port)
 
 
+def _kh_field_matches(field: str, name: str) -> bool:
+    """
+    Совпадает ли первое поле строки known_hosts с именем хоста.
+
+    Поле бывает трёх видов:
+      • обычный список через запятую — "1.2.3.4,host.example";
+      • хешированный маркер "|1|<salt-b64>|<hash-b64>", где
+        hash = HMAC-SHA1(key=salt, msg=name). Так пишет OpenSSH при
+        HashKnownHosts, включённом по умолчанию во многих дистрибутивах;
+      • маркер @revoked/@cert-authority — сюда не попадает, отсекается выше.
+
+    Прежняя версия сравнивала поле как обычный текст, поэтому хешированную
+    запись не узнавала НИКОГДА. Последствие было не «пин не найден», а хуже:
+    вызывающий ssh_exec трактовал это как «пина нет» и шёл на хост с
+    known_hosts=None, то есть полностью без проверки ключа. Достаточно было
+    одного `ssh` с дефолтным HashKnownHosts, чтобы реестр перестал защищать.
+    """
+    if not field.startswith("|1|"):
+        return name in field.split(",")
+    parts = field.split("|")
+    if len(parts) != 4:
+        return False
+    try:
+        salt = base64.b64decode(parts[2])
+        want = base64.b64decode(parts[3])
+    except (ValueError, binascii.Error):
+        return False
+    got = hmac.new(salt, name.encode("utf-8"), hashlib.sha1).digest()
+    return hmac.compare_digest(got, want)
+
+
 def host_key_known(host: str, port: int = 22) -> bool:
     """Есть ли пин для этого хоста."""
     try:
@@ -262,7 +297,7 @@ def host_key_known(host: str, port: int = 22) -> bool:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            if name in line.split()[0].split(","):
+            if _kh_field_matches(line.split()[0], name):
                 return True
     except OSError as e:
         # НЕ «работаем без пина». Отсутствие файла — это штатное «пина ещё нет»,
@@ -293,7 +328,7 @@ def host_key_forget(host: str, port: int = 22) -> int:
         kept, dropped = [], 0
         for line in KNOWN_HOSTS_PATH.read_text().splitlines():
             st = line.strip()
-            if st and not st.startswith("#") and name in st.split()[0].split(","):
+            if st and not st.startswith("#") and _kh_field_matches(st.split()[0], name):
                 dropped += 1
                 continue
             kept.append(line)
