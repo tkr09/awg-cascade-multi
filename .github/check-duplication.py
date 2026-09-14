@@ -49,6 +49,55 @@ def upgrade_block(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+def check_config_before_helpers() -> int:
+    """
+    config должен записываться РАНЬШЕ, чем запускается что-либо его читающее.
+
+    Заведено по регрессии F01 из аудита v2.2.4. Когда awg-cascade-iptables.sh
+    перестал быть heredoc'ом внутри setup.sh и стал обычным helper'ом, он начал
+    читать CLIENT_NET из config — а config installer писал на сотню строк ниже.
+    Чистая установка падала на Phase 6, и ни один прогон на уже настроенной
+    ноде этого не показывал: там config оставался от прошлой установки.
+
+    Проверка чисто позиционная и потому дешёвая: номер строки записи config
+    должен быть меньше номера первого вызова зависимого helper'а.
+    """
+    text = read("setup.sh")
+    lines = text.splitlines()
+
+    def line_of(pred, what):
+        for i, l in enumerate(lines, 1):
+            if pred(l):
+                return i
+        fail("в setup.sh не найдено: " + what)
+        return None
+
+    cfg_at = line_of(lambda l: l.startswith('cat > "$CONFIG_FILE"'),
+                     "запись config")
+    if cfg_at is None:
+        return 1
+
+    bad = 0
+    # Helper'ы, которые читают config при запуске. Список ведётся вручную:
+    # добавляя в setup.sh вызов нового helper'а, читающего config, допишите сюда.
+    for helper in ("awg-cascade-iptables.sh", "awg-cascade-iprule.sh",
+                   "awg-cascade-fail2ban.sh", "awg-cascade-client3-fw.sh",
+                   "awg-cascade-interclient.sh"):
+        run_at = None
+        for i, l in enumerate(lines, 1):
+            st = l.strip()
+            # именно ВЫЗОВ, а не install/копирование
+            if (st.startswith("/usr/local/sbin/" + helper)
+                    or st.startswith("$REPO_DIR/watchdog/" + helper)):
+                run_at = i
+                break
+        if run_at is not None and run_at < cfg_at:
+            fail("%s запускается на строке %d, а config пишется только на %d "
+                 "— чистая установка упадёт" % (helper, run_at, cfg_at))
+            bad = 1
+    return bad
+
+
 def main() -> int:
     bad = 0
     setup = read("setup.sh")
@@ -76,6 +125,8 @@ def main() -> int:
         fail("блок обновления пакетов в setup.sh и setup-exit.sh разошёлся")
         bad = 1
 
+    bad |= check_config_before_helpers()
+
     # ─── 3. комплект provisioning ────────────────────────────────────────────
     want = {
         "setup-exit.sh",
@@ -91,7 +142,8 @@ def main() -> int:
             bad = 1
 
     if not bad:
-        print("дубли сошлись: sudoers, блок apt upgrade, комплект provisioning")
+        print("сошлось: sudoers, блок apt upgrade, комплект provisioning, "
+              "порядок «config раньше helper'ов»")
     return bad
 
 

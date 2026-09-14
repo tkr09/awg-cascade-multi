@@ -30,7 +30,14 @@ elif [ -d /etc/awg-cascade-exit ]; then
 else
     STORE=/etc/awg-cascade-autoreboot
 fi
-[ -f "$STORE" ] && . "$STORE" 2>/dev/null || true
+# Читаем разбором, а не `source`. На RU $STORE — это /etc/awg-cascade/config,
+# принадлежащий боту, и этот скрипт запускается от root: `source` здесь
+# означал бы выполнение содержимого bot-writable файла с правами root.
+if . /usr/local/sbin/awg-cascade-cfg.sh 2>/dev/null; then
+    awgc_load_config "$STORE" || true
+elif [ -f "$STORE" ]; then
+    echo "autoreboot: awg-cascade-cfg.sh недоступен, настройки не прочитаны" >&2
+fi
 
 ARG="${1:-}"
 AUTO_REBOOT="${AUTO_REBOOT:-0}"

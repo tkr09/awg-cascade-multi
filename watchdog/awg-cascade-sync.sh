@@ -30,10 +30,11 @@
 # =============================================================================
 set -u
 REPO_URL="https://github.com/tkr09/awg-cascade-multi.git"
-# Config читаем строгим разбором, а не source: файл принадлежит боту, и
-# source превращал бы любую его правку в выполнение кода от root.
-# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
-{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
+# Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
+# он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
+# достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
+# от root. Нет парсера — нет конфига, это честный отказ.
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || true
 : "${BOT_USER:=awgbot}"
 
 CHECK=0
@@ -171,6 +172,9 @@ else
     # разных местах, поэтому перечислены поимённо, а не глобом.
     sync_file "$TMP/repo/setup-exit.sh"                      "$BOT_DIR/scripts/setup-exit.sh"                 755 $BOT_OWN
     sync_file "$TMP/repo/awg2-params.sh"                     "$BOT_DIR/scripts/awg2-params.sh"                755 $BOT_OWN
+    # Он же root-owned в /usr/local/sbin: client3.sh исполняет генератор от root,
+    # и брать его из bot-writable каталога нельзя.
+    sync_file "$TMP/repo/awg2-params.sh"                     "/usr/local/sbin/awg2-params.sh"                  755
     sync_file "$TMP/repo/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"      755 $BOT_OWN
     sync_file "$TMP/repo/watchdog/awg-cascade-ssh-harden.sh" "$BOT_DIR/scripts/awg-cascade-ssh-harden.sh"     755 $BOT_OWN
     sync_file "$TMP/repo/watchdog/awg-cascade-fail2ban.sh"   "$BOT_DIR/scripts/awg-cascade-fail2ban.sh"       755 $BOT_OWN

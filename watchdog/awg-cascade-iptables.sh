@@ -18,7 +18,7 @@
 # AWG Cascade — apply iptables rules (idempotent)
 set -e
 
-{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || true
 C3="${CLIENT3_IFACE:-}"
 
 # Без CLIENT_NET правило MASQUERADE для клиентов собрать не из чего, а без

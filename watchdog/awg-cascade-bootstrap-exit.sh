@@ -22,10 +22,11 @@ warn() { echo -e "${YELLOW}[!]${NC} $1" >&2; }
 err()  { echo -e "${RED}[✗]${NC} $1" >&2; exit 1; }
 info() { echo -e "${CYAN}[i]${NC} $1" >&2; }
 
-# Config читаем строгим разбором, а не source: файл принадлежит боту, и
-# source превращал бы любую его правку в выполнение кода от root.
-# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
-. /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config || . /etc/awg-cascade/config
+# Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
+# он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
+# достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
+# от root. Нет парсера — нет конфига, это честный отказ.
+. /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config
 STATE_FILE=/etc/awg-cascade/state.json
 SSH_DIR=/etc/awg-cascade/ssh
 BOT_SCRIPTS=/opt/awg-cascade-bot/scripts

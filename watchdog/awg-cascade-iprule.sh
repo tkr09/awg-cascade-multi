@@ -10,10 +10,11 @@
 # BOT_USER правило uidrange молча считалось бы для несуществующего awgbot и
 # уезжало в фолбэк 999 — то есть бот ходил бы в Telegram мимо exit'ов, светя
 # IP российской ноды. Фолбэк оставлен на случай, если config недоступен.
-# Config читаем строгим разбором, а не source: файл принадлежит боту, и
-# source превращал бы любую его правку в выполнение кода от root.
-# Фолбэк на source — на время раскатки, пока cfg.sh есть не на всех нодах.
-{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
+# Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
+# он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
+# достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
+# от root. Нет парсера — нет конфига, это честный отказ.
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || true
 : "${BOT_USER:=awgbot}"
 BOT_UID=$(id -u "$BOT_USER" 2>/dev/null || echo 999)
 

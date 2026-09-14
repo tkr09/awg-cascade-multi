@@ -569,6 +569,103 @@ MAIN_IFACE=$(ip route show default 0.0.0.0/0 | head -1 | awk '/dev/ {for(i=1;i<=
 [ -z "$MAIN_IFACE" ] && MAIN_IFACE="eth0"
 ok "Main interface: $MAIN_IFACE"
 
+# ─── Config пишется ЗДЕСЬ, до первого запуска зависимых helper'ов ────────────
+#
+# Раньше этот блок стоял в Phase 7, на сотню строк ниже. С v2.2.0, когда
+# awg-cascade-iptables.sh перестал быть heredoc'ом и стал обычным helper'ом,
+# это сломало чистую установку: helper читает CLIENT_NET из config, а config
+# ещё не существовал. Переменная оболочки из Phase 1 в дочерний процесс не
+# наследуется, helper падал на `${CLIENT_NET:?}`, и `set -e` убивал installer
+# на Phase 6. На уже настроенной ноде дефект не проявлялся — config там был от
+# прошлой установки, поэтому ни один наш прогон его не показал.
+#
+# Отсюда правило: config должен существовать раньше, чем что-либо его читающее.
+# Всё, что нужно блоку ниже, к этому моменту определено: параметры собраны в
+# Phase 1, каталог и пользователь созданы в Phase 3-4, MAIN_IFACE — строкой выше.
+# Config-файл бота.
+#
+# ВНИМАНИЕ при правке этого блока. setup.sh запускают повторно — для обновления
+# или после смены параметров. Раньше файл перезаписывался фиксированным набором
+# полей, и повторный запуск СНОСИЛ всё, чего в шаблоне нет:
+#   • CLIENT3_IFACE/PORT/NET/NET_PREFIX/SERVER_IP — второй клиентский интерфейс
+#     продолжал работать, но helper'ы переставали о нём знать: firewall wgc3 без
+#     правил, peer-add без нужных параметров;
+#   • HC_PING_URL, пороги алертов, срок хранения трафика, час авто-ребута —
+#     обнулялись до дефолтов.
+# Защита двухслойная: (1) настраиваемые поля берутся из уже загруженного config
+# через ${VAR:-default}; (2) ниже идёт merge-проход, возвращающий ЛЮБЫЕ ключи,
+# которых в шаблоне нет вообще. Второй слой важнее первого: он не требует
+# помнить про новое поле при его добавлении.
+[ -f "$CONFIG_FILE" ] && cp -a "$CONFIG_FILE" "$CONFIG_FILE.prev"
+cat > "$CONFIG_FILE" <<EOF
+# AWG Cascade Multi — config (загружается ботом и скриптами)
+RU_PUBLIC_IP="$RU_PUBLIC_IP"
+AWG0_PORT="$AWG0_PORT"
+CLIENT_NET="$CLIENT_NET"
+CLIENT_NET_PREFIX="$CLIENT_NET_PREFIX"
+SERVER_IP="$SERVER_IP"
+MAIN_IFACE="$MAIN_IFACE"
+TG_TOKEN="$TG_TOKEN"
+TG_CHAT_ID="$TG_CHAT_ID"
+NTFY_URL="$NTFY_URL"
+NTFY_TOPIC="$NTFY_TOPIC"
+BOT_USER="$BOT_USER"
+
+# ─── Alerting (A) ───
+# HC_PING_URL: создай check на healthchecks.io → вставь ping-URL (dead-man). Пусто = выкл.
+HC_PING_URL="${HC_PING_URL:-}"
+DISK_ALERT_PCT=${DISK_ALERT_PCT:-90}
+RAM_ALERT_PCT=${RAM_ALERT_PCT:-90}
+LOAD_ALERT_MULT=${LOAD_ALERT_MULT:-2}
+SSH_ALERT=${SSH_ALERT:-1}
+
+# ─── Traffic graphs (D) ───
+# Сколько суток хранить историю трафика per-peer (72 часа — минимум метаданных).
+TRAFFIC_RETENTION_DAYS=${TRAFFIC_RETENTION_DAYS:-3}
+
+# ─── Auto-reboot после unattended-upgrades ───
+# Срабатывает ТОЛЬКО при /var/run/reboot-required (обновление ядра), не ежедневно.
+# AUTO_REBOOT_HOUR (UTC) должен быть УНИКАЛЕН на каждой ноде каскада — иначе
+# несколько exits перезагрузятся одновременно → пустая ECMP → kill-switch.
+# Применяется через awg-cascade-autoreboot.sh (вызывается из sync.sh guards).
+AUTO_REBOOT=${AUTO_REBOOT:-1}
+AUTO_REBOOT_HOUR="${AUTO_REBOOT_HOUR:-03}"
+EOF
+
+# Merge-проход: возвращаем ключи, которых в шаблоне выше нет вообще.
+# Пример из жизни — CLIENT3_*: их пишет awg-cascade-client3.sh, setup про них
+# не знает, и без этого прохода повторная установка их теряла.
+if [ -f "$CONFIG_FILE.prev" ]; then
+    _restored=""
+    while IFS= read -r _line; do
+        case "$_line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        _key=${_line%%=*}
+        # Пробелы/табы в начале ключа = не присваивание, пропускаем
+        case "$_key" in *[!A-Za-z0-9_]*) continue ;; esac
+        if ! grep -q "^${_key}=" "$CONFIG_FILE"; then
+            printf '%s
+' "$_line" >> "$CONFIG_FILE"
+            _restored="$_restored $_key"
+        fi
+    done < "$CONFIG_FILE.prev"
+    if [ -n "$_restored" ]; then
+        ok "Сохранены поля из прошлого config:$_restored"
+    fi
+    # Прошлая версия остаётся рядом до следующего запуска setup — если merge
+    # что-то не так понял, откатиться можно копированием .prev на место.
+    chmod 600 "$CONFIG_FILE.prev"
+    chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE.prev"
+fi
+
+chmod 600 "$CONFIG_FILE"
+chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
+ok "Config файл сохранён: $CONFIG_FILE"
+
+
 # Скрипт применения правил — обычный helper из репо (watchdog/awg-cascade-iptables.sh),
 # а не heredoc здесь. До v2.2 он генерировался инлайном и из-за этого не попадал
 # ни в sync.sh, ни в drift-guard: правка firewall доезжала до ноды только
@@ -669,88 +766,6 @@ chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/state.lock"
 chmod 666 "$CONFIG_DIR/state.lock"
 ok "state.lock pre-created с 0666 (shared между bot и root)"
 
-# Config-файл бота.
-#
-# ВНИМАНИЕ при правке этого блока. setup.sh запускают повторно — для обновления
-# или после смены параметров. Раньше файл перезаписывался фиксированным набором
-# полей, и повторный запуск СНОСИЛ всё, чего в шаблоне нет:
-#   • CLIENT3_IFACE/PORT/NET/NET_PREFIX/SERVER_IP — второй клиентский интерфейс
-#     продолжал работать, но helper'ы переставали о нём знать: firewall wgc3 без
-#     правил, peer-add без нужных параметров;
-#   • HC_PING_URL, пороги алертов, срок хранения трафика, час авто-ребута —
-#     обнулялись до дефолтов.
-# Защита двухслойная: (1) настраиваемые поля берутся из уже загруженного config
-# через ${VAR:-default}; (2) ниже идёт merge-проход, возвращающий ЛЮБЫЕ ключи,
-# которых в шаблоне нет вообще. Второй слой важнее первого: он не требует
-# помнить про новое поле при его добавлении.
-[ -f "$CONFIG_FILE" ] && cp -a "$CONFIG_FILE" "$CONFIG_FILE.prev"
-cat > "$CONFIG_FILE" <<EOF
-# AWG Cascade Multi — config (загружается ботом и скриптами)
-RU_PUBLIC_IP="$RU_PUBLIC_IP"
-AWG0_PORT="$AWG0_PORT"
-CLIENT_NET="$CLIENT_NET"
-CLIENT_NET_PREFIX="$CLIENT_NET_PREFIX"
-SERVER_IP="$SERVER_IP"
-MAIN_IFACE="$MAIN_IFACE"
-TG_TOKEN="$TG_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-NTFY_URL="$NTFY_URL"
-NTFY_TOPIC="$NTFY_TOPIC"
-BOT_USER="$BOT_USER"
-
-# ─── Alerting (A) ───
-# HC_PING_URL: создай check на healthchecks.io → вставь ping-URL (dead-man). Пусто = выкл.
-HC_PING_URL="${HC_PING_URL:-}"
-DISK_ALERT_PCT=${DISK_ALERT_PCT:-90}
-RAM_ALERT_PCT=${RAM_ALERT_PCT:-90}
-LOAD_ALERT_MULT=${LOAD_ALERT_MULT:-2}
-SSH_ALERT=${SSH_ALERT:-1}
-
-# ─── Traffic graphs (D) ───
-# Сколько суток хранить историю трафика per-peer (72 часа — минимум метаданных).
-TRAFFIC_RETENTION_DAYS=${TRAFFIC_RETENTION_DAYS:-3}
-
-# ─── Auto-reboot после unattended-upgrades ───
-# Срабатывает ТОЛЬКО при /var/run/reboot-required (обновление ядра), не ежедневно.
-# AUTO_REBOOT_HOUR (UTC) должен быть УНИКАЛЕН на каждой ноде каскада — иначе
-# несколько exits перезагрузятся одновременно → пустая ECMP → kill-switch.
-# Применяется через awg-cascade-autoreboot.sh (вызывается из sync.sh guards).
-AUTO_REBOOT=${AUTO_REBOOT:-1}
-AUTO_REBOOT_HOUR="${AUTO_REBOOT_HOUR:-03}"
-EOF
-
-# Merge-проход: возвращаем ключи, которых в шаблоне выше нет вообще.
-# Пример из жизни — CLIENT3_*: их пишет awg-cascade-client3.sh, setup про них
-# не знает, и без этого прохода повторная установка их теряла.
-if [ -f "$CONFIG_FILE.prev" ]; then
-    _restored=""
-    while IFS= read -r _line; do
-        case "$_line" in
-            ''|'#'*) continue ;;
-            *=*) ;;
-            *) continue ;;
-        esac
-        _key=${_line%%=*}
-        # Пробелы/табы в начале ключа = не присваивание, пропускаем
-        case "$_key" in *[!A-Za-z0-9_]*) continue ;; esac
-        if ! grep -q "^${_key}=" "$CONFIG_FILE"; then
-            printf '%s
-' "$_line" >> "$CONFIG_FILE"
-            _restored="$_restored $_key"
-        fi
-    done < "$CONFIG_FILE.prev"
-    if [ -n "$_restored" ]; then
-        ok "Сохранены поля из прошлого config:$_restored"
-    fi
-    # Прошлая версия остаётся рядом до следующего запуска setup — если merge
-    # что-то не так понял, откатиться можно копированием .prev на место.
-    chmod 600 "$CONFIG_FILE.prev"
-    chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE.prev"
-fi
-
-chmod 600 "$CONFIG_FILE"
-chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
-ok "Config файл сохранён: $CONFIG_FILE"
 
 # version-stamp — какой ref/commit развёрнут (для drift-guard и бота)
 _VER=$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null || echo "unknown")
@@ -807,6 +822,7 @@ header "8b. Deploy watchdog + helper-скрипты"
 
 # Копируем все helper-скрипты в /usr/local/sbin (перетирая stub'ы и старые версии)
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-cfg.sh               /usr/local/sbin/
+install -m 755 "$REPO_DIR"/awg2-params.sh                            /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-iptables.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog.sh          /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-watchdog-postboot.sh /usr/local/sbin/

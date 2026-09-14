@@ -25,9 +25,13 @@ set -u
 CFG=/etc/awg-cascade/config
 WG_DIR=/etc/amnezia/amneziawg
 PEERS_JSON=/etc/awg-cascade/peers.json
-PARAMS=/opt/awg-cascade-bot/scripts/awg2-params.sh
+# Генератор берём из root-owned /usr/local/sbin, а НЕ из $BOT_DIR/scripts.
+# Тот каталог принадлежит боту, а этот скрипт исполняет генератор от root:
+# подменив там файл, захваченный бот получал бы root без единого sudo.
+PARAMS=/usr/local/sbin/awg2-params.sh
 
-. "$CFG" 2>/dev/null || true
+# Разбор вместо `source`: $CFG принадлежит боту (см. awg-cascade-cfg.sh).
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config "$CFG"; } 2>/dev/null || true
 : "${CLIENT3_IFACE:=}"
 : "${CLIENT_NET:=}"
 : "${AWG0_PORT:=}"

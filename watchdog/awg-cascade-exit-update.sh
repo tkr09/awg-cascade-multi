@@ -26,8 +26,11 @@
 #     --os     дополнительно apt-get upgrade на exit'е (без перезапуска сервисов)
 # =============================================================================
 set -u
-# Config читаем строгим разбором, а не source (см. awg-cascade-cfg.sh).
-{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || . /etc/awg-cascade/config 2>/dev/null || true
+# Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
+# он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
+# достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
+# от root. Нет парсера — нет конфига, это честный отказ.
+{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config; } 2>/dev/null || true
 : "${BOT_USER:=awgbot}"
 
 STATE=/etc/awg-cascade/state.json
