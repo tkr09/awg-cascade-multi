@@ -87,6 +87,7 @@ def exit_menu_kb(iface: str, warp: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📝 Заметка", callback_data=f"exit:note:{iface}"),
             InlineKeyboardButton(text="✏️ Имя",     callback_data=f"exit:rename:{iface}"),
         ],
+        [InlineKeyboardButton(text="🔑 Ключ другой RU", callback_data=f"exit:authkey:{iface}")],
         [InlineKeyboardButton(text="🔄 Reboot exit",  callback_data=f"exit:reboot:{iface}")],
         [InlineKeyboardButton(text="🗑 Удалить exit", callback_data=f"exit:rm:{iface}")],
         [InlineKeyboardButton(text="◀️ К списку",    callback_data="exits:list")],
@@ -297,6 +298,86 @@ async def fsm_note_text(message: Message, state: FSMContext) -> None:
 
 
 # ─── Rename ──────────────────────────────────────────────────────────────────
+
+class AuthKeyFSM(StatesGroup):
+    waiting = State()
+
+
+@router.callback_query(F.data.startswith("exit:authkey:"))
+@admin_only
+async def cb_exit_authkey(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    iface = call.data[len("exit:authkey:"):]
+    st = state_load()
+    e = _get_exit(st, iface)
+    if not e:
+        await call.message.edit_text("Exit не найден.")
+        return
+    await state.set_state(AuthKeyFSM.waiting)
+    await state.update_data(iface=iface)
+    await call.message.edit_text(
+        f"🔑 <b>Ключ другой RU → {html_escape(e['name'])}</b>\n\n"
+        "Этот exit закрыт для входа по паролю, поэтому новая RU сама на него "
+        "зайти не может — ключ должна положить RU, для которой exit уже свой.\n\n"
+        "Пришли <b>публичный</b> ключ новой RU одной строкой. Взять его там так:\n"
+        "<pre>cat /etc/awg-cascade/ssh/id_ed25519.pub</pre>\n"
+        "Строка с опциями (<code>command=</code>, <code>from=</code>) принята не будет.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"exit:menu:{iface}")
+        ]]),
+    )
+
+
+@router.message(AuthKeyFSM.waiting)
+@admin_only
+async def fsm_authkey(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    iface = data["iface"]
+    key = (message.text or "").strip()
+    if not key:
+        await message.answer("Пустое сообщение — жду публичный ключ.")
+        return
+    await state.clear()
+
+    st = state_load()
+    e = _get_exit(st, iface)
+    if not e:
+        await message.answer("Exit не найден.")
+        return
+
+    status = await message.answer("⏳ Кладу ключ на exit...")
+    # Ключ уходит через stdin: в argv он был бы виден в ps всем на ноде.
+    out, err, rc = await sudo_run(
+        "/usr/local/sbin/awg-cascade-exit-authkey.sh", iface,
+        timeout=60, stdin_data=key + "\n",
+    )
+    if rc != 0:
+        reason = ""
+        try:
+            reason = json.loads(err.strip().splitlines()[-1]).get("error", "")
+        except Exception:
+            reason = (err or out)[:300]
+        await status.edit_text(
+            "❌ Ключ не добавлен.\n<pre>" + html_escape(reason) + "</pre>",
+            parse_mode="HTML",
+            reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
+        )
+        return
+
+    result = json.loads(out)
+    head = "✅ Ключ добавлен" if result.get("added") else "✅ Ключ уже был на месте"
+    await status.edit_text(
+        f"{head} — <b>{html_escape(result['exit'])}</b>\n\n"
+        f"отпечаток: <code>{html_escape(result['fingerprint'])}</code>\n"
+        f"ключей у root на exit'е: {result.get('keys_total', '?')}\n\n"
+        "Теперь с той RU можно подключить этот exit:\n"
+        f"<pre>awg-cascade-bootstrap-exit.sh {html_escape(result['ip'])} "
+        f"{html_escape(result['exit'])}</pre>",
+        parse_mode="HTML",
+        reply_markup=exit_menu_kb(iface, e.get("warp_state", "off")),
+    )
+
 
 class RenameFSM(StatesGroup):
     waiting = State()
