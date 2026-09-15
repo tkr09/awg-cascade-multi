@@ -68,16 +68,39 @@ def snapshot(operation):
     return manifest
 
 
+def retire_journal():
+    """
+    Пометить журнал отработанным ДО удаления его файлов.
+
+    shutil.rmtree не атомарен. Прерывание между удалением части снимка и
+    удалением journal.json оставляло журнал, который выглядит как требующий
+    отката, — а файлов для отката уже нет. Следующий recovery падал на чтении
+    снимка и блокировал и мутации, и запуск зависимых сервисов, при том что
+    откат уже завершился (A08 аудита v2.7.6).
+
+    Переименование в пределах каталога атомарно, а fsync каталога делает его
+    долговечным. После него journal.json отсутствует — то есть триггера
+    восстановления нет, и остаток каталога следующий запуск просто уберёт.
+    """
+    path = JOURNAL / 'journal.json'
+    if path.exists():
+        os.replace(path, JOURNAL / 'journal.retired')
+        fd = os.open(JOURNAL, os.O_RDONLY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    if JOURNAL.exists(): shutil.rmtree(JOURNAL)
+
+
 def recover():
     c.recover_peer_edit()
     path = JOURNAL / 'journal.json'
     if not path.exists():
         # Incomplete snapshot cannot have executed a mutation.
-        if JOURNAL.exists(): shutil.rmtree(JOURNAL)
+        retire_journal()
         return
     manifest = json.loads(path.read_text())
     if manifest.get('committed'):
-        shutil.rmtree(JOURNAL)
+        retire_journal()
         return
     before = manifest['files']
     live = command('awg', 'show', 'interfaces').stdout.decode().split()
@@ -103,7 +126,7 @@ def recover():
         command('systemctl', 'enable' if enabled else 'disable', 'awg-quick@' + iface)
     command('/usr/local/sbin/awg-cascade-iprule.sh')
     command('/usr/local/sbin/awg-cascade-iptables.sh')
-    shutil.rmtree(JOURNAL)
+    retire_journal()
 
 
 def terminate_child(proc):
@@ -156,7 +179,8 @@ def main():
                 with path.open('rb') as stream: os.fsync(stream.fileno())
             manifest['committed'] = True
             c.atomic_write(JOURNAL / 'journal.json', json.dumps(manifest), mode=0o600)
-            shutil.rmtree(JOURNAL)
+            # Тем же путём, что и откат: сначала снимаем триггер, потом файлы.
+            retire_journal()
             sys.stdout.buffer.write(out)
             sys.stderr.buffer.write(err)
             return 0
