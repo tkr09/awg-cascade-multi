@@ -25,11 +25,48 @@ fi
 # exit'ами по SSH разом: статус, WARP, удаление, обновление, добавление
 # нового exit'а. Снаружи это выглядело как зависший экран в Telegram, а
 # selftest горел зелёным, потому что проверяет egress через curl.
-[ ! -L "$BASE/ssh/known_hosts" ] || { echo "Отказ: ssh/known_hosts — симлинк" >&2; exit 1; }
-if [ -f "$BASE/ssh/known_hosts" ]; then
-    chown "$BOT_USER:$BOT_USER" "$BASE/ssh/known_hosts"
-    chmod 600 "$BASE/ssh/known_hosts"
-fi
+#
+# ПОЧЕМУ НЕ `chown` ПО ИМЕНИ. Каталог ssh принадлежит боту, значит между нашей
+# проверкой и сменой прав бот успевает подставить на это имя symlink — и root
+# сменит владельца произвольного файла в системе. Проверка «это не symlink»
+# такую гонку не закрывает в принципе: между ней и следующей командой проходит
+# время (замечание A01 аудита v2.7.6).
+#
+# Поэтому файл открывается ОДИН раз с O_NOFOLLOW, а права меняются через
+# дескриптор: подменить имя после открытия уже бессмысленно, мы работаем с
+# конкретным inode. Заодно отвергаем не-обычный файл и жёсткие ссылки — через
+# них можно было бы подсунуть чужой inode, не создавая symlink.
+python3 - "$BASE/ssh/known_hosts" "$BOT_USER" <<'PYEOF'
+import os
+import pwd
+import stat
+import sys
+
+path, user = sys.argv[1], sys.argv[2]
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+except FileNotFoundError:
+    sys.exit(0)                      # файла ещё нет — чинить нечего
+except OSError as exc:
+    # ELOOP сюда же: имя оказалось symlink'ом — это отказ, а не повод идти дальше.
+    print("ssh/known_hosts: не открыть без следования по ссылке: %s" % exc, file=sys.stderr)
+    sys.exit(1)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        print("ssh/known_hosts: не обычный файл — не трогаю", file=sys.stderr)
+        sys.exit(1)
+    if st.st_nlink != 1:
+        print("ssh/known_hosts: жёстких ссылок %d — не трогаю" % st.st_nlink, file=sys.stderr)
+        sys.exit(1)
+    want = pwd.getpwnam(user)
+    if (st.st_uid, st.st_gid) != (want.pw_uid, want.pw_gid):
+        os.fchown(fd, want.pw_uid, want.pw_gid)
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        os.fchmod(fd, 0o600)
+finally:
+    os.close(fd)
+PYEOF
 for file in config state.json peers.json awg2_params version installed-version active-version activation-pending; do
     [ ! -L "$BASE/$file" ] || { echo "Отказ: $file — симлинк" >&2; exit 1; }
     if [ -f "$BASE/$file" ]; then
