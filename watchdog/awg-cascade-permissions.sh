@@ -16,6 +16,20 @@ install -d -m 700 -o "$BOT_USER" -g "$BOT_USER" "$BASE/ssh"
 if [ -f "$BASE/known_hosts" ] && [ ! -e "$BASE/ssh/known_hosts" ]; then
     install -m 600 -o "$BOT_USER" -g "$BOT_USER" "$BASE/known_hosts" "$BASE/ssh/known_hosts"
 fi
+# Реестр host-ключей принадлежит БОТУ: он его и читает, и дописывает при TOFU.
+#
+# Миграция выше срабатывает только когда целевого файла ещё нет, а владельца
+# существующего не проверял никто. Между тем файл создаёт ssh, запущенный от
+# root: bootstrap-exit.sh вызывается из setup.sh во время установки. Нода
+# рождалась с root:root 600 в каталоге бота — и бот терял ВСЕ операции с
+# exit'ами по SSH разом: статус, WARP, удаление, обновление, добавление
+# нового exit'а. Снаружи это выглядело как зависший экран в Telegram, а
+# selftest горел зелёным, потому что проверяет egress через curl.
+[ ! -L "$BASE/ssh/known_hosts" ] || { echo "Отказ: ssh/known_hosts — симлинк" >&2; exit 1; }
+if [ -f "$BASE/ssh/known_hosts" ]; then
+    chown "$BOT_USER:$BOT_USER" "$BASE/ssh/known_hosts"
+    chmod 600 "$BASE/ssh/known_hosts"
+fi
 for file in config state.json peers.json awg2_params version installed-version active-version activation-pending; do
     [ ! -L "$BASE/$file" ] || { echo "Отказ: $file — симлинк" >&2; exit 1; }
     if [ -f "$BASE/$file" ]; then
