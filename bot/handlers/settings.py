@@ -11,7 +11,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from common import (admin_only, cfg, html_escape, local_run, state_load,
-                    SSH_KEY)
+                    sudo_run, SSH_KEY)
 
 LOG = logging.getLogger("awg.settings")
 router = Router(name="settings")
@@ -43,6 +43,8 @@ async def cb_settings(call: CallbackQuery) -> None:
     await call.message.edit_text(
         text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Клиенты 3.x",
+                                  callback_data="settings:client3")],
             [InlineKeyboardButton(text="🔑 SSH-ключ этой RU",
                                   callback_data="settings:sshkey")],
             [InlineKeyboardButton(text="🏠 Меню", callback_data="main")]]),
@@ -88,3 +90,111 @@ async def cb_ssh_key(call: CallbackQuery) -> None:
         "<b>Что делать.</b> Открой бота той RU, которой этот exit принадлежит: 🌍 Exits → нужный exit → 🔑 Ключ другой RU → вставь этот текст. Потом вернись сюда и добавь exit кнопкой ➕.\n\n"
         "<i>Ключ публичный — пересылать его безопасно.</i>",
         parse_mode="HTML", reply_markup=back)
+
+
+def _client3_kb(configured: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if configured:
+        rows.append([InlineKeyboardButton(text="⏹ Выключить 3.x",
+                                          callback_data="settings:client3:down")])
+    else:
+        rows.append([InlineKeyboardButton(text="▶️ Включить 3.x",
+                                          callback_data="settings:client3:up")])
+    rows.append([InlineKeyboardButton(text="◀️ Настройки", callback_data="settings:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "settings:client3")
+@admin_only
+async def cb_client3(call: CallbackQuery) -> None:
+    """
+    Второй клиентский интерфейс (AmneziaWG 3.x).
+
+    Версия протокола для клиентов спрашивается один раз, при установке. Выбрал
+    2.0 — интерфейса wgc3 на ноде нет, и бот не может выдать 3.x-конфиг, потому
+    что выдавать его не с чего. Путь создать интерфейс позже существовал только
+    в CLI, то есть ответ на «почему я не могу добавить peer 3.1» был «переустанови
+    ноду или иди в терминал». Теперь это кнопка.
+    """
+    await call.answer()
+    c = cfg()
+    if c.client3_iface:
+        out, _, _ = await local_run("systemctl", "is-active",
+                                    f"awg-quick@{c.client3_iface}", timeout=10)
+        text = (
+            f"📱 <b>Клиенты 3.x</b>\n\n"
+            f"интерфейс: <code>{html_escape(c.client3_iface)}</code> "
+            f"({html_escape(out.strip() or '?')})\n"
+            f"порт: <code>{html_escape(str(c.client3_port))}/udp</code>\n"
+            f"подсеть: <code>{html_escape(str(c.client3_net))}</code>\n\n"
+            "Новые peer'ы можно выдавать на обоих интерфейсах — выбор появляется "
+            "при создании.\n\n"
+            "<i>Роутеры на NativeWG протокол 3.x не понимают и молча откатятся "
+            "на 2.0 — им нужен обычный awg0.</i>"
+        )
+    else:
+        text = (
+            "📱 <b>Клиенты 3.x</b>\n\n"
+            "<b>Не настроен.</b> При установке был выбран протокол 2.0, поэтому "
+            "второго интерфейса на ноде нет — и выдать 3.x-конфиг не из чего.\n\n"
+            "Включение создаст отдельный интерфейс <code>wgc3</code>: шифрование "
+            "заголовков, набивка, случайные таймеры. Существующие peer'ы на "
+            "<code>awg0</code> останутся как есть.\n\n"
+            "<i>Займёт около минуты: поднимается интерфейс и пересобирается "
+            "firewall.</i>"
+        )
+    await call.message.edit_text(text, parse_mode="HTML",
+                                 reply_markup=_client3_kb(bool(c.client3_iface)))
+
+
+@router.callback_query(F.data == "settings:client3:up")
+@admin_only
+async def cb_client3_up(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text("⏳ Поднимаю второй интерфейс...", parse_mode="HTML")
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-client3.sh", "up",
+                                  timeout=180)
+    tail = (out or err).strip().splitlines()[-8:]
+    body = html_escape("\n".join(tail))
+    if rc != 0:
+        await call.message.edit_text(
+            "❌ Не поднялся.\n<pre>" + body + "</pre>",
+            parse_mode="HTML", reply_markup=_client3_kb(False))
+        return
+    await call.message.edit_text(
+        "✅ <b>Второй интерфейс поднят</b>\n<pre>" + body + "</pre>\n"
+        "Теперь при создании peer'а бот спросит, на каком интерфейсе его выдать.",
+        parse_mode="HTML", reply_markup=_client3_kb(True))
+
+
+@router.callback_query(F.data == "settings:client3:down")
+@admin_only
+async def cb_client3_down(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text(
+        "⏹ <b>Выключить 3.x?</b>\n\n"
+        "Интерфейс будет снесён, а его настройки убраны из config. Выданные на "
+        "нём конфиги перестанут работать.\n\n"
+        "<i>Если на интерфейсе ещё есть peer'ы, helper откажется — сначала удали "
+        "их в разделе Peers.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏹ Да, выключить",
+                                  callback_data="settings:client3:down-yes")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="settings:client3")],
+        ]))
+
+
+@router.callback_query(F.data == "settings:client3:down-yes")
+@admin_only
+async def cb_client3_down_yes(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text("⏳ Сношу второй интерфейс...", parse_mode="HTML")
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-client3.sh", "down",
+                                  timeout=180)
+    tail = (out or err).strip().splitlines()[-8:]
+    body = html_escape("\n".join(tail))
+    ok = rc == 0
+    await call.message.edit_text(
+        ("✅ <b>Выключен</b>\n<pre>" if ok else "❌ Не вышло.\n<pre>") + body + "</pre>",
+        parse_mode="HTML", reply_markup=_client3_kb(not ok and bool(cfg().client3_iface)))
