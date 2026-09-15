@@ -134,15 +134,56 @@ def exit_reboot(ssh, record):
         if returned: break
     if not returned:
         return 'failed: exit не вернулся после перезагрузки за 5 минут'
+    # Фактическое ядро, а не то, которое мы наметили ДО перезагрузки. Загрузчик
+    # мог поднять другое — и туннель на нём тоже заработает, так что ни boot_id,
+    # ни handshake этого не покажут. Отчёт «done: ядро X» без этой сверки просто
+    # повторял бы наше же намерение.
+    try:
+        booted=run(ssh+['uname -r'],timeout=20)
+    except Exception:
+        booted=''
     iface='awg'+str(record['exit_index'])
     deadline=time.time()+180
     while time.time()<deadline:
         probe=subprocess.run(['awg','show',iface,'latest-handshakes'],capture_output=True,timeout=15)
         stamps=[int(f[1]) for f in (l.split() for l in probe.stdout.decode().splitlines()) if len(f)>1]
         if stamps and max(stamps)>moment:
+            if booted!=target:
+                return 'failed: загрузилось ядро '+(booted or '?')+', ожидалось '+target
             return 'done: ядро '+target
         time.sleep(10)
     return 'failed: туннель не восстановился после перезагрузки'
+
+
+def finish(ssh, record, record_path, resumed=False):
+    """
+    Шаги ПОСЛЕ добавления exit'а на RU: протокол, version-stamp, перезагрузка.
+
+    Журнал операции удаляется здесь и только здесь — последним действием.
+
+    Раньше он удалялся ДО этих шагов. Любая ошибка в них оставляла exit уже в
+    state, но без журнала: повтор упирался в «exit already exists», а сообщение
+    об ошибке предлагало именно повтор. То есть инструкция по восстановлению
+    вела в тупик, а сведения о незавершённых стадиях терялись.
+
+    Теперь повтор с тем же IP и именем доигрывает оставшееся: exit в state —
+    признак того, что RU commit прошёл и переделывать его нельзя.
+    """
+    iface = 'awg' + str(record['exit_index'])
+    proto = apply_exit_proto(iface)
+    stamp = write_version_stamp(ssh)
+    reboot = exit_reboot(ssh, record)
+    record_path.unlink(missing_ok=True)
+    result = {'ok': True, 'index': record['exit_index'], 'interface': iface,
+              'proto': proto, 'reboot': reboot, 'version_stamp': stamp}
+    if resumed:
+        result['resumed'] = True
+    print(json.dumps(result))
+    # Код 2, а не 1: exit добавлен и работает, не сложилось только что-то из
+    # обещанного — протокол, перезагрузка или целевое ядро. Повторять
+    # провижининг не нужно; вызывающая сторона обязана различать эти исходы.
+    if reboot.startswith('failed') or proto.startswith('failed'):
+        sys.exit(2)
 
 
 def main():
@@ -157,9 +198,10 @@ def main():
         state=c.validate_state(json.loads((BASE/'state.json').read_text()))
         if record_path.exists():
             record=json.loads(record_path.read_text())
-            # A lost final response must not create a second exit.
+            # Exit уже в state — значит RU commit прошёл, и переделывать его
+            # нельзя. Не завершились только шаги после него: доигрываем их.
             if any(n['index']==record['exit_index'] and n['ip']==ip for n in state['exits']):
-                record_path.unlink();print(json.dumps({'ok':True,'index':record['exit_index'],'resumed':True}));return
+                finish(ssh,record,record_path,resumed=True);return
         else:
             if any(n['ip']==ip or n['name']==name for n in state['exits']): raise ValueError('exit already exists')
             lease=run(['/usr/local/sbin/awg-cascade-exit-reserve.sh','acquire','provision:'+name]).split()
@@ -195,20 +237,7 @@ def main():
         # Stage is a validated directory created by mktemp for this operation only.
         if re.fullmatch(r'/root/awgc-provision\.[A-Za-z0-9]+',record.get('stage','')):
             run(ssh+['rm -rf -- '+record['stage']])
-        record_path.unlink()
-        iface='awg'+str(record['exit_index'])
-        # 3.1 включаем ДО перезагрузки exit'а: так проверка возвращения
-        # подтверждает handshake уже на том протоколе, на котором туннель
-        # будет работать дальше.
-        proto=apply_exit_proto(iface)
-        stamp=write_version_stamp(ssh)
-        reboot=exit_reboot(ssh,record)
-        print(json.dumps({'ok':True,'index':record['exit_index'],'interface':iface,
-                          'proto':proto,'reboot':reboot,'version_stamp':stamp}))
-        # Код 2, а не 1: exit добавлен и работает, не сложилось только что-то
-        # из обещанного — перезагрузка или протокол. Повторять провижининг не
-        # нужно и вредно; вызывающая сторона обязана различать эти исходы.
-        if reboot.startswith('failed') or proto.startswith('failed'): sys.exit(2)
+        finish(ssh,record,record_path)
 
 
 if __name__=='__main__':
