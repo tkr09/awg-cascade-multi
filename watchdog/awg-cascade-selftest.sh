@@ -124,9 +124,14 @@ fi
 # означает «управлять exit'ом не могу», и знать об этом надо ДО того, как
 # понадобится что-то с ним сделать.
 if [ -f "$STATE" ] && [ -f /etc/awg-cascade/ssh/id_ed25519 ]; then
-    ssh_bad=""; ssh_ok=0
-    while IFS= read -r row; do
+    # Цикл читает с fd 3, а не со stdin. Внутри стоит ssh, и он съедает stdin
+    # цикла: перебор обрывается на первой же ноде, а проверка при этом бодро
+    # рапортует успех по одному exit-у из нескольких. В этом проекте ловушка
+    # уже срабатывала (ssh в цикле по нодам в exit-update.sh).
+    ssh_bad=""; ssh_ok=0; ssh_total=0
+    while IFS= read -r row <&3; do
         [ "$(jq -r .enabled <<<"$row")" = "true" ] || continue
+        ssh_total=$((ssh_total + 1))
         eip=$(jq -r .ip <<<"$row"); ename=$(jq -r .name <<<"$row")
         if runuser -u "$BOT_USER" -- ssh -F /dev/null \
                 -i /etc/awg-cascade/ssh/id_ed25519 -o IdentitiesOnly=yes \
@@ -137,11 +142,11 @@ if [ -f "$STATE" ] && [ -f /etc/awg-cascade/ssh/id_ed25519 ]; then
         else
             ssh_bad="$ssh_bad $ename"
         fi
-    done < <(jq -c '.exits[]' "$STATE" 2>/dev/null)
+    done 3< <(jq -c '.exits[]' "$STATE" 2>/dev/null)
     if [ -n "$ssh_bad" ]; then
-        emit FAIL "SSH бота → exits" "не заходит:$ssh_bad (управление ими недоступно)"
+        emit FAIL "SSH бота → exits" "$ssh_ok из $ssh_total; не заходит:$ssh_bad"
     elif [ "$ssh_ok" -gt 0 ]; then
-        emit OK "SSH бота → exits" "$ssh_ok из $ssh_ok"
+        emit OK "SSH бота → exits" "$ssh_ok из $ssh_total"
     fi
 fi
 
