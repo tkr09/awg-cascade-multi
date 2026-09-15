@@ -11,8 +11,10 @@ Restart=always остаётся как backup (после max retries или fat
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 import sys
 
 from aiogram import Bot, Dispatcher
@@ -55,12 +57,54 @@ async def _try_startup_notify(bot: Bot, chat_id: int) -> None:
     LOG.warning("Startup notify: %d attempts exhausted", STARTUP_NOTIFY_RETRIES)
 
 
+# ─── Остановка по сигналу ─────────────────────────────────────────────────────
+#
+# Между попытками переподключения бот спит до MAX_BACKOFF_SEC — и всё это время
+# он обязан оставаться останавливаемым.
+#
+# Своих обработчиков сигналов здесь раньше не было, а aiogram ставит собственные
+# ТОЛЬКО на время polling. При обрыве связи мы из polling как раз и вышли,
+# поэтому SIGTERM уходил в пустоту: systemd ждал TimeoutStopSec и добивал
+# процесс. Наблюдалось на ноде без exit'ов — полторы минуты на перезапуск бота,
+# и всё это время блокировался вызвавший его скрипт.
+#
+# Поэтому polling запускается с handle_signals=False, а сигналы обрабатываем
+# сами — одинаково и в polling, и в паузе между попытками.
+_STOP = asyncio.Event()
+
+
+async def _sleep_or_stop(seconds: float) -> None:
+    """Пауза, прерываемая сигналом остановки."""
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(_STOP.wait(), timeout=seconds)
+
+
+async def _stop_polling(dp: Dispatcher) -> None:
+    # stop_polling() бросает RuntimeError, если polling не запущен. Это штатный
+    # случай: сигнал мог прийти в паузе между попытками.
+    with contextlib.suppress(RuntimeError):
+        await dp.stop_polling()
+
+
+def _install_signal_handlers(dp: Dispatcher) -> None:
+    loop = asyncio.get_running_loop()
+
+    def _on_signal(sig: signal.Signals) -> None:
+        LOG.info("Сигнал %s — останавливаюсь", sig.name)
+        _STOP.set()
+        loop.create_task(_stop_polling(dp))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, _on_signal, sig)
+
+
 async def _run_polling_with_retry(dp: Dispatcher, bot: Bot) -> None:
     """Запускает polling с автоматическим retry на TelegramNetworkError."""
     backoff = INITIAL_BACKOFF_SEC
-    while True:
+    while not _STOP.is_set():
         try:
-            await dp.start_polling(bot)
+            await dp.start_polling(bot, handle_signals=False)
             # Если start_polling вернулся без исключения — значит остановили намеренно
             LOG.info("Polling stopped cleanly, exiting")
             return
@@ -68,21 +112,22 @@ async def _run_polling_with_retry(dp: Dispatcher, bot: Bot) -> None:
             # Flood control от Telegram
             wait = max(1, int(getattr(e, "retry_after", 30)))
             LOG.warning("Telegram RetryAfter: wait %ds", wait)
-            await asyncio.sleep(wait)
+            await _sleep_or_stop(wait)
             backoff = INITIAL_BACKOFF_SEC  # сброс
         except TelegramNetworkError as e:
             LOG.warning(
                 "TelegramNetworkError: %s — retry in %ds",
                 str(e)[:200], backoff,
             )
-            await asyncio.sleep(backoff)
+            await _sleep_or_stop(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SEC)
         except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
             raise
         except Exception:
             LOG.exception("Unexpected exception in polling — retry in %ds", backoff)
-            await asyncio.sleep(backoff)
+            await _sleep_or_stop(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SEC)
+    LOG.info("Остановлен по сигналу")
 
 
 async def main() -> None:
@@ -107,6 +152,10 @@ async def main() -> None:
 
     # Стартовое сообщение (best-effort, не блокирует запуск polling)
     asyncio.create_task(_try_startup_notify(bot, c.tg_chat_id))
+
+    # Сигналы берём на себя ДО запуска polling: иначе пауза между попытками
+    # остаётся неубиваемой.
+    _install_signal_handlers(dp)
 
     LOG.info("Polling... (session timeout=%ds, retry backoff=%d..%ds)",
              SESSION_TIMEOUT_SEC, INITIAL_BACKOFF_SEC, MAX_BACKOFF_SEC)
