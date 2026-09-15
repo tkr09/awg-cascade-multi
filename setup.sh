@@ -149,9 +149,9 @@ prompt "Подсеть клиентов [${CLIENT_NET}]: "; read_tty inp; [ -n "
 BOT_ENABLED=${BOT_ENABLED:-1}
 if [ "$BOT_ENABLED" = 1 ]; then
     if [ -z "${TG_TOKEN:-}" ]; then prompt "Telegram bot token: "; read_tty TG_TOKEN; fi
-    [ -n "$TG_TOKEN" ] || err "TG_TOKEN required"
+    [ -n "$TG_TOKEN" ] || err "Telegram bot token обязателен (или ставь с BOT_ENABLED=0)"
     if [ -z "${TG_CHAT_ID:-}" ]; then prompt "Telegram chat ID: "; read_tty TG_CHAT_ID; fi
-    [ -n "$TG_CHAT_ID" ] || err "TG_CHAT_ID required"
+    [ -n "$TG_CHAT_ID" ] || err "Telegram chat ID обязателен (или ставь с BOT_ENABLED=0)"
     if [ -z "${NTFY_TOPIC:-}" ]; then prompt "ntfy topic (optional): "; read_tty NTFY_TOPIC; fi
 else
     TG_TOKEN=""; TG_CHAT_ID=0; NTFY_TOPIC=""
