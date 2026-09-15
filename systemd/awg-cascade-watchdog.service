@@ -1,6 +1,8 @@
 [Unit]
 Description=AWG Cascade Multi — Watchdog (handshake/ping monitor + ECMP)
 After=network-online.target awg-quick@awg0.service awg-cascade-iptables.service
+Requires=awg-cascade-recover.service
+After=awg-cascade-recover.service
 Wants=network-online.target
 OnFailure=awg-cascade-alert@%n.service
 

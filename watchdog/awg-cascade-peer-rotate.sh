@@ -11,7 +11,11 @@
 # stdout: JSON {ok, name, ip, conf}
 # =============================================================================
 
-set -e
+set -eu
+umask 077
+if [ "${AWGC_TRANSACTION:-}" != 1 ]; then
+    exec /usr/bin/python3 -I /usr/local/sbin/awg-cascade-transaction.py peer-rotate "$@"
+fi
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
@@ -23,6 +27,7 @@ PEERS_JSON=/etc/awg-cascade/peers.json
 FLOCK=/etc/awg-cascade/state.lock
 
 NAME="${1:-}"
+[[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$ ]] || exit 2
 [ -z "$NAME" ] && { echo '{"ok":false,"error":"empty name"}'; exit 1; }
 
 # Новые ключи peer'а генерим ДО lock: это чистая энтропия, ни от чего не зависит
@@ -43,8 +48,8 @@ NEW_PSK=$(awg genpsk)
 #
 # Блокировка берётся на весь остаток скрипта (fd 200 живёт до выхода), поэтому
 # отдельный субшелл с flock ниже больше не нужен.
-exec 200>"$FLOCK"
-flock -x 200
+
+: # parent transaction holds state.lock
 
 # Текущий peer
 PEER=$(jq --arg n "$NAME" '.[] | select(.name==$n)' "$PEERS_JSON")
@@ -154,8 +159,8 @@ Endpoint = ${RU_PUBLIC_IP}:${PORT}
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
-    chmod 600 "$CLIENT_CONF"
-    chown "$BOT_USER:$BOT_USER" "$CLIENT_CONF"
+    chmod 640 "$CLIENT_CONF"
+    chown "root:$BOT_USER" "$CLIENT_CONF"
 
     # 5. Обновляем peers.json — новый pubkey
     TMP=$(mktemp)
@@ -163,8 +168,8 @@ EOF
        'map(if .name == $n then .pubkey = $pk | .rotated_at = $t else . end)' \
        "$PEERS_JSON" > "$TMP"
     mv "$TMP" "$PEERS_JSON"
-    chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
-    chmod 644 "$PEERS_JSON"
+    chown "root:$BOT_USER" "$PEERS_JSON"
+    chmod 640 "$PEERS_JSON"
 
     # Output
     jq -n --arg n "$NAME" --arg ip "$PEER_IP" --rawfile conf "$CLIENT_CONF" \

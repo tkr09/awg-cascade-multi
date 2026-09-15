@@ -21,7 +21,8 @@
 #   awg-cascade-exit-reserve.sh release <token>
 #   awg-cascade-exit-reserve.sh list
 # =============================================================================
-set -u
+set -euo pipefail
+umask 077
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
@@ -46,19 +47,20 @@ FLOCK=/etc/awg-cascade/state.lock
 : "${MAX_INDEX:=99}"
 
 _save() {  # <файл-с-новым-json>
-    chown "$BOT_USER:$BOT_USER" "$1" 2>/dev/null || true
-    chmod 644 "$1" 2>/dev/null || true
+    chown "root:$BOT_USER" "$1" 2>/dev/null || true
+    chmod 640 "$1" 2>/dev/null || true
     mv "$1" "$STATE"
 }
 
 _gc() {  # чистка протухших броней; вызывать под lock
-    local now tmp
+    local now tmp protected
+    protected=$(python3 -c 'import glob,json; print(json.dumps([json.load(open(p))["exit_index"] for p in glob.glob("/etc/awg-cascade/exits/.provision-*.json")]))') || return 1
     now=$(date +%s)
     tmp=$(mktemp)
-    jq --argjson now "$now" --argjson ttl "$RESERVE_TTL" \
+    jq --argjson now "$now" --argjson ttl "$RESERVE_TTL" --argjson protected "$protected" \
        '.exit_reservations = [ (.exit_reservations // [])[]
-                               | select((.at // 0) > ($now - $ttl)) ]' \
-       "$STATE" > "$tmp" && _save "$tmp" || rm -f "$tmp"
+                               | . as $lease | select((.at // 0) > ($now - $ttl) or ($protected | index($lease.index)) != null) ]' \
+       "$STATE" > "$tmp" && _save "$tmp" || { rm -f "$tmp"; return 1; }
 }
 
 case "${1:-}" in
@@ -81,7 +83,7 @@ acquire)
        '.exit_reservations = ((.exit_reservations // [])
                               + [{index: $i, token: $t, owner: $o, at: $now}])' \
        "$STATE" > "$TMP" || { rm -f "$TMP"; echo "jq не смог записать бронь" >&2; exit 1; }
-    _save "$TMP"
+    _save "$TMP" || { rm -f "$TMP"; echo "не удалось записать бронь" >&2; exit 1; }
     echo "$IDX $TOKEN"
     ;;
 release)
@@ -92,7 +94,7 @@ release)
     TMP=$(mktemp)
     jq --arg t "$TOKEN" \
        '.exit_reservations = [ (.exit_reservations // [])[] | select(.token != $t) ]' \
-       "$STATE" > "$TMP" && _save "$TMP" || rm -f "$TMP"
+       "$STATE" > "$TMP" && _save "$TMP" || { rm -f "$TMP"; exit 1; }
     ;;
 list)
     jq -r '(.exit_reservations // [])[] | "\(.index)\t\(.owner)\t\(.token)"' "$STATE" 2>/dev/null

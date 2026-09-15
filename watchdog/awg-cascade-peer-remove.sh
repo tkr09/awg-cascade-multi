@@ -2,7 +2,11 @@
 # Удаляет peer. Вызывается ботом через sudo.
 # argv: $1 = имя peer'а
 # Интерфейс берётся из peers.json (поле iface; старые записи без него — awg0).
-set -e
+set -eu
+umask 077
+if [ "${AWGC_TRANSACTION:-}" != 1 ]; then
+    exec /usr/bin/python3 -I /usr/local/sbin/awg-cascade-transaction.py peer-remove "$@"
+fi
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
@@ -12,14 +16,15 @@ PEERS_DIR=/etc/awg-cascade/peers
 PEERS_JSON=/etc/awg-cascade/peers.json
 
 NAME="${1:-}"
+[[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$ ]] || exit 2
 [ -z "$NAME" ] && { echo '{"error":"empty name"}'; exit 1; }
 
 # Общий замок каскада на всё «прочитать peers.json → поменять → записать»:
 # тот же, что берут peer-add.sh, peer-rotate.sh и бот. Без него параллельное
 # добавление пира между нашим чтением и записью терялось целиком.
 FLOCK=/etc/awg-cascade/state.lock
-exec 200>"$FLOCK"
-flock -x 200
+
+: # parent transaction holds state.lock
 
 PUBKEY=$(jq -r --arg n "$NAME" '.[] | select(.name==$n) | .pubkey' "$PEERS_JSON" 2>/dev/null)
 [ -z "$PUBKEY" ] || [ "$PUBKEY" = "null" ] && { echo "{\"error\":\"peer $NAME not found\"}"; exit 1; }
@@ -58,13 +63,13 @@ jq --arg n "$NAME" --arg ip "$PEER_IP" '
           then .lan_allow = (.lan_allow | map(select(. != $ip)))
           else . end)
 ' "$PEERS_JSON" > "$TMP" && mv "$TMP" "$PEERS_JSON"
-chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
-chmod 644 "$PEERS_JSON"
+chown "root:$BOT_USER" "$PEERS_JSON"
+chmod 640 "$PEERS_JSON"
 
-flock -u 200        # конец критической секции; interclient ниже замок не требует
+
 
 # 5. Переприменяем inter-client whitelist — снимает iptables-пары удалённого пира
 #    (RETURN/ACCEPT), иначе они живут до следующего boot/тоггла.
-[ -x /usr/local/sbin/awg-cascade-interclient.sh ] && /usr/local/sbin/awg-cascade-interclient.sh || true
+/usr/local/sbin/awg-cascade-interclient.sh
 
 echo "{\"ok\":true,\"name\":\"$NAME\",\"pubkey\":\"$PUBKEY\"}"

@@ -449,7 +449,7 @@ async def cb_peer_setpin(call: CallbackQuery) -> None:
     parts = call.data.split(":", 3)
     _, _, name, target = parts
     new_pin = None if target == "auto" else target
-    p = peer_update(name, pinned_exit=new_pin)
+    p = await peer_update(name, pinned_exit=new_pin)
     if not p:
         await call.message.edit_text("Peer не найден.")
         return
@@ -521,14 +521,16 @@ async def cb_peer_lan_toggle(call: CallbackQuery) -> None:
         allow.remove(dstip)
     else:
         allow.append(dstip)
-    p = peer_update(name, lan_allow=allow)
+    p = await peer_update(name, lan_allow=allow)
     if not p:
         await call.message.edit_text("Peer не найден.")
         return
     # Применяем iptables-правила inter-client из обновлённого peers.json
-    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-interclient.sh", timeout=15)
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-interclient.sh", timeout=120)
     if rc != 0:
         LOG.warning("interclient apply rc=%s err=%s", rc, (err or out)[:300])
+        await safe_edit_text(call.message, "❌ LAN-правила не применены. Трафик может быть заблокирован защитой; запустите doctor и повторите применение.")
+        return
     await safe_edit_text(
         call.message, _lan_text(name, p["ip"], allow),
         parse_mode="HTML", reply_markup=_lan_kb(name, allow),
@@ -570,7 +572,7 @@ async def fsm_peer_note(message: Message, state: FSMContext) -> None:
     text = text[:200]
     await state.clear()
 
-    p = peer_update(name, note=text)
+    p = await peer_update(name, note=text)
     if not p:
         await message.answer("Peer не найден")
         return
@@ -661,7 +663,7 @@ async def fsm_peer_name(message: Message, state: FSMContext) -> None:
     ver = "3.0 🛡" if iface != "awg0" else "2.0"
     await message.answer(f"⏳ Создаю peer <b>{name}</b> ({ver})...", parse_mode="HTML")
 
-    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-peer-add.sh", name, iface, timeout=15)
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-peer-add.sh", name, iface, timeout=300)
     if rc != 0:
         await message.answer(
             f"❌ Не удалось создать peer:\n<pre>{html_escape((err or out)[:500])}</pre>",
@@ -737,7 +739,7 @@ async def cb_peer_rotate_yes(call: CallbackQuery) -> None:
     )
 
     out, err, rc = await sudo_run(
-        "/usr/local/sbin/awg-cascade-peer-rotate.sh", name, timeout=15,
+        "/usr/local/sbin/awg-cascade-peer-rotate.sh", name, timeout=300,
     )
     if rc != 0:
         await call.message.answer(
@@ -798,7 +800,7 @@ async def cb_peer_rm(call: CallbackQuery) -> None:
 async def cb_peer_rm_yes(call: CallbackQuery) -> None:
     await call.answer("⏳")
     name = call.data[len("peer:rm-yes:"):]
-    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-peer-remove.sh", name, timeout=10)
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-peer-remove.sh", name, timeout=300)
     if rc != 0:
         await call.message.edit_text(
             f"❌ Не удалось удалить:\n<pre>{html_escape((err or out)[:500])}</pre>",

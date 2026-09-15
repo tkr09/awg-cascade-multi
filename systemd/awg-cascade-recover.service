@@ -1,0 +1,14 @@
+[Unit]
+Description=Recover interrupted AWG Cascade mutations
+After=local-fs.target network-online.target
+Before=awg-cascade-watchdog.service awg-cascade-bot.service
+ConditionPathExists=|/var/lib/awg-cascade/transaction/journal.json
+ConditionPathExists=|/var/lib/awg-cascade/peer-edit-pending.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awg-cascade-recover.sh
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

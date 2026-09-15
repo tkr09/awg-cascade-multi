@@ -28,7 +28,11 @@
 #   awg-cascade-sync.sh [ref]        — применить (re-deploy)
 #   awg-cascade-sync.sh --check [ref] — только показать дрейф (ничего не менять)
 # =============================================================================
-set -u
+set -uo pipefail
+umask 077
+[ "$EUID" -eq 0 ] || exit 1
+exec 9>/run/awg-cascade-sync.lock
+flock -w 30 -x 9 || exit 1
 REPO_URL="https://github.com/tkr09/awg-cascade-multi.git"
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
@@ -53,7 +57,7 @@ if [ -n "$REF" ]; then
     git checkout --quiet "$REF" 2>/dev/null || { echo "🔴 ref '$REF' не найден"; exit 1; }
 else
     REF=$(git describe --tags --abbrev=0 2>/dev/null || echo main)
-    git checkout --quiet "$REF" 2>/dev/null || true
+    git checkout --quiet "$REF" 2>/dev/null || exit 1
 fi
 VER=$(git describe --tags --always 2>/dev/null || echo "$REF")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
@@ -80,12 +84,12 @@ sync_file() {  # <src> <dst> <mode> [доп. аргументы install, нап�
     # Сравниваем не только содержимое, но и права с владельцем. Файл с верными
     # байтами и mode 777 или чужим владельцем — это тоже дрейф, а cmp его не
     # видит. Для приватных ключей и sudoers разница принципиальна.
-    local want_own="" cur_mode="" cur_own=""
+    local want_own="root" cur_mode="" cur_own=""
     case " $* " in *" -o "*) want_own=$(echo "$*" | sed -n 's/.*-o \([^ ]*\).*/\1/p') ;; esac
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
         cur_mode=$(stat -c '%a' "$dst" 2>/dev/null || echo "")
         cur_own=$(stat -c '%U' "$dst" 2>/dev/null || echo "")
-        if [ "$cur_mode" = "$mode" ] && { [ -z "$want_own" ] || [ "$cur_own" = "$want_own" ]; }; then
+        if [ "$cur_mode" = "$mode" ] && [ "$cur_own" = "$want_own" ] && [ "$(stat -c %G "$dst")" = root ]; then
             return 0
         fi
         drift=$(( drift + 1 ))
@@ -93,7 +97,8 @@ sync_file() {  # <src> <dst> <mode> [доп. аргументы install, нап�
             echo "  ДРЕЙФ ПРАВ: $dst (mode $cur_mode, владелец $cur_own; ожидалось $mode${want_own:+/$want_own})"
             return 0
         fi
-        install -m "$mode" "$@" "$src" "$dst" \
+        printf "%s %s\n" "$VER" "$(basename "$dst")" >> /etc/awg-cascade/activation-pending || { fail "pending marker write failed"; return; }
+        install -m "$mode" -o root -g root "$@" "$src" "$dst" \
             && echo "  права исправлены: $dst" \
             || fail "не удалось исправить права: $dst"
         return 0
@@ -103,7 +108,8 @@ sync_file() {  # <src> <dst> <mode> [доп. аргументы install, нап�
     if [ "$CHECK" = "1" ]; then
         echo "  ДРЕЙФ: $dst (отличается от репо $VER)"
     else
-        if install -m "$mode" "$@" "$src" "$dst"; then
+        printf "%s %s\n" "$VER" "$(basename "$dst")" >> /etc/awg-cascade/activation-pending || { fail "pending marker write failed"; return; }
+        if install -m "$mode" -o root -g root "$@" "$src" "$dst"; then
             echo "  обновлён: $dst"
             note_changed "$(basename "$dst")"
         else
@@ -113,7 +119,7 @@ sync_file() {  # <src> <dst> <mode> [доп. аргументы install, нап�
 }
 
 echo "=== helper-скрипты ==="
-for f in "$TMP"/repo/watchdog/awg-cascade-*.sh; do
+for f in "$TMP"/repo/watchdog/awg-cascade-*.sh "$TMP"/repo/watchdog/awg-cascade-*.py; do
     [ -e "$f" ] || continue
     sync_file "$f" "/usr/local/sbin/$(basename "$f")" 755
 done
@@ -132,7 +138,7 @@ for dst in /usr/local/sbin/awg-cascade-*.sh; do
     if [ "$CHECK" = "1" ]; then
         echo "  ОРФАН: $dst (нет в репо $VER)"
     else
-        rm -f "$dst" && echo "  удалён орфан: $dst"
+        rm -f "$dst" && echo "  удалён орфан: $dst" || fail "orphan removal failed: $dst"
     fi
 done
 
@@ -152,8 +158,7 @@ if [ ! -d "$BOT_DIR" ]; then
 else
     # Файлы бота принадлежат $BOT_USER. Если пользователя нет — ставим без chown,
     # иначе install упал бы и оборвал синк.
-    BOT_OWN=""
-    id "$BOT_USER" >/dev/null 2>&1 && BOT_OWN="-o $BOT_USER -g $BOT_USER"
+    BOT_OWN="-o root -g root"
     _bot_before=$drift
 
     for f in "$TMP"/repo/bot/*.py; do
@@ -185,6 +190,9 @@ else
     sync_file "$TMP/repo/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"      755 $BOT_OWN
     sync_file "$TMP/repo/watchdog/awg-cascade-ssh-harden.sh" "$BOT_DIR/scripts/awg-cascade-ssh-harden.sh"     755 $BOT_OWN
     sync_file "$TMP/repo/watchdog/awg-cascade-fail2ban.sh"   "$BOT_DIR/scripts/awg-cascade-fail2ban.sh"       755 $BOT_OWN
+    sync_file "$TMP/repo/watchdog/awg-cascade-cfg.sh" "$BOT_DIR/scripts/awg-cascade-cfg.sh" 755 $BOT_OWN
+    sync_file "$TMP/repo/watchdog/awg-cascade-autoreboot.sh" "$BOT_DIR/scripts/awg-cascade-autoreboot.sh" 755 $BOT_OWN
+    sync_file "$TMP/repo/watchdog/awg-cascade-reboot.py" "$BOT_DIR/scripts/awg-cascade-reboot.py" 755 $BOT_OWN
 
     # Орфаны в handlers/: удалённый из репо хендлер иначе останется на ноде вместе
     # со своим .pyc и продолжит импортироваться.
@@ -196,7 +204,7 @@ else
         if [ "$CHECK" = "1" ]; then
             echo "  ОРФАН: $dst (нет в репо $VER)"
         else
-            rm -f "$dst" && echo "  удалён орфан: $dst"
+            rm -f "$dst" && echo "  удалён орфан: $dst" || fail "orphan removal failed: $dst"
         fi
     done
 
@@ -216,7 +224,7 @@ done
 
 # Орфан-юниты: на ноде есть, в репо нет. Защищаем inline-генерируемые setup.sh
 # (iptables/iprule.service) — их в репо нет, но они критичны для boot.
-PROTECT_UNIT="awg-cascade-iptables.service awg-cascade-iprule.service"
+PROTECT_UNIT="awg-cascade-iptables.service awg-cascade-iprule.service awg-cascade-reboot.service awg-cascade-reboot.timer"
 for dst in /etc/systemd/system/awg-cascade-*.service /etc/systemd/system/awg-cascade-*.timer; do
     [ -e "$dst" ] || continue
     base=$(basename "$dst")
@@ -243,7 +251,25 @@ $BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg show *
 $BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl kill -s SIGUSR1 awg-cascade-watchdog
 # Helper'ы каскада. Wildcard по имени — чтобы не ловить рассинхрон при
 # добавлении нового helper'а; аргументы проверяет сам helper.
-$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-*.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-add.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-remove.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-rotate.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-add-ru.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-remove.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-reserve.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-provision.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-interclient.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-iptables.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-iprule.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-client3.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-client3-fw.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-awg3.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-state.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-selftest.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-doctor.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-alert.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-autoreboot.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-kernel-check.sh
 EOF
 if [ ! -f "$SUD" ] || ! cmp -s "$TMP/sud" "$SUD"; then
     drift=$(( drift + 1 ))
@@ -290,14 +316,14 @@ if [ -x /usr/local/sbin/awg-cascade-ssh-harden.sh ] \
    && ! /usr/local/sbin/awg-cascade-ssh-harden.sh --check >/dev/null 2>&1; then
     drift=$(( drift + 1 ))
     [ "$CHECK" = "1" ] && echo "  ДРЕЙФ: SSH разрешает вход по паролю" \
-        || { /usr/local/sbin/awg-cascade-ssh-harden.sh | sed 's/^/  /'; }
+        || { /usr/local/sbin/awg-cascade-ssh-harden.sh | sed 's/^/  /' || fail "SSH hardening failed"; }
 fi
 # авто-ребут после unattended-upgrades (окно из AUTO_REBOOT_HOUR в config)
 if [ -x /usr/local/sbin/awg-cascade-autoreboot.sh ] \
    && ! /usr/local/sbin/awg-cascade-autoreboot.sh --check >/dev/null 2>&1; then
     drift=$(( drift + 1 ))
     [ "$CHECK" = "1" ] && echo "  ДРЕЙФ: auto-reboot окно не настроено (AUTO_REBOOT_HOUR)" \
-        || { /usr/local/sbin/awg-cascade-autoreboot.sh | sed 's/^/  /'; }
+        || { /usr/local/sbin/awg-cascade-autoreboot.sh | sed 's/^/  /' || fail "reboot policy failed"; }
 fi
 # SSH-login pam hook
 if ! grep -q "awg-cascade-ssh-alert" /etc/pam.d/sshd 2>/dev/null; then
@@ -311,6 +337,16 @@ fi
 SCOPE="helper-скрипты, systemd-юниты и таймеры, sudoers, код бота и scripts/"
 UNCHECKED="setup.sh, inline-генерируемый iprule.service, venv, ключи и значения config"
 
+if [ -s /etc/awg-cascade/activation-pending ]; then
+    drift=$((drift + 1))
+    echo "  PENDING: runtime activation required"
+fi
+for t in "$TMP"/repo/systemd/awg-cascade-*.timer; do
+    [ -e "$t" ] || continue
+    if ! systemctl is-enabled "$(basename "$t")" >/dev/null 2>&1 || ! systemctl is-active --quiet "$(basename "$t")"; then
+        drift=$((drift + 1)); echo "  TIMER INACTIVE: $(basename "$t")"
+    fi
+done
 if [ "$CHECK" = "1" ]; then
     echo "─────────────────────────────"
     echo "   проверено:     $SCOPE"
@@ -318,7 +354,7 @@ if [ "$CHECK" = "1" ]; then
     if [ "$drift" -eq 0 ]; then echo "✅ Дрейфа нет — проверяемая область соответствует репо $VER"; exit 0
     else echo "⚠️ Найдено расхождений: $drift (репо $VER). Применить: awg-cascade-sync.sh $REF"; exit 2; fi
 else
-    [ "$units_changed" = "1" ] && { systemctl daemon-reload; echo "  systemctl daemon-reload"; }
+    [ "$units_changed" = "1" ] && { systemctl daemon-reload || fail "daemon-reload failed"; echo "  systemctl daemon-reload"; }
     # Таймеры надо не только положить, но и включить — иначе файл на месте, а
     # бэкапов нет, и это самый неприятный вид тишины.
     # Проверяем is-enabled И is-active. Раньше при enabled-но-остановленном
@@ -336,7 +372,8 @@ else
             fail "таймер не запустился: $tb (systemctl status $tb)"
         fi
     done
-    if [ "$bot_changed" = "1" ]; then
+    /usr/local/sbin/awg-cascade-permissions.sh || fail "ownership migration failed"
+    if [ "${BOT_ENABLED:-1}" = 1 ] && [ "$bot_changed" = "1" ] && [ "$req_changed" = 0 ] && [ "$errors" = 0 ]; then
         # Устаревший .pyc может пережить замену .py — чистим кеш перед рестартом.
         find "$BOT_DIR" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
         # Мало запустить — надо убедиться, что он остался жив. Бот, упавший на
@@ -375,44 +412,31 @@ else
     # version-stamp писался новый. Нода отчитывалась о версии, которой в runtime
     # на ней не было. Это ровно тот способ, которым «репо = прод» расходится
     # снова, только уже незаметно.
-    case " $CHANGED " in
-        *" awg-cascade-watchdog.sh "*)
-            # Перезапуск watchdog обратим и клиентского трафика не трогает.
-            if systemctl restart awg-cascade-watchdog 2>/dev/null; then
-                sleep 2
-                if systemctl is-active --quiet awg-cascade-watchdog; then
-                    echo "  watchdog перезапущен (код изменился)"
-                else
-                    fail "watchdog не поднялся после обновления кода"
-                fi
-            else
-                fail "watchdog не перезапустился"
-            fi
-            ;;
-    esac
+    if [ "$errors" -gt 0 ]; then echo "Активация не прошла — версия не изменена" >&2; exit 1; fi
 
     # Firewall и policy routing автоматически НЕ переприменяем: это данные-путь,
     # решение принимает оператор. Но и молчать нельзя — иначе новые правила лежат
     # файлом и не действуют до перезагрузки, а stamp уже новый.
     ACTIVATION=""
-    for _c in awg-cascade-iptables.sh awg-cascade-client3-fw.sh               awg-cascade-interclient.sh awg-cascade-iprule.sh; do
+    for _c in awg-cascade-iptables.sh awg-cascade-client3-fw.sh               awg-cascade-interclient.sh awg-cascade-iprule.sh awg-cascade-firewall.py awg-cascade-routing.py awg-cascade-watchdog.sh; do
         case " $CHANGED " in *" $_c "*) ACTIVATION="$ACTIVATION $_c" ;; esac
     done
     if [ -n "$ACTIVATION" ]; then
         mkdir -p /etc/awg-cascade
-        echo "$VER$ACTIVATION" > /etc/awg-cascade/activation-pending
-    else
-        rm -f /etc/awg-cascade/activation-pending 2>/dev/null || true
+        echo "$VER$ACTIVATION" >> /etc/awg-cascade/activation-pending
     fi
 
-    printf '%s %s %s\n' "$VER" "$COMMIT" "$(date -Iseconds)" > /etc/awg-cascade/version
+    [ "$errors" -eq 0 ] || exit 1
+    printf '%s %s %s\n' "$VER" "$COMMIT" "$(date -Iseconds)" > /etc/awg-cascade/.installed-version.new || exit 1
+    mv /etc/awg-cascade/.installed-version.new /etc/awg-cascade/installed-version || exit 1
+    install -m 640 -o root -g "$BOT_USER" /etc/awg-cascade/installed-version /etc/awg-cascade/version || exit 1
     echo "✅ Синхронизировано с $VER ($COMMIT). Изменений: $drift. version-stamp обновлён."
     echo "   проверено:     $SCOPE"
     echo "   вне проверки:  $UNCHECKED"
     if [ "$req_changed" = "1" ]; then
         echo "  ⚠️ requirements.txt изменился, но venv НЕ обновлён автоматически:"
         echo "     новая версия зависимости может сломать работающего бота. Вручную:"
-        echo "       sudo -u $BOT_USER $BOT_DIR/venv/bin/pip install -r $BOT_DIR/requirements.txt"
+        echo "       /usr/local/sbin/awg-cascade-activate.sh"
         echo "       sudo systemctl restart awg-cascade-bot"
     fi
     if [ -n "${ACTIVATION:-}" ]; then
@@ -420,7 +444,7 @@ else
         echo "⚠️  ТРЕБУЕТСЯ АКТИВАЦИЯ. Обновлены, но НЕ применены:$ACTIVATION"
         echo "    Новые правила лежат файлами и вступят в силу при следующей загрузке."
         echo "    Применить сейчас (кратко прервёт клиентский трафик):"
-        echo "      sudo /usr/local/sbin/awg-cascade-iptables.sh"
+        echo "      sudo /usr/local/sbin/awg-cascade-activate.sh"
         echo "    Отметка сохранена в /etc/awg-cascade/activation-pending."
     fi
     # Без явного exit 0 скрипт возвращал rc=1 при drift=0 (последней командой

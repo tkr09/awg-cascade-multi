@@ -7,7 +7,11 @@
 # и опциональный CLIENT3_IFACE (3.0 — header protection + padding, требует
 # клиента 3.x). Параметры обфускации у них РАЗНЫЕ, поэтому всё, что попадает в
 # клиентский конфиг, читается из конфига именно того интерфейса.
-set -e
+set -eu
+umask 077
+if [ "${AWGC_TRANSACTION:-}" != 1 ]; then
+    exec /usr/bin/python3 -I /usr/local/sbin/awg-cascade-transaction.py peer-add "$@"
+fi
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
@@ -18,9 +22,7 @@ PEERS_JSON=/etc/awg-cascade/peers.json
 
 NAME="${1:-}"
 IFACE="${2:-awg0}"
-[ -z "$NAME" ] && { echo '{"error":"empty name"}'; exit 1; }
-[ -n "$(echo "$NAME" | tr -cd 'a-zA-Z0-9._-')" ] || { echo '{"error":"invalid name"}'; exit 1; }
-NAME=$(echo "$NAME" | tr -cd 'a-zA-Z0-9._-')
+[[ "$NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$ ]] || { echo '{"error":"invalid name"}'; exit 2; }
 
 # ─── Выбор интерфейса ────────────────────────────────────────────────────────
 if [ "$IFACE" = "awg0" ]; then
@@ -45,8 +47,8 @@ WG_CONF="/etc/amnezia/amneziawg/${IFACE}.conf"
 # интерфейса оставались два пира с одинаковым AllowedIPs.
 # Держим замок меньше секунды, watchdog за это время лишь пропустит один тик.
 FLOCK=/etc/awg-cascade/state.lock
-exec 200>"$FLOCK"
-flock -x 200
+
+: # parent transaction holds state.lock
 
 # Не дублируем (имена глобальны — по обоим интерфейсам)
 if [ -f "$PEERS_JSON" ] && jq -e --arg n "$NAME" 'map(.name) | index($n)' "$PEERS_JSON" >/dev/null 2>&1; then
@@ -156,8 +158,8 @@ Endpoint = ${RU_PUBLIC_IP}:${PORT}
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
-chmod 600 "$CLIENT_CONF"
-chown "$BOT_USER:$BOT_USER" "$CLIENT_CONF"
+chmod 640 "$CLIENT_CONF"
+chown "root:$BOT_USER" "$CLIENT_CONF"
 
 # 4. peers.json
 [ -f "$PEERS_JSON" ] || echo "[]" > "$PEERS_JSON"
@@ -165,10 +167,10 @@ TMP=$(mktemp)
 jq --arg n "$NAME" --arg ip "$PEER_IP" --arg pk "$PUBKEY" --arg if "$IFACE" \
    '. + [{name: $n, ip: $ip, pubkey: $pk, iface: $if, created: now|todate, note: "", pinned_exit: null}]' \
    "$PEERS_JSON" > "$TMP" && mv "$TMP" "$PEERS_JSON"
-chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
-chmod 644 "$PEERS_JSON"
+chown "root:$BOT_USER" "$PEERS_JSON"
+chmod 640 "$PEERS_JSON"
 
-flock -u 200        # конец критической секции
+
 
 # 5. Output JSON для бота
 jq -n \

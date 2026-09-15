@@ -281,7 +281,7 @@ async def fsm_note_text(message: Message, state: FSMContext) -> None:
         text = ""
     await state.clear()
 
-    with state_locked() as st:
+    async with state_locked() as st:
         e = _get_exit(st, iface)
         if e:
             e["note"] = text[:200]
@@ -330,7 +330,7 @@ async def fsm_rename(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
 
-    with state_locked() as st:
+    async with state_locked() as st:
         e = _get_exit(st, iface)
         if e:
             e["name"] = new_name
@@ -408,7 +408,7 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
             exit_obj.pop("warp_exit_ip", None)
             exit_obj.pop("warp_exit_geo", None)
 
-    with state_locked() as fresh:
+    async with state_locked() as fresh:
         fresh_e = _get_exit(fresh, iface)
         if fresh_e is not None:
             _apply(fresh_e)
@@ -589,7 +589,7 @@ async def cb_exit_rm_yes(call: CallbackQuery) -> None:
 
     # 1. RU-side: down awgN, rm conf/keys, убрать из state, пересобрать ECMP.
     out, err, rc = await sudo_run(
-        "/usr/local/sbin/awg-cascade-exit-remove.sh", iface, timeout=20,
+        "/usr/local/sbin/awg-cascade-exit-remove.sh", iface, timeout=300,
     )
     if rc != 0:
         await safe_edit_text(
@@ -845,7 +845,7 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
             "добавляйте заново: только так снимется пин его host-key."
         )
         return
-    dropped = host_key_forget(ip)
+    dropped = await asyncio.to_thread(host_key_forget, ip)
     if dropped:
         LOG.info("addexit: снят прежний host-key пин для %s", ip)
 
@@ -858,216 +858,33 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
             await update_status(f"❌ Не удалось залогиниться:\n<pre>{err[:300]}</pre>")
             return
 
-    # 2. Резервируем EXIT_INDEX атомарно, а не «берём свободный из снимка».
-    #
-    # Снимок state.json читался здесь, а использовался после provisioning —
-    # то есть через десять минут. Резервирования не было, FSM очищается сразу,
-    # поэтому два добавления, запущенные кнопками подряд, получали ОДИН индекс:
-    # второе переписывало ключи и конфиг первого и опускало уже поднятый туннель.
-    # Теперь индекс выдаётся под общей блокировкой вместе с токеном брони,
-    # который exit-add-ru.sh проверит перед тем, как что-то менять на RU.
-    r_out, r_err, r_rc = await sudo_run(
-        "/usr/local/sbin/awg-cascade-exit-reserve.sh", "acquire",
-        f"bot:{name}", timeout=20,
-    )
-    if r_rc != 0 or not r_out.strip():
-        await update_status(
-            "❌ Не удалось зарезервировать индекс exit'а:\n"
-            f"<pre>{html_escape((r_err or r_out)[:300])}</pre>"
-        )
+    # CLI and bot share one root-owned, resumable engine. No secrets in argv.
+    await update_status("SSH доступ готов. Устанавливаю exit; повтор с тем же IP и именем продолжит прерванную операцию.")
+    out, err, rc = await sudo_run("/usr/local/sbin/awg-cascade-provision.sh", ip, name, timeout=3300)
+    # rc == 2 — особый исход: exit настроен, добавлен и работает, не
+    # подтвердилась только его перезагрузка в новое ядро. Повторять
+    # провижининг в этом случае нельзя: он уже сделан.
+    if rc not in (0, 2):
+        await update_status("❌ Установка не завершена. Повторите добавление с тем же IP и именем.\n<pre>" + html_escape(err[:400]) + "</pre>")
         return
-    try:
-        _idx_s, RESERVE_TOKEN = r_out.strip().split()
-        EXIT_INDEX = int(_idx_s)
-    except ValueError:
-        await update_status(f"❌ Непонятный ответ брони: <pre>{html_escape(r_out[:200])}</pre>")
-        return
-
-    async def release_reserve() -> None:
-        """Отпустить бронь на любом пути неуспеха.
-
-        Без этого оборванное добавление держит индекс до истечения TTL (45 мин),
-        и повторная попытка получает СЛЕДУЮЩИЙ индекс — в state постепенно
-        появляются дыры, а awgN перестаёт соответствовать порядку добавления.
-        """
-        with contextlib.suppress(Exception):
-            await sudo_run("/usr/local/sbin/awg-cascade-exit-reserve.sh",
-                           "release", RESERVE_TOKEN, timeout=15)
-
-    # 3. Генерим RU-side ключи для awg<EXIT_INDEX>
-    proc = await asyncio.create_subprocess_exec(
-        "/usr/bin/awg", "genkey",
-        stdout=asyncio.subprocess.PIPE,
-    )
-    out, _ = await proc.communicate()
-    ru_privkey = out.decode().strip()
-
-    # Приватный ключ подаём в stdin, а НЕ через `echo '<key>' | awg pubkey` в шелле:
-    # аргументы команды видны в /proc, то есть ключ утекал в вывод `ps` любому
-    # локальному пользователю на время выполнения.
-    proc = await asyncio.create_subprocess_exec(
-        "/usr/bin/awg", "pubkey",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-    )
-    out, _ = await proc.communicate(ru_privkey.encode())
-    ru_pubkey = out.decode().strip()
-
-    proc = await asyncio.create_subprocess_exec(
-        "/usr/bin/awg", "genpsk",
-        stdout=asyncio.subprocess.PIPE,
-    )
-    out, _ = await proc.communicate()
-    ru_psk = out.decode().strip()
-
-    await update_status(
-        f"1/6 ✓ SSH доступ есть\n"
-        f"2/6 ✓ Индекс exit: <b>{EXIT_INDEX}</b>\n"
-        f"3/6 ✓ Ключи RU-стороны сгенерены\n"
-        f"4/6 Заливаю setup-exit.sh и провижу exit-side..."
-    )
-
-    # 4. Заливаем setup-exit.sh + awg2-params.sh + warp helper на exit и запускаем
-    setup_path = Path("/opt/awg-cascade-bot/scripts/setup-exit.sh")
-    awg2_params_path = Path("/opt/awg-cascade-bot/scripts/awg2-params.sh")
-    warp_helper_path = Path("/opt/awg-cascade-bot/scripts/awg-cascade-exit-warp.sh")
-    f2b_path = Path("/opt/awg-cascade-bot/scripts/awg-cascade-fail2ban.sh")
-    ssh_harden_path = Path("/opt/awg-cascade-bot/scripts/awg-cascade-ssh-harden.sh")
-    if not setup_path.exists():
-        await update_status(f"❌ Не найден {setup_path}. Бот не может запровижить exit.")
-        await release_reserve()
-        return
-    if not awg2_params_path.exists():
-        await update_status(f"❌ Не найден {awg2_params_path}. v2.0 generator отсутствует.")
-        await release_reserve()
-        return
-
-    # Копируем через scp через SSH (asyncssh умеет copy)
-    import asyncssh as _asyncssh
-    try:
-        # known_hosts НЕ None. Через это соединение на exit уезжают RU_PSK и
-        # блок provisioning, а прежний код отключал проверку ключа целиком —
-        # даже когда предыдущее соединение (ssh_copy_id) хост уже запомнило.
-        # Пин есть — сверяемся по нему; нет — первый контакт, запомним после.
-        _pinned = host_key_known(ip, 22)
-        async with _asyncssh.connect(
-            ip, username="root", client_keys=[str(SSH_KEY)],
-            known_hosts=str(KNOWN_HOSTS_PATH) if _pinned else None,
-            connect_timeout=15,
-        ) as conn:
-            if not _pinned:
-                _host_key_remember(ip, 22, conn.get_server_host_key())
-            await _asyncssh.scp(str(setup_path), (conn, "/root/setup-exit.sh"))
-            await _asyncssh.scp(str(awg2_params_path), (conn, "/tmp/awg2-params.sh"))
-            if warp_helper_path.exists():
-                await _asyncssh.scp(str(warp_helper_path), (conn, "/tmp/awg-cascade-exit-warp.sh"))
-            if f2b_path.exists():
-                await _asyncssh.scp(str(f2b_path), (conn, "/tmp/awg-cascade-fail2ban.sh"))
-            # Наш ключ уже лежит в authorized_keys — setup-exit.sh закроет вход
-            # по паролю, иначе свежий exit сразу тонет в SSH-брутфорсе.
-            if ssh_harden_path.exists():
-                await _asyncssh.scp(str(ssh_harden_path), (conn, "/tmp/awg-cascade-ssh-harden.sh"))
-            cmd = (
-                f"chmod +x /root/setup-exit.sh && "
-                f"BATCH=1 "
-                f"EXIT_INDEX={EXIT_INDEX} "
-                # Предпочитаемый tunnel-октет для SHARED-режима = 100+EXIT_INDEX.
-                # Уникален среди интерфейсов этого RU → нет коллизии awgN Address.
-                f"RU_TUNNEL_OCTET={100 + EXIT_INDEX} "
-                f"RU_PUBLIC_IP={cfg().ru_public_ip} "
-                f"RU_PUBKEY='{ru_pubkey}' "
-                f"RU_PSK='{ru_psk}' "
-                f"bash /root/setup-exit.sh"
-            )
-            # 2400 sec = 40 min. На fresh Ubuntu VPS первые 5-10 мин держится
-            # apt-lock от unattended-upgrades (setup-exit.sh ждёт через
-            # wait_apt_lock). Плюс компиляция amneziawg-dkms кушает ещё 2-3 мин.
-            # Было 900; поднято в v2.2.1 setup-exit.sh сначала приводит образ к
-            # актуальному состоянию (apt upgrade), и на отставшем образе это
-            # несколько минут сверху. Поднято снова в v2.5.1: на чистой ноде
-            # идёт dist-upgrade вместе с ядром — на свежем образе HOSTKEY это
-            # 413 пакетов, пересборка initramfs и сборка DKMS под ДВА ядра.
-            # Запас нужен, иначе провижининг обрывается на середине — с уже
-            # настроенным сервером и без JSON для RU.
-            result = await asyncio.wait_for(conn.run(cmd, check=False), timeout=2400)
-            stdout_text = result.stdout if isinstance(result.stdout, str) else \
-                          (result.stdout.decode() if result.stdout else "")
-            stderr_text = result.stderr if isinstance(result.stderr, str) else \
-                          (result.stderr.decode() if result.stderr else "")
-            rc = result.exit_status or 0
-
-            if rc != 0:
-                await update_status(
-                    f"❌ setup-exit.sh exit_code={rc}:\n<pre>"
-                    f"{html_escape((stderr_text or stdout_text)[-500:])}</pre>"
-                )
-                await release_reserve()
-                return
-
-            # 5. Парсим JSON из stdout setup-exit.sh. Все логи скрипт шлёт в
-            #    stderr, на stdout — только итоговый JSON. В SHARED-режиме info
-            #    пишется в per-interface файл (info-awg-in-N.json), которого нет
-            #    по фиксированному пути info.json — поэтому cat фиксированного
-            #    пути давал ЧУЖОЙ primary info (баг: awg<N> коннектился не туда).
-            m = re.search(r"\{.*\}", stdout_text, re.DOTALL)
-            if not m:
-                await update_status(
-                    f"❌ Не нашёл JSON в выводе setup-exit.sh:\n"
-                    f"<pre>{html_escape(stdout_text[-400:])}</pre>"
-                )
-                await release_reserve()
-                return
-            try:
-                exit_info = json.loads(m.group(0))
-            except json.JSONDecodeError as e:
-                await update_status(
-                    f"❌ info JSON невалиден: {e}\n<pre>{html_escape(m.group(0)[:400])}</pre>"
-                )
-                await release_reserve()
-                return
-    except Exception as e:
-        await update_status(f"❌ Ошибка SSH/scp: {html_escape(str(e))}")
-        await release_reserve()
-        return
-
-    await update_status(
-        f"1/6 ✓ SSH\n"
-        f"2/6 ✓ Index {EXIT_INDEX}\n"
-        f"3/6 ✓ Keys\n"
-        f"4/6 ✓ Exit provisioned\n"
-        f"5/6 Поднимаю awg{EXIT_INDEX} на RU..."
-    )
-
-    # 6. Создаём awg<N>.conf на RU и поднимаем (через helper-скрипт)
-    helper_args = json.dumps({
-        "exit_index": EXIT_INDEX,
-        "reserve_token": RESERVE_TOKEN,
-        "name": name,
-        "ru_privkey": ru_privkey,
-        "ru_pubkey": ru_pubkey,
-        "ru_psk": ru_psk,
-        "exit_info": exit_info,
-    })
-    # helper_args содержит ru_privkey и ru_psk — передаём через stdin, не argv.
-    out, err, rc = await sudo_run(
-        "/usr/local/sbin/awg-cascade-exit-add-ru.sh", "-",
-        timeout=30, stdin_data=helper_args,
-    )
-    if rc != 0:
-        await release_reserve()
-        await update_status(f"❌ RU-side setup failed:\n<pre>{(err or out)[:400]}</pre>")
-        return
+    provision = json.loads(out)
+    EXIT_INDEX = provision["index"]
+    reboot_note = ""
+    if rc == 2:
+        reboot_note = ("\n\n⚠️ Перезагрузка exit не подтверждена: "
+                       + html_escape(str(provision.get("reboot", "?")))
+                       + "\nПровижининг НЕ повторять — проверьте сам сервер.")
 
     flag2 = name_to_flag(name)
     await update_status(
         f"1/6 ✓ SSH\n"
         f"2/6 ✓ Index {EXIT_INDEX}\n"
         f"3/6 ✓ Keys\n"
-        f"4/6 ✓ Exit provisioned\n"
+        f"4/6 ✓ Exit настроен\n"
         f"5/6 ✓ awg{EXIT_INDEX} up на RU\n"
         f"6/6 ✓ Добавлен в state.json\n\n"
         f"✅ {flag2} <b>{name}</b> готов!\n"
-        f"Через ~5 сек watchdog подхватит и добавит в ECMP."
+        f"Через ~5 сек watchdog подхватит и добавит в ECMP." + reboot_note
     )
 
     # Финальное отдельное сообщение со списком (не edit чтобы tracker остался виден)

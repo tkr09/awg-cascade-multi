@@ -12,7 +12,11 @@
 #   "ru_psk":     "...",
 #   "exit_info":  { ... } // вывод setup-exit.sh JSON
 # }
-set -e
+set -eu
+umask 077
+if [ "${AWGC_TRANSACTION:-}" != 1 ]; then
+    exec /usr/bin/python3 -I /usr/local/sbin/awg-cascade-transaction.py exit-add-ru "$@"
+fi
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
@@ -34,6 +38,7 @@ else
 fi
 [ -z "$ARGS" ] && { echo '{"error":"empty args"}'; exit 1; }
 
+printf '%s\n' "$ARGS" | /usr/bin/python3 -I /usr/local/sbin/awg-cascade-control.py validate-exit
 EXIT_INDEX=$(echo "$ARGS" | jq -r .exit_index)
 RESERVE_TOKEN=$(echo "$ARGS" | jq -r '.reserve_token // empty')
 
@@ -86,8 +91,8 @@ IFACE="awg${EXIT_INDEX}"
 # Блокировка берётся на весь остаток скрипта (fd 200 живёт до выхода): операция
 # короткая, вся сетевая часть уже выполнена ботом на стороне exit'а.
 FLOCK=/etc/awg-cascade/state.lock
-exec 200>"$FLOCK"
-flock -x 200
+
+: # parent transaction holds state.lock
 
 if jq -e --argjson i "$EXIT_INDEX" 'any((.exits // [])[]; .index == $i)' "$STATE" >/dev/null 2>&1; then
     printf '{"error":"exit_index %s уже занят — ничего не меняю"}
@@ -103,15 +108,10 @@ fi
 # Поэтому отказываем только когда индекс ДЕЙСТВИТЕЛЬНО занят: он либо уже у
 # другого exit'а (проверено выше), либо забронирован ЧУЖИМ токеном. Свою
 # пропавшую бронь отмечаем предупреждением и идём дальше.
-if [ -n "$RESERVE_TOKEN" ]; then
-    if ! jq -e --arg t "$RESERVE_TOKEN" --argjson i "$EXIT_INDEX" 'any((.exit_reservations // [])[]; .token == $t and .index == $i)' "$STATE" >/dev/null 2>&1; then
-        if jq -e --argjson i "$EXIT_INDEX" 'any((.exit_reservations // [])[]; .index == $i)' "$STATE" >/dev/null 2>&1; then
-            printf '{"error":"индекс %s забронирован другой операцией — ничего не меняю"}
-' "$EXIT_INDEX" >&2
-            exit 1
-        fi
-        echo "ВНИМАНИЕ: своя бронь на индекс $EXIT_INDEX не найдена, но индекс свободен — продолжаю" >&2
-    fi
+# Any lease at this index must match, including a caller with no token.
+if jq -e --arg t "$RESERVE_TOKEN" --argjson i "$EXIT_INDEX" \
+    'any((.exit_reservations // [])[]; .index == $i and .token != $t)' "$STATE" >/dev/null; then
+    echo '{"error":"index reserved by another operation"}' >&2; exit 1
 fi
 # Интерфейс уже поднят, а в state его нет — индекс переиспользуют в обход
 # state.json. Останавливаемся, а не переписываем чужой туннель.
@@ -211,8 +211,8 @@ FLOCK=/etc/awg-cascade/state.lock
         | .exit_reservations = [ (.exit_reservations // [])[] | select(.token != $t) ]
         | .last_update = (now|todate)' "$STATE" > "$TMP"
     mv "$TMP" "$STATE"
-    chown "$BOT_USER:$BOT_USER" "$STATE"
-    chmod 644 "$STATE"
+    chown "root:$BOT_USER" "$STATE"
+    chmod 640 "$STATE"
 )
 
 # Список доверенных адресов fail2ban на RU строится из state.json и потому

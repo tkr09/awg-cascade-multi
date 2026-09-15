@@ -22,7 +22,8 @@
 #   awg-cascade-ssh-harden.sh --status   — показать состояние
 #   awg-cascade-ssh-harden.sh --force   — применить даже без ключей (ОПАСНО)
 # =============================================================================
-set -u
+set -euo pipefail
+umask 077
 DROPIN=/etc/ssh/sshd_config.d/99-awg-cascade-hardening.conf
 MODE="${1:-}"
 
@@ -67,7 +68,7 @@ if [ "$MODE" = "--status" ]; then
 fi
 
 if [ "$MODE" = "--check" ]; then
-    [ "$(eff passwordauthentication)" = "no" ] && exit 0 || exit 1
+    sshd -t && [ "$(eff passwordauthentication)" = "no" ] && [ "$(eff kbdinteractiveauthentication)" = "no" ] && exit 0 || exit 1
 fi
 
 KEYS=$(count_keys)
@@ -81,12 +82,39 @@ if [ "$KEYS" -lt 1 ] && [ "$MODE" != "--force" ]; then
     exit 2
 fi
 
+# Snapshot every configuration file before editing; restore on any failure.
+exec 9>/run/awg-cascade-ssh-harden.lock
+flock -w 30 -x 9
+BACKUP=$(mktemp -d /etc/ssh/.awg-hardening.XXXXXX)
+cp -a /etc/ssh/sshd_config "$BACKUP/main"
+cp -a /etc/ssh/sshd_config.d "$BACKUP/dropins"
+COMMITTED=0
+restore_ssh() {
+    local rc=$?
+    trap - EXIT
+    if [ "$COMMITTED" != 1 ]; then
+        cp -a "$BACKUP/main" /etc/ssh/sshd_config || rc=1
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+            [ -e "$BACKUP/dropins/$(basename "$f")" ] || rm -f "$f"
+        done
+        cp -a "$BACKUP/dropins/." /etc/ssh/sshd_config.d/ || rc=1
+        sshd -t && { systemctl reload ssh || systemctl reload sshd; } || rc=1
+        echo "SSH changes rolled back; backup: $BACKUP" >&2
+    else
+        rm -rf "$BACKUP"
+    fi
+    exit "$rc"
+}
+trap restore_ssh EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
 # 1. drop-in'ы, которые явно разрешают пароль (в первую очередь cloud-init)
 for f in /etc/ssh/sshd_config.d/*.conf; do
     [ -e "$f" ] || continue
     [ "$f" = "$DROPIN" ] && continue
     if grep -qE '^\s*PasswordAuthentication\s+yes' "$f"; then
-        cp -a "$f" "$f.awgbak" 2>/dev/null
+        cp -a "$f" "$f.awgbak"
         sed -i 's/^\s*PasswordAuthentication.*/PasswordAuthentication no/' "$f"
         echo "  поправлен drop-in: $f"
     fi
@@ -106,16 +134,10 @@ PermitEmptyPasswords no
 EOF
 chmod 644 "$DROPIN"
 
-# 4. применяем только если конфиг валиден; reload не рвёт активные сессии
-if sshd -t 2>/dev/null; then
-    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-    sleep 1
-    if [ "$(eff passwordauthentication)" = "no" ]; then
-        echo "  ✅ вход по паролю отключён (ключей в authorized_keys: $KEYS)"
-    else
-        echo "  ⚠ применилось не полностью — проверь: sshd -T | grep passwordauth"
-    fi
-else
-    echo "  🔴 sshd -t не прошёл — откатываю свой drop-in, конфиг не тронут"
-    rm -f "$DROPIN"
-fi
+# sshd uses the first obtained value; verify the effective result, not file order.
+sshd -t
+[ "$(eff passwordauthentication)" = no ]
+[ "$(eff kbdinteractiveauthentication)" = no ]
+systemctl reload ssh || systemctl reload sshd
+COMMITTED=1
+echo "SSH password authentication disabled; reload verified"

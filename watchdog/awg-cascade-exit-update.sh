@@ -25,7 +25,10 @@
 #     --check  только показать расхождение, ничего не менять
 #     --os     дополнительно apt-get upgrade на exit'е (без перезапуска сервисов)
 # =============================================================================
-set -u
+set -uo pipefail
+umask 077
+exec 9>/run/awg-cascade-exit-update.lock
+flock -w 30 -x 9 || exit 1
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
@@ -36,8 +39,8 @@ set -u
 STATE=/etc/awg-cascade/state.json
 BOT_SCRIPTS="/opt/awg-cascade-bot/scripts"
 SSH_KEY=/etc/awg-cascade/ssh/id_ed25519
-KNOWN_HOSTS=/etc/awg-cascade/known_hosts
-SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=15 -o BatchMode=yes"
+KNOWN_HOSTS=/etc/awg-cascade/ssh/known_hosts
+SSH_OPTS="-F /dev/null -o IdentitiesOnly=yes -o IdentityAgent=none -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=15 -o BatchMode=yes"
 
 TARGET="${1:-}"
 [ -z "$TARGET" ] && { echo "usage: $0 <awgN|IP|all> [--check] [--os]" >&2; exit 1; }
@@ -61,7 +64,7 @@ done
 # вовсе — например, awg-cascade-autoreboot.sh там есть, и без парсера он
 # молча не прочитал бы AUTO_REBOOT, то есть exit перестал бы сам
 # перезагружаться после обновления ядра.
-BUNDLE="awg-cascade-cfg.sh awg-cascade-exit-warp.sh awg-cascade-fail2ban.sh awg-cascade-ssh-harden.sh awg-cascade-autoreboot.sh setup-exit.sh awg2-params.sh"
+BUNDLE="awg-cascade-cfg.sh awg-cascade-exit-warp.sh awg-cascade-fail2ban.sh awg-cascade-ssh-harden.sh awg-cascade-autoreboot.sh awg-cascade-reboot.py setup-exit.sh awg2-params.sh"
 
 VER=$(cut -d' ' -f1 /etc/awg-cascade/version 2>/dev/null || echo unknown)
 COMMIT=$(cut -d' ' -f2 /etc/awg-cascade/version 2>/dev/null || echo "?")
@@ -92,6 +95,7 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
     if ! ssh $SSH_OPTS "root@$IP" 'echo ok' >/dev/null 2>&1; then
         echo "  🔴 SSH недоступен — пропускаю"
         node_rc=1
+        rc_total=1
         continue
     fi
 
@@ -111,10 +115,12 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
             continue
         fi
         lsum=$(sha256sum "$src" | cut -d' ' -f1)
-        rsum=$(ssh $SSH_OPTS "root@$IP" "sha256sum /usr/local/sbin/$f 2>/dev/null | cut -d' ' -f1")
-        [ "$lsum" = "$rsum" ] || changed="$changed $f"
+        rsum=$(ssh $SSH_OPTS "root@$IP" "if [ -f /usr/local/sbin/$f ]; then sha256sum /usr/local/sbin/$f; fi") || node_rc=1
+        rsum=${rsum%% *}
+        rmeta=$(ssh $SSH_OPTS "root@$IP" "if [ -f /usr/local/sbin/$f ]; then stat -c '%u:%g:%a' /usr/local/sbin/$f; fi") || node_rc=1
+        [ "$lsum" = "$rsum" ] && [ "$rmeta" = '0:0:755' ] || changed="$changed $f"
     done
-    remote_ver=$(ssh $SSH_OPTS "root@$IP" "cut -d' ' -f1 /etc/awg-cascade/version 2>/dev/null")
+    remote_ver=$(ssh $SSH_OPTS "root@$IP" "if [ -f /etc/awg-cascade/version ]; then cut -d' ' -f1 /etc/awg-cascade/version; fi") || node_rc=1
 
     if [ -z "$changed" ] && [ "$remote_ver" = "$VER" ]; then
         echo "  ✅ уже на $VER, расхождений нет"
@@ -126,19 +132,21 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
     if [ "$CHECK" = "1" ]; then
         # Расхождением считаем и разницу версий, а не только файлов: одинаковые
         # байты при разном штампе означают, что нода не проходила обновление.
-        { [ -n "$changed" ] || [ "$remote_ver" != "$VER" ]; } && rc_total=2
+        if [ "$node_rc" -ne 0 ]; then rc_total=1
+        elif [ "$rc_total" -ne 1 ] && { [ -n "$changed" ] || [ "$remote_ver" != "$VER" ]; }; then rc_total=2; fi
         continue
     fi
 
+    UPLOAD_ID="$$-$(date +%s)-$RANDOM"
     # ─── заливка ─────────────────────────────────────────────────────────────
     for f in $changed; do
         fsrc="$BOT_SCRIPTS/$f"; [ -f "$fsrc" ] || fsrc="/usr/local/sbin/$f"
-        if ! scp $SSH_OPTS "$fsrc" "root@$IP:/tmp/.upd-$f" >/dev/null 2>&1; then
+        if ! scp $SSH_OPTS "$fsrc" "root@$IP:/root/.awgc-upd-$UPLOAD_ID-$f" >/dev/null 2>&1; then
             echo "  🔴 не передался $f"
             node_rc=1
             continue
         fi
-        if ssh $SSH_OPTS "root@$IP" "install -m 755 -o root -g root /tmp/.upd-$f /usr/local/sbin/$f && rm -f /tmp/.upd-$f"; then
+        if ssh $SSH_OPTS "root@$IP" "install -m 755 -o root -g root /root/.awgc-upd-$UPLOAD_ID-$f /usr/local/sbin/$f && rm -f /root/.awgc-upd-$UPLOAD_ID-$f"; then
             echo "  обновлён: $f"
         else
             echo "  🔴 не установился $f"
@@ -160,7 +168,7 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
     # WARP: restore сам разбирается, включён он здесь или нет. Включён —
     # переприменит маршруты и поставит юнит восстановления после перезагрузки.
     # Не заводился — state-файлов нет, и это честный no-op.
-    warp_out=$(ssh $SSH_OPTS "root@$IP" "[ -x /usr/local/sbin/awg-cascade-exit-warp.sh ] && /usr/local/sbin/awg-cascade-exit-warp.sh restore 2>/dev/null")
+    warp_out=$(ssh $SSH_OPTS "root@$IP" "[ -x /usr/local/sbin/awg-cascade-exit-warp.sh ] && /usr/local/sbin/awg-cascade-exit-warp.sh restore 2>/dev/null") || { node_rc=1; echo "  WARP restore SSH failed" >&2; }
     if [ -n "$warp_out" ]; then
         restored=$(echo "$warp_out" | jq -r '.restored // 0' 2>/dev/null)
         failed=$(echo "$warp_out" | jq -r '.failed // 0' 2>/dev/null)
@@ -180,9 +188,9 @@ while IFS='|' read -r IFACE IP NAME EIFACE <&3; do
         # NEEDRESTART_MODE=l — список, БЕЗ перезапуска сервисов. На работающем
         # exit'е перезапуск демонов и есть вся дисруптивность, а обновления
         # здесь несекьюрные и вполне ждут штатной перезагрузки.
-        os_out=$(ssh $SSH_OPTS "root@$IP" 'n=$(apt-get -s -q upgrade 2>/dev/null | grep -cE "^Inst "); if [ "${n:-0}" -eq 0 ]; then echo "уже актуальны"; else DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade >/dev/null 2>&1 && echo "обновлено пакетов: $n" || echo "ОШИБКА apt upgrade"; fi; [ -f /var/run/reboot-required ] && echo "требуется перезагрузка (сработает в своё окно)"; exit 0')
+        os_out=$(ssh $SSH_OPTS "root@$IP" 'set -e; export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l; apt-get -o DPkg::Lock::Timeout=600 update -qq; apt-get -o DPkg::Lock::Timeout=600 -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; dpkg --configure -a; test -z "$(dpkg --audit)"; apt-get check; if test -f /var/run/reboot-required; then echo "manual reboot required"; fi') || { node_rc=1; rc_total=1; }
         echo "$os_out" | sed 's/^/    /'
-        echo "$os_out" | grep -q "ОШИБКА" && rc_total=1
+        if echo "$os_out" | grep -q "ОШИБКА"; then node_rc=1; rc_total=1; fi
     fi
 
     # ─── проверка, что ничего не уронили ─────────────────────────────────────

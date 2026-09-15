@@ -1,5 +1,15 @@
 # AWG Cascade Multi
 
+Текущие исправления аудита, совместимость и результаты испытаний записываются
+в [CHANGELOG.md](CHANGELOG.md). В Unreleased перечислены исправления,
+подтверждённые испытания RU/NL и ограничения проверки; релиз ещё не опубликован.
+
+Для установки без Telegram и ntfy предусмотрен `BOT_ENABLED=0`.
+Обновление файлов и активация различаются: после sync проверяйте
+`activation-pending`, `installed-version` и `active-version`; команда полного
+применения — `sudo /usr/local/sbin/awg-cascade-activate.sh`.
+Диагностика без вывода ключей: `sudo /usr/local/sbin/awg-cascade-doctor.sh`.
+
 Полноценный multi-exit AmneziaWG **2.0** каскад с балансировкой по пингу,
 kill-switch, watchdog, drift-guard и Telegram-ботом для управления.
 Поддерживает несколько RU-точек входа на общих exit-серверах (shared exits).

@@ -15,6 +15,9 @@ import logging
 import os
 import re
 import subprocess
+import signal
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
@@ -34,7 +37,7 @@ PEERS_DIR = Path("/etc/awg-cascade/peers")
 EXITS_DIR = Path("/etc/awg-cascade/exits")
 SSH_KEY = Path("/etc/awg-cascade/ssh/id_ed25519")
 # Пины host-ключей exit'ов. TOFU: первый контакт запоминаем, дальше сверяем.
-KNOWN_HOSTS_PATH = Path("/etc/awg-cascade/known_hosts")
+KNOWN_HOSTS_PATH = Path("/etc/awg-cascade/ssh/known_hosts")
 WG_DIR = Path("/etc/amnezia/amneziawg")
 
 # AmneziaWG Default preset
@@ -106,47 +109,47 @@ def state_load() -> dict[str, Any]:
                 "kill_switch_active": True, "last_update": None}
 
 
-def _state_write_unlocked(state: dict[str, Any]) -> None:
-    """Запись state. Вызывать ТОЛЬКО удерживая STATE_LOCK."""
-    state["last_update"] = datetime.now(timezone.utc).isoformat()
-    tmp = STATE_PATH.with_suffix(".tmp")
-    with tmp.open("w") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, STATE_PATH)
-    os.chmod(STATE_PATH, 0o644)
-
-
-# state_save() намеренно НЕ существует. Она записывала объект, прочитанный
-# когда-то раньше, и затирала всё, что watchdog успел записать в промежутке.
-# Единственный способ поменять state из бота — state_locked() ниже.
-
-
-@contextlib.contextmanager
-def state_locked():
-    """Прочитать state, дать поменять и записать — всё под одной блокировкой.
-
-    Зачем: watchdog пишет state.json точечными jq-фильтрами каждые несколько
-    секунд (ping_ring, ping_avg, status, handshake_age, weight). Бот же писал
-    ФАЙЛ ЦЕЛИКОМ из объекта, прочитанного до того, как начал долгую операцию, —
-    и всё, что watchdog успел записать за это время, молча пропадало.
-
-    Внутри блока нельзя делать ничего долгого (SSH, запросы к Telegram): пока
-    он не закрыт, watchdog ждёт на flock. Схема — сделать долгое ДО, а внутри
-    только присвоить поля.
-    """
-    fd = os.open(str(STATE_LOCK), os.O_RDWR | os.O_CREAT, 0o666)
+async def _stop_process(proc) -> None:
+    if proc.returncode is not None:
+        return
+    if proc.stdin:
+        proc.stdin.close()
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGTERM)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            with STATE_PATH.open() as f:
-                state = json.load(f)
-        except FileNotFoundError:
-            state = {"schema": 1, "exits": [], "active_default_route": [],
-                     "kill_switch_active": True, "last_update": None}
-        yield state
-        _state_write_unlocked(state)
+        await asyncio.wait_for(proc.wait(), 5)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            proc.kill()
+        await asyncio.wait_for(proc.wait(), 5)
+
+
+@contextlib.asynccontextmanager
+async def _data_edit(kind):
+    # The root broker owns the lock; waiting never blocks the event loop.
+    proc = await asyncio.create_subprocess_exec(
+        "sudo", "-n", "/usr/local/sbin/awg-cascade-state.sh", "edit-" + kind,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, start_new_session=True, limit=4*1024*1024+1,
+    )
+    try:
+        line = await asyncio.wait_for(proc.stdout.readline(), 45)
+        if not line:
+            raise RuntimeError("State broker refused read/lock; run doctor")
+        data = json.loads(line)
+        yield data
+        out, err = await asyncio.wait_for(proc.communicate(
+            (json.dumps(data, separators=(",", ":")) + "\n").encode()), 210)
+        if proc.returncode != 0 or not json.loads(out).get("ok"):
+            raise RuntimeError("State broker refused commit; data was not saved")
     finally:
-        os.close(fd)
+        await asyncio.shield(_stop_process(proc))
+
+
+def state_locked():
+    return _data_edit("state")
 
 
 def get_exit(state: dict[str, Any], identifier: str) -> dict[str, Any] | None:
@@ -165,54 +168,18 @@ def peers_list() -> list[dict[str, Any]]:
     return json.loads(PEERS_PATH.read_text())
 
 
-def _peers_write_unlocked(peers: list[dict[str, Any]]) -> None:
-    """Запись peers.json. Вызывать ТОЛЬКО удерживая STATE_LOCK."""
-    tmp = PEERS_PATH.with_suffix(".tmp")
-    with tmp.open("w") as f:
-        json.dump(peers, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, PEERS_PATH)
-    os.chmod(PEERS_PATH, 0o644)
-
-
-def peers_save(peers: list[dict[str, Any]]) -> None:
-    fd = os.open(str(STATE_LOCK), os.O_RDWR | os.O_CREAT, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        _peers_write_unlocked(peers)
-    finally:
-        os.close(fd)
-
-
-@contextlib.contextmanager
 def peers_locked():
-    """Прочитать peers.json, дать поменять и записать — под одной блокировкой.
-
-    peers.json пишут четверо: бот и три helper-скрипта (peer-add, peer-remove,
-    peer-rotate), причём скрипты — через `jq файл > tmp && mv`. Общий замок —
-    /etc/awg-cascade/state.lock (его же берёт peer-rotate.sh), поэтому здесь и
-    в шелле блокировка одна и та же.
-    """
-    fd = os.open(str(STATE_LOCK), os.O_RDWR | os.O_CREAT, 0o666)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            peers = json.loads(PEERS_PATH.read_text())
-        except FileNotFoundError:
-            peers = []
-        yield peers
-        _peers_write_unlocked(peers)
-    finally:
-        os.close(fd)
+    return _data_edit("peers")
 
 
-def peer_update(name: str, **changes: Any) -> dict | None:
+async def peer_update(name: str, **changes: Any) -> dict | None:
     """Обновить поля одного пира атомарно. Возвращает обновлённого пира или None.
 
     Раньше читало список вне блокировки и записывало под ней: параллельный
     peer-add.sh между чтением и записью терялся целиком.
     """
     updated = None
-    with peers_locked() as peers:
+    async with peers_locked() as peers:
         for p in peers:
             if p["name"] == name:
                 p.update(changes)
@@ -288,73 +255,81 @@ def _kh_field_matches(field: str, name: str) -> bool:
 
 
 def host_key_known(host: str, port: int = 22) -> bool:
-    """Есть ли пин для этого хоста."""
+    if not KNOWN_HOSTS_PATH.exists():
+        return False
+    # Library parser includes CA/revocation markers, hashed hosts and patterns.
+    # Read/parse failures propagate: they must never disable verification.
+    registry = asyncssh.import_known_hosts(KNOWN_HOSTS_PATH.read_text())
+    return (any(registry.match(host, host, None if port == 22 else port))
+            or any(registry.match(_kh_name(host, port), "", None)))
+
+
+@contextlib.contextmanager
+def _known_hosts_lock():
+    lock = KNOWN_HOSTS_PATH.with_suffix(".lock")
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        if not KNOWN_HOSTS_PATH.exists():
-            return False
-        name = _kh_name(host, port)
-        for line in KNOWN_HOSTS_PATH.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if _kh_field_matches(line.split()[0], name):
-                return True
-    except OSError as e:
-        # НЕ «работаем без пина». Отсутствие файла — это штатное «пина ещё нет»,
-        # и его ловит проверка .exists() выше. Сюда мы попадаем только когда файл
-        # ЕСТЬ, но прочитать его нельзя (права, ФС, битый носитель) — то есть
-        # ровно тогда, когда нельзя утверждать, что ключ хоста не менялся.
-        # Прежнее поведение возвращало False, и вызывающий ssh_exec шёл на хост
-        # с known_hosts=None, полностью отключая проверку: сбой чтения реестра
-        # снимал защиту. Возвращаем True — asyncssh получит путь к нечитаемому
-        # файлу и откажется соединяться. Отказ лучше незаметного даунгрейда.
-        LOG.error("known_hosts есть, но нечитаем (%s) — соединение без проверки "
-                  "ключа запрещено", e)
-        return True
-    return False
+        # Calls run in a worker where contention may wait, with a fixed deadline.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("known_hosts lock deadline")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _write_known_hosts(body: str) -> None:
+    if KNOWN_HOSTS_PATH.is_symlink():
+        raise ValueError("symlink known_hosts refused")
+    fd, tmp = tempfile.mkstemp(dir=KNOWN_HOSTS_PATH.parent, prefix=".known-hosts-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(body)
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(tmp, KNOWN_HOSTS_PATH)
+    finally:
+        with contextlib.suppress(FileNotFoundError): os.unlink(tmp)
 
 
 def host_key_forget(host: str, port: int = 22) -> int:
-    """
-    Убирает пин. Нужен при ПЕРЕустановке exit'а: машина та же, ключ новый, и без
-    этого бот честно откажется подключаться. Вызывается из flow добавления
-    exit'а — там провижининг инициируем мы сами, значит смена ключа ожидаема.
-    Возвращает число удалённых строк.
-    """
-    try:
+    with _known_hosts_lock():
         if not KNOWN_HOSTS_PATH.exists():
             return 0
         name = _kh_name(host, port)
         kept, dropped = [], 0
         for line in KNOWN_HOSTS_PATH.read_text().splitlines():
-            st = line.strip()
-            if st and not st.startswith("#") and _kh_field_matches(st.split()[0], name):
+            fields = line.split()
+            # Never remove CA/revocation policy as a side effect of reinstall.
+            if fields and not fields[0].startswith(("#", "@")) and _kh_field_matches(fields[0], name):
                 dropped += 1
-                continue
-            kept.append(line)
+            else:
+                kept.append(line)
         if dropped:
-            tmp = KNOWN_HOSTS_PATH.with_suffix(".tmp")
-            body = ("\n".join(kept).rstrip() + "\n") if any(k.strip() for k in kept) else ""
-            tmp.write_text(body)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, KNOWN_HOSTS_PATH)
-            LOG.info("host-key пин снят для %s (строк: %d)", name, dropped)
+            _write_known_hosts("\n".join(kept).rstrip() + "\n")
         return dropped
-    except OSError as e:
-        LOG.warning("не удалось снять пин для %s: %s", host, e)
-        return 0
 
 
 def _host_key_remember(host: str, port: int, key: Any) -> None:
-    """Записывает увиденный ключ. Тихо не делает ничего, если записать нельзя."""
-    try:
+    with _known_hosts_lock():
+        old = KNOWN_HOSTS_PATH.read_text() if KNOWN_HOSTS_PATH.exists() else ""
+        registry = asyncssh.import_known_hosts(old)
+        matches = registry.match(host, host, None if port == 22 else port)
+        explicit = registry.match(_kh_name(host, port), "", None)
+        if key in explicit[2]: raise ValueError("revoked host key")
+        if any(matches):
+            if key not in matches[0] or key in matches[2]:
+                raise ValueError("host-key changed during TOFU")
+            return
         pub = key.export_public_key().decode().strip()
-        with open(KNOWN_HOSTS_PATH, "a", encoding="utf-8") as fh:
-            fh.write("{} {}\n".format(_kh_name(host, port), pub))
-        os.chmod(KNOWN_HOSTS_PATH, 0o600)
-        LOG.info("host-key запомнен (TOFU) для %s", _kh_name(host, port))
-    except (OSError, AttributeError) as e:
-        LOG.warning("не удалось запомнить host-key для %s: %s", host, e)
+        _write_known_hosts(old.rstrip("\n") + ("\n" if old else "") +
+                           "{} {}\n".format(_kh_name(host, port), pub))
 
 
 async def _host_key_alert(host: str, detail: str) -> None:
@@ -386,7 +361,7 @@ async def ssh_exec(
     opts: dict[str, Any] = {
         "username": username, "port": port,
         "known_hosts": str(KNOWN_HOSTS_PATH) if pinned else None,
-        "connect_timeout": 15,
+        "connect_timeout": 15, "agent_path": None, "config": None,
     }
     if password:
         opts["password"] = password
@@ -396,7 +371,7 @@ async def ssh_exec(
     try:
         async with asyncssh.connect(host, **opts) as conn:
             if not pinned:
-                _host_key_remember(host, port, conn.get_server_host_key())
+                await asyncio.to_thread(_host_key_remember, host, port, conn.get_server_host_key())
             result = await asyncio.wait_for(conn.run(command, check=False), timeout=timeout)
             return (
                 result.stdout if isinstance(result.stdout, str) else (result.stdout.decode() if result.stdout else ""),
@@ -455,19 +430,23 @@ async def local_run(*args: str, timeout: float = 30,
         stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         payload = stdin_data.encode() if stdin_data is not None else None
         out, err = await asyncio.wait_for(proc.communicate(payload), timeout=timeout)
         return out.decode(errors="replace"), err.decode(errors="replace"), proc.returncode or 0
     except asyncio.TimeoutError:
-        proc.kill()
-        return "", f"Timeout after {timeout}s", -1
+        await asyncio.shield(_stop_process(proc))
+        return "", f"Timeout after {timeout}s; check operation recovery status", -1
+    except asyncio.CancelledError:
+        await asyncio.shield(_stop_process(proc))
+        raise
 
 
 async def sudo_run(*args: str, timeout: float = 30,
                    stdin_data: str | None = None) -> tuple[str, str, int]:
-    return await local_run("sudo", *args, timeout=timeout, stdin_data=stdin_data)
+    return await local_run("sudo", "-n", *args, timeout=timeout, stdin_data=stdin_data)
 
 
 # ─── Geo IP ──────────────────────────────────────────────────────────────────

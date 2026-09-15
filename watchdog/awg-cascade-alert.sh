@@ -13,6 +13,14 @@
 # (для level-алертов: disk/RAM/SSH).
 # =============================================================================
 set -u
+umask 077
+# Validate both write and clear keys before any privileged filesystem operation.
+ALERT_KEY=${1:-}
+[ "$ALERT_KEY" != --clear ] || ALERT_KEY=${2:-}
+[[ "$ALERT_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || exit 2
+if [ "${1:-}" != --clear ]; then
+    [[ "${2:-1800}" =~ ^[0-9]{1,7}$ ]] || exit 2
+fi
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла

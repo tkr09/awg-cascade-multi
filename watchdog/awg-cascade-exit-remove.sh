@@ -1,7 +1,11 @@
 #!/bin/bash
 # Удаляет exit с RU: down интерфейс + удаляет conf + убирает из state.json.
 # Вызывается ботом через sudo. argv: $1 = interface (awg<N>).
-set -e
+set -eu
+umask 077
+if [ "${AWGC_TRANSACTION:-}" != 1 ]; then
+    exec /usr/bin/python3 -I /usr/local/sbin/awg-cascade-transaction.py exit-remove "$@"
+fi
 # Config читаем строгим разбором. Фолбэка на `source` здесь НЕТ намеренно:
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
@@ -11,13 +15,14 @@ STATE=/etc/awg-cascade/state.json
 PEERS_JSON=/etc/awg-cascade/peers.json
 WG_DIR=/etc/amnezia/amneziawg
 IFACE="${1:-}"
+[[ "$IFACE" =~ ^awg[1-9][0-9]?$ ]] || exit 2
 
 [ -z "$IFACE" ] && { echo '{"error":"empty interface"}'; exit 1; }
 [ "$IFACE" = "awg0" ] && { echo '{"error":"cannot remove awg0"}'; exit 1; }
 
 # Опускаем интерфейс
-awg-quick down "$IFACE" 2>/dev/null || true
-systemctl disable "awg-quick@${IFACE}" >/dev/null 2>&1 || true
+if ip link show "$IFACE" >/dev/null 2>&1; then awg-quick down "$IFACE"; fi
+systemctl disable "awg-quick@${IFACE}" >/dev/null
 
 # Удаляем conf и ключи
 rm -f "$WG_DIR/${IFACE}.conf"
@@ -37,14 +42,14 @@ rm -f "/etc/awg-cascade/exits/${IFACE}.keys"
 FLOCK=/etc/awg-cascade/state.lock
 UNPIN_F="/run/awg-cascade-unpinned.$$"
 (
-    flock -x 200
+    : # parent transaction holds state.lock
     TMP=$(mktemp)
     jq --arg if "$IFACE" \
        '.exits |= map(select(.interface != $if)) | .last_update = (now|todate)' \
        "$STATE" > "$TMP"
     mv "$TMP" "$STATE"
-    chown "$BOT_USER:$BOT_USER" "$STATE"
-    chmod 644 "$STATE"
+    chown "root:$BOT_USER" "$STATE"
+    chmod 640 "$STATE"
 
     cnt=0
     if [ -f "$PEERS_JSON" ]; then
@@ -55,12 +60,12 @@ UNPIN_F="/run/awg-cascade-unpinned.$$"
                'map(if .pinned_exit == $if then .pinned_exit = null else . end)' \
                "$PEERS_JSON" > "$TMP2"
             mv "$TMP2" "$PEERS_JSON"
-            chown "$BOT_USER:$BOT_USER" "$PEERS_JSON"
-            chmod 644 "$PEERS_JSON"
+            chown "root:$BOT_USER" "$PEERS_JSON"
+            chmod 640 "$PEERS_JSON"
         fi
     fi
     printf '%s' "${cnt:-0}" > "$UNPIN_F"
-) 200>"$FLOCK"
+)
 
 # Счётчик забираем через файл: переменная, присвоенная внутри субшелла, наружу
 # не доедет.

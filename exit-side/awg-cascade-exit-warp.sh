@@ -25,7 +25,13 @@
 # Stdout всегда JSON.
 # =============================================================================
 
-set -u
+set -euo pipefail
+umask 077
+# Serialize shared warp0 mutations; restore children each acquire this lock.
+if [ "${1:-status}" != restore ]; then
+    exec 9>/run/awg-cascade-warp.lock
+    flock -w 30 -x 9 || exit 1
+fi
 WGCF_VERSION=2.2.27
 WGCF_BIN=/usr/local/bin/wgcf
 WARP_DIR=/etc/awg-cascade-exit
@@ -54,6 +60,7 @@ case "$IFACE" in
     *) die "bad iface: $IFACE (ожидается awg-in или awg-in-N)" ;;
 esac
 [[ "$IDX" =~ ^[0-9]+$ ]] || die "bad iface index: $IFACE"
+[ "$IDX" -ge 1 ] && [ "$IDX" -le 99 ] || die "iface index outside 1..99"
 MARK=$(printf '0x%x' $((0x10 + IDX - 1)))
 RULE_PRIO=$((990 + IDX - 1))
 WARP_STATE="$WARP_DIR/warp-$IFACE.state"
@@ -66,13 +73,33 @@ count_active_marks() {
 
 # Получаем внешний IP через warp0
 detect_warp_ip() {
-    local ip
-    ip=$(timeout 8 curl -s --interface warp0 --max-time 6 \
-         https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
-         | awk -F= '/^ip=/{print $2}')
-    [ -z "$ip" ] && ip=$(timeout 8 curl -s --interface warp0 --max-time 6 \
-         -4 https://api.ipify.org 2>/dev/null)
-    echo "${ip:-}"
+    local result
+    result=$(curl -4 -fsS --interface warp0 --max-time 6 --connect-timeout 3 https://www.cloudflare.com/cdn-cgi/trace) || return 1
+    printf '%s\n' "$result" | grep -qE '^warp=(on|plus)$' || return 1
+    printf '%s\n' "$result" | awk -F= '/^ip=/{print $2}' | python3 -c 'import sys,ipaddress; print(ipaddress.IPv4Address(sys.stdin.read().strip()))'
+}
+warp_guard() {
+    iptables -w 30 -C FORWARD -i "$IFACE" -m comment --comment awgc-warp-guard -j DROP 2>/dev/null \
+        || iptables -w 30 -I FORWARD 1 -i "$IFACE" -m comment --comment awgc-warp-guard -j DROP
+}
+warp_unguard() {
+    while iptables -w 30 -C FORWARD -i "$IFACE" -m comment --comment awgc-warp-guard -j DROP 2>/dev/null; do
+        iptables -w 30 -D FORWARD -i "$IFACE" -m comment --comment awgc-warp-guard -j DROP || return 1
+    done
+}
+warp_killswitch() {
+    iptables -w 30 -C FORWARD -i "$IFACE" ! -o warp0 -m comment --comment awgc-warp-killswitch -j DROP 2>/dev/null \
+        || iptables -w 30 -I FORWARD 1 -i "$IFACE" ! -o warp0 -m comment --comment awgc-warp-killswitch -j DROP
+}
+warp_unprotect() {
+    while iptables -w 30 -C FORWARD -i "$IFACE" ! -o warp0 -m comment --comment awgc-warp-killswitch -j DROP 2>/dev/null; do
+        iptables -w 30 -D FORWARD -i "$IFACE" ! -o warp0 -m comment --comment awgc-warp-killswitch -j DROP || return 1
+    done
+}
+persist_warp() {
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/.rules.v4.awgc-warp
+    mv /etc/iptables/.rules.v4.awgc-warp /etc/iptables/rules.v4
 }
 
 # ─── install (shared warp0 + per-iface mark rule) ─────────────────────────────
@@ -102,7 +129,7 @@ cmd_install() {
         cd $WARP_DIR
         if [ ! -f wgcf-account.toml ]; then
             log "  registering WARP account..."
-            yes | $WGCF_BIN register >/dev/null 2>&1 || die "wgcf register failed"
+            printf 'yes\n' | $WGCF_BIN register >/dev/null 2>&1 || die "wgcf register failed"
         fi
         [ -f wgcf-account.toml ] || die "wgcf-account.toml missing"
         $WGCF_BIN generate >/dev/null 2>&1 || die "wgcf generate failed"
@@ -132,9 +159,7 @@ EOF
         log "  warp0.conf created"
     fi
 
-    # 6. iptables: mark per-iface + nat/MSS shared (idempotent)
-    iptables -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null \
-        || iptables -t mangle -A PREROUTING -i "$IFACE" -j MARK --set-mark $MARK
+    # Installation prepares shared NAT/MSS. Only on may mark client traffic.
     iptables -t nat -C POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null \
         || iptables -t nat -A POSTROUTING -o warp0 -j MASQUERADE
     iptables -t mangle -C FORWARD -o warp0 -p tcp --tcp-flags SYN,RST SYN \
@@ -143,8 +168,10 @@ EOF
              -j TCPMSS --clamp-mss-to-pmtu
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 
-    jq -n --arg t "$(date -Iseconds)" \
-        '{installed:true, running:false, installed_at:$t}' > $WARP_STATE
+    if [ ! -f "$WARP_STATE" ]; then
+        jq -n --arg t "$(date -Iseconds)" \
+            '{installed:true, running:false, installed_at:$t}' > "$WARP_STATE"
+    fi
     install_restore_unit
     log "INSTALL OK"
     jq -n '{ok:true, installed:true}'
@@ -153,41 +180,35 @@ EOF
 # ─── on ───────────────────────────────────────────────────────────────────────
 
 cmd_on() {
-    [ -f "$WARP_CONF" ] || { log "ON: not installed, installing"; cmd_install >/dev/null; }
-
-    # warp0 общий: поднимаем только если ещё не поднят (не трогаем чужой WARP)
-    if ! ip link show warp0 >/dev/null 2>&1; then
-        awg-quick up warp0 >/dev/null 2>&1 || die "awg-quick up warp0 failed"
-        log "  warp0 brought up"
-    else
-        log "  warp0 already up (другой iface уже использует)"
-    fi
-    ip route replace default dev warp0 table $TABLE
-
-    # mark-rule для этого iface (idempotent)
-    iptables -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null \
-        || iptables -t mangle -A PREROUTING -i "$IFACE" -j MARK --set-mark $MARK
-
-    # ip rule: fwmark → table 200 (per-iface priority)
-    ip rule del fwmark $MARK lookup $TABLE 2>/dev/null || true
-    ip rule add fwmark $MARK lookup $TABLE priority $RULE_PRIO
-
-    # Юнит восстановления ставим и здесь: exit мог быть заведён до его появления,
-    # и тогда включение WARP снова не пережило бы перезагрузку.
-    install_restore_unit
-
-    sleep 2
-    local exit_ip
-    exit_ip=$(detect_warp_ip)
-    jq -n --arg ip "$exit_ip" --arg t "$(date -Iseconds)" \
-        '{installed:true, running:true, exit_ip:$ip, on_at:$t}' > $WARP_STATE
-    log "ON exit_ip=$exit_ip mark=$MARK prio=$RULE_PRIO"
-    jq -n --arg ip "$exit_ip" '{ok:true, warp_state:"on", exit_ip:$ip}'
+    warp_guard || die "cannot guard WARP transition"
+    if [ ! -f "$WARP_CONF" ]; then cmd_install >/dev/null; fi
+    if ! ip link show warp0 >/dev/null 2>&1; then awg-quick up warp0 >/dev/null 2>&1 || die "warp0 up failed"; fi
+    warp_killswitch || die "persistent kill-switch failed"
+    persist_warp || die "kill-switch persistence failed"
+    # A terminal rule protects against loss of the shared device/default route.
+    ip rule show priority 1200 | grep -q "fwmark $MARK.*prohibit" \
+        || ip rule add fwmark "$MARK" prohibit priority 1200 || die "terminal rule failed"
+    ip route replace default dev warp0 table "$TABLE" || die "route failed"
+    iptables -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark "$MARK" 2>/dev/null \
+        || iptables -t mangle -A PREROUTING -i "$IFACE" -j MARK --set-mark "$MARK" || die "mark failed"
+    ip rule show priority "$RULE_PRIO" | grep -q "fwmark $MARK.*lookup $TABLE" \
+        || ip rule add fwmark "$MARK" lookup "$TABLE" priority "$RULE_PRIO" || die "policy rule failed"
+    install_restore_unit || die "restore unit failed"
+    local exit_ip tmp
+    exit_ip=$(detect_warp_ip) || die "WARP data plane not verified; guard retained"
+    tmp=$(mktemp "$WARP_DIR/.state.XXXXXX")
+    jq -n --arg ip "$exit_ip" --arg t "$(date -Iseconds)" '{installed:true,running:true,exit_ip:$ip,on_at:$t}' > "$tmp" || die "state render failed"
+    mv "$tmp" "$WARP_STATE" || die "state commit failed"
+    warp_unguard || die "guard release failed"
+    persist_warp || { warp_guard; die "firewall persistence failed"; }
+    jq -n --arg ip "$exit_ip" '{ok:true,warp_state:"on",exit_ip:$ip}'
 }
 
 # ─── off ──────────────────────────────────────────────────────────────────────
 
 cmd_off() {
+    warp_guard
+
     # Убираем routing ТОЛЬКО для этого iface
     ip rule del fwmark $MARK lookup $TABLE 2>/dev/null || true
     iptables -t mangle -D PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null || true
@@ -206,6 +227,9 @@ cmd_off() {
     jq -n --arg t "$(date -Iseconds)" \
         '{installed:true, running:false, off_at:$t}' > $WARP_STATE
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    warp_unprotect
+    warp_unguard
+    persist_warp
     jq -n '{ok:true, warp_state:"off"}'
 }
 
@@ -216,9 +240,12 @@ cmd_status() {
     [ -f "$WARP_CONF" ] && installed=true
     # running ДЛЯ ЭТОГО iface = warp0 поднят И есть mark-rule этого iface
     if ip link show warp0 >/dev/null 2>&1 && \
-       iptables -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null; then
+       iptables -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null &&
+       ip rule show priority "$RULE_PRIO" | grep -q "fwmark $MARK.*lookup $TABLE" &&
+       ip route show table "$TABLE" | grep -q '^default dev warp0' &&
+       ! iptables -w 30 -C FORWARD -i "$IFACE" -m comment --comment awgc-warp-guard -j DROP 2>/dev/null &&
+       exit_ip=$(detect_warp_ip); then
         running=true
-        exit_ip=$(detect_warp_ip)
     fi
     jq -n --argjson i "$installed" --argjson r "$running" --arg ip "$exit_ip" \
         '{ok:true, installed:$i, running:$r, exit_ip:$ip, warp_state: (if $r then "on" else "off" end)}'
@@ -226,23 +253,54 @@ cmd_status() {
 
 # ─── rekey (влияет на общий warp0 → меняет exit IP для ВСЕХ iface) ────────────
 
-cmd_rekey() {
-    local was_up=false
-    ip link show warp0 >/dev/null 2>&1 && was_up=true
+REKEY_DIR="$WARP_DIR/rekey-pending"
+recover_rekey() {
+    if [ -f "$REKEY_DIR/committed" ]; then rm -rf -- "$REKEY_DIR"; return 0; fi
+    [ -f "$REKEY_DIR/ready" ] || return 0
     awg-quick down warp0 2>/dev/null || true
-    rm -f $WARP_DIR/wgcf-account.toml $WARP_DIR/wgcf-profile.conf "$WARP_CONF"
-    log "REKEY: account deleted, re-installing shared warp0..."
-    cmd_install >/dev/null
-    if $was_up; then
-        awg-quick up warp0 >/dev/null 2>&1 || true
-        ip route replace default dev warp0 table $TABLE
+    for f in wgcf-account.toml wgcf-profile.conf; do
+        if [ -f "$REKEY_DIR/$f" ]; then cp -p "$REKEY_DIR/$f" "$WARP_DIR/$f"; else rm -f "$WARP_DIR/$f"; fi
+    done
+    if [ -f "$REKEY_DIR/warp0.conf" ]; then cp -p "$REKEY_DIR/warp0.conf" "$WARP_CONF"; else rm -f "$WARP_CONF"; fi
+    if [ -f "$REKEY_DIR/was-up" ]; then
+        awg-quick up warp0 >/dev/null 2>&1 || die "rekey rollback: warp0 up failed"
+        ip route replace default dev warp0 table "$TABLE" || die "rekey rollback: route failed"
     fi
+    touch "$REKEY_DIR/committed"; sync -f "$REKEY_DIR"
+    rm -rf -- "$REKEY_DIR"
+    log "REKEY previous configuration recovered"
+}
+cmd_rekey() {
+    # Ready journals were recovered before dispatch; discard partial snapshots.
+    if [ -d "$REKEY_DIR" ]; then rm -rf -- "$REKEY_DIR"; fi
+    mkdir -p "$REKEY_DIR"
+    chmod 700 "$REKEY_DIR"
+    for f in wgcf-account.toml wgcf-profile.conf; do
+        [ ! -f "$WARP_DIR/$f" ] || cp -p "$WARP_DIR/$f" "$REKEY_DIR/$f"
+    done
+    [ ! -f "$WARP_CONF" ] || cp -p "$WARP_CONF" "$REKEY_DIR/warp0.conf"
+    if ip link show warp0 >/dev/null 2>&1; then touch "$REKEY_DIR/was-up"; fi
+    sync -f "$REKEY_DIR"
+    touch "$REKEY_DIR/ready"
+    sync -f "$REKEY_DIR"
+    awg-quick down warp0 2>/dev/null || true
+    rm -f "$WARP_DIR/wgcf-account.toml" "$WARP_DIR/wgcf-profile.conf" "$WARP_CONF"
+    cmd_install >/dev/null
+    if [ -f "$REKEY_DIR/was-up" ]; then
+        awg-quick up warp0 >/dev/null 2>&1 || die "rekey warp0 up failed"
+        ip route replace default dev warp0 table "$TABLE" || die "rekey route failed"
+        detect_warp_ip >/dev/null || die "rekey data plane failed; rollback pending"
+    fi
+    touch "$REKEY_DIR/committed"; sync -f "$REKEY_DIR"
+    rm -rf -- "$REKEY_DIR"
+    log "REKEY committed"
     cmd_status
 }
 
 # ─── uninstall (per-iface; полный снос если iface не осталось) ─────────────────
 
 cmd_uninstall() {
+    cmd_off >/dev/null
     ip rule del fwmark $MARK lookup $TABLE 2>/dev/null || true
     iptables -t mangle -D PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null || true
     rm -f "$WARP_STATE"
@@ -260,7 +318,7 @@ cmd_uninstall() {
         # иначе он останется падать на каждой загрузке.
         systemctl disable --now awg-cascade-warp-restore.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/awg-cascade-warp-restore.service
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null
         log "UNINSTALL — полный снос (последний iface)"
     else
         log "UNINSTALL — убран только $IFACE (ещё $remain используют warp0)"
@@ -281,7 +339,7 @@ cmd_uninstall() {
 # Восстанавливаем ЖЕЛАЕМОЕ состояние: для каждого интерфейса, у которого в
 # state-файле running:true, повторяем ту же операцию on.
 cmd_restore() {
-    local f iface n=0 failed=0 waited
+    local f iface n=0 failed=0 waited deadline=$((SECONDS + 120))
     for f in "$WARP_DIR"/warp-*.state; do
         [ -e "$f" ] || continue
         jq -e '.running == true' "$f" >/dev/null 2>&1 || continue
@@ -291,7 +349,7 @@ cmd_restore() {
         # Ждём ограниченно, а не пропускаем молча: тихий пропуск здесь неотличим
         # от того самого дефекта, который мы чиним.
         waited=0
-        while ! ip link show "$iface" >/dev/null 2>&1 && [ "$waited" -lt 60 ]; do
+        while ! ip link show "$iface" >/dev/null 2>&1 && [ "$SECONDS" -lt "$deadline" ]; do
             sleep 2; waited=$(( waited + 2 ))
         done
         if ! ip link show "$iface" >/dev/null 2>&1; then
@@ -300,7 +358,7 @@ cmd_restore() {
             continue
         fi
 
-        if "$0" on "$iface" >/dev/null 2>&1; then
+        if [ "$SECONDS" -lt "$deadline" ] && timeout "$((deadline - SECONDS))" "$0" on "$iface" >/dev/null 2>&1; then
             n=$(( n + 1 )); log "RESTORE: $iface восстановлен"
         else
             failed=$(( failed + 1 )); log "RESTORE: $iface НЕ восстановлен (on вернул ошибку)"
@@ -331,14 +389,19 @@ TimeoutStartSec=300
 [Install]
 WantedBy=multi-user.target
 UNIT
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl enable awg-cascade-warp-restore.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null
+    systemctl enable awg-cascade-warp-restore.service >/dev/null
     log "restore-юнит установлен и включён"
 }
 
 # ─── dispatch ────────────────────────────────────────────────────────────────
 
+# Interrupted rekey restores the old keys before accepting another command.
+if [ -f "$REKEY_DIR/ready" ]; then
+    if [ "${1:-status}" = restore ]; then "$0" recover-rekey >/dev/null; else recover_rekey; fi
+fi
 case "${1:-status}" in
+    recover-rekey) jq -n '{ok:true, recovered:true}' ;;
     install)   cmd_install ;;
     restore)   cmd_restore ;;
     on)        cmd_on ;;

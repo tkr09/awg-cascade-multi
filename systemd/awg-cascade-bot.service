@@ -1,6 +1,8 @@
 [Unit]
 Description=AWG Cascade Multi — Telegram bot
 After=network-online.target awg-cascade-watchdog.service
+Requires=awg-cascade-recover.service
+After=awg-cascade-recover.service
 Wants=network-online.target
 OnFailure=awg-cascade-alert@%n.service
 
@@ -9,6 +11,7 @@ Type=simple
 User=awgbot
 Group=awgbot
 WorkingDirectory=/opt/awg-cascade-bot
+ExecCondition=/usr/local/sbin/awg-cascade-bot-enabled.sh
 ExecStart=/opt/awg-cascade-bot/venv/bin/python /opt/awg-cascade-bot/bot.py
 Restart=always
 RestartSec=5

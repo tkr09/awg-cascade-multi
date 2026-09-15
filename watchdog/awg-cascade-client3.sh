@@ -21,7 +21,11 @@
 #   awg-cascade-client3.sh down            — снести (только если нет пиров)
 #   awg-cascade-client3.sh status          — показать состояние
 # =============================================================================
-set -u
+set -eu
+umask 077
+if [ "${AWGC_TRANSACTION:-}" != 1 ]; then
+    exec /usr/bin/python3 -I /usr/local/sbin/awg-cascade-transaction.py client3 "$@"
+fi
 CFG=/etc/awg-cascade/config
 WG_DIR=/etc/amnezia/amneziawg
 PEERS_JSON=/etc/awg-cascade/peers.json
@@ -31,7 +35,8 @@ PEERS_JSON=/etc/awg-cascade/peers.json
 PARAMS=/usr/local/sbin/awg2-params.sh
 
 # Разбор вместо `source`: $CFG принадлежит боту (см. awg-cascade-cfg.sh).
-{ . /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config "$CFG"; } 2>/dev/null || true
+. /usr/local/sbin/awg-cascade-cfg.sh
+awgc_load_config "$CFG"
 : "${CLIENT3_IFACE:=}"
 : "${CLIENT_NET:=}"
 : "${AWG0_PORT:=}"
@@ -57,9 +62,9 @@ show_status() {
         echo "  $i: в config есть, но интерфейс НЕ ПОДНЯТ"
         return 0
     fi
-    hpk=$(awg showconf "$i" 2>/dev/null | grep -c '^HeaderProtectionKey')
-    pad=$(awg showconf "$i" 2>/dev/null | grep -oP '^ContentPaddingAddition = \K.*')
-    n=$(awg show "$i" peers 2>/dev/null | grep -c .)
+    hpk=$(awg showconf "$i" 2>/dev/null | grep -c '^HeaderProtectionKey') || hpk=0
+    pad=$(awg showconf "$i" 2>/dev/null | grep -oP '^ContentPaddingAddition = \K.*') || pad=""
+    n=$(awg show "$i" peers 2>/dev/null | awk 'NF {n++} END {print n+0}')
     echo "  интерфейс:  $i  (порт ${CLIENT3_PORT:-?}/udp, сеть ${CLIENT3_NET:-?})"
     echo "  режим:      $([ "${hpk:-0}" -gt 0 ] && echo "3.0 (header protection + padding=${pad:-?})" || echo "🔴 2.0 — HeaderProtectionKey НЕ применился")"
     echo "  пиров:      $n"
@@ -70,15 +75,18 @@ show_status() {
 # ─── down ────────────────────────────────────────────────────────────────────
 if [ "$ACTION" = "down" ]; then
     [ -z "$CLIENT3_IFACE" ] && { echo "  нечего сносить"; exit 0; }
-    n=$(jq -r --arg i "$CLIENT3_IFACE" '[.[] | select((.iface // "awg0") == $i)] | length' "$PEERS_JSON" 2>/dev/null || echo 0)
+    n=$(jq -r --arg i "$CLIENT3_IFACE" '[.[] | select((.iface // "awg0") == $i)] | length' "$PEERS_JSON")
     if [ "${n:-0}" -gt 0 ]; then
         echo "🔴 на $CLIENT3_IFACE ещё $n пир(ов) — сначала удали их, иначе останутся висеть в peers.json"
         exit 1
     fi
-    systemctl disable --now "awg-quick@$CLIENT3_IFACE" >/dev/null 2>&1 || true
+    systemctl disable --now "awg-quick@$CLIENT3_IFACE" >/dev/null
     rm -f "$WG_DIR/$CLIENT3_IFACE.conf"
     sed -i '/^# ─── Второй клиентский интерфейс/d;/^CLIENT3_/d' "$CFG"
-    /usr/local/sbin/awg-cascade-iptables.sh >/dev/null 2>&1 || true
+    # Remove the exact LAN exception created for this interface.
+    ip -4 rule del to "$CLIENT3_NET" lookup main priority 997
+    /usr/local/sbin/awg-cascade-iprule.sh
+    /usr/local/sbin/awg-cascade-iptables.sh >/dev/null
     echo "  ✅ $CLIENT3_IFACE снесён, config почищен, firewall пересобран"
     exit 0
 fi
@@ -206,11 +214,11 @@ fi
 # только если пропало правило fwmark, поэтому нового 997 могло не быть до
 # перезапуска. Последствие — разрешённый LAN-трафик pinned-клиента awg0 к новой
 # подсети уходил в exit вместо соседа.
-[ -x /usr/local/sbin/awg-cascade-iprule.sh ] && /usr/local/sbin/awg-cascade-iprule.sh || true
-/usr/local/sbin/awg-cascade-iptables.sh >/dev/null 2>&1 || true
+/usr/local/sbin/awg-cascade-iprule.sh
+/usr/local/sbin/awg-cascade-iptables.sh >/dev/null
 
 echo ""
-. "$CFG"
+awgc_load_config "$CFG" || exit 1
 show_status
 echo ""
 echo "  ✅ готово. Добавить пира: awg-cascade-peer-add.sh <имя> $IFACE"

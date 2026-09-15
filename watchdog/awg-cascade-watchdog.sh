@@ -22,7 +22,7 @@ set -u
 # он существовал только на время раскатки v2.2.0 и сам по себе был дырой —
 # достаточно было убрать cfg.sh, чтобы вернуть исполнение bot-writable файла
 # от root. Нет парсера — нет конфига, это честный отказ.
-. /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config
+. /usr/local/sbin/awg-cascade-cfg.sh && awgc_load_config || exit 1
 
 STATE=/etc/awg-cascade/state.json
 STATE_LOCK=/etc/awg-cascade/state.lock
@@ -100,7 +100,7 @@ exec >>"$LOG" 2>&1
 # открыть R/W когда root уже создал файл). Bash redirection в `200>"$STATE_LOCK"`
 # создаёт файл с дефолтными правами 0644 если его не было.
 touch "$STATE_LOCK" 2>/dev/null || true
-chmod 666 "$STATE_LOCK" 2>/dev/null || true
+chmod 600 "$STATE_LOCK" 2>/dev/null || true
 
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 log() { echo "$(date -Iseconds) $*"; }
@@ -109,12 +109,12 @@ log() { echo "$(date -Iseconds) $*"; }
 update_state() {
     local jq_filter=$1
     (
-        flock -x 200
+        flock -w 1 -x 200 || return 1
         local tmp
         tmp=$(mktemp)
         if jq "$jq_filter" "$STATE" > "$tmp" 2>/dev/null; then
-            chown awgbot:awgbot "$tmp" 2>/dev/null
-            chmod 644 "$tmp"
+            chown "root:$BOT_USER" "$tmp" 2>/dev/null
+            chmod 640 "$tmp"
             mv "$tmp" "$STATE"
         else
             rm -f "$tmp"
@@ -219,151 +219,20 @@ reconnect_iface() {
     NET_GENERATION=$(( NET_GENERATION + 1 ))
 }
 
-# Отпечаток желаемого состояния peer-routing: пары «ip>интерфейс» плюс живость
-# каждого задействованного интерфейса. Меняется ровно тогда, когда правила надо
-# перестраивать, — и не меняется от тика к тику при спокойном каскаде.
-PEERS_JSON=/etc/awg-cascade/peers.json
-PEER_ROUTING_SIG=""
-PEER_TABLES_APPLIED=""
-
-peer_routing_signature() {
-    [ -f "$PEERS_JSON" ] || { echo "-"; return; }
-    local pairs iface up=""
-    pairs=$(jq -r '[.[] | select(.pinned_exit != null) | "\(.ip)>\(.pinned_exit)"]
-                   | sort | join(",")' "$PEERS_JSON" 2>/dev/null)
-    for iface in $(jq -r '[.[] | .pinned_exit // empty] | unique | .[]?' "$PEERS_JSON" 2>/dev/null); do
-        ip link show "$iface" >/dev/null 2>&1 && up="$up$iface:1," || up="$up$iface:0,"
-    done
-    echo "$pairs|$up|$NET_GENERATION"
-}
-
-# Применить per-peer routing rules: pinned peers → их exit (table 100+idx),
-# остальные (auto) — через fwmark→table 100 (ECMP).
-#
-# ВЫЗЫВАТЬ ТОЛЬКО ПРИ ИЗМЕНЕНИИ (см. peer_routing_signature). До v2.1.6 эта
-# функция бежала КАЖДЫЙ тик, то есть раз в 10 секунд сносила правила priority
-# 999 и заново их ставила. В окне между `ip rule del` и `ip rule add` pinned-пир
-# проваливался на общее правило fwmark → table 100 и уезжал в ECMP на чужой
-# exit — то есть его соединения рвались каждые 10 секунд. Плюс `seq 101 199`
-# давал 99 вызовов `ip route show` на тик впустую.
-apply_peer_routing() {
-    [ -f "$PEERS_JSON" ] || return 0
-
-    # ─── Инкрементально, а не «снести всё и построить заново» ────────────────
-    #
-    # Прежняя версия первым делом удаляла ВСЕ правила priority 999, потом
-    # чистила таблицы и только затем строила набор заново. Всё это время
-    # pinned-клиенты проваливались на общее правило fwmark → table 100 и уезжали
-    # в ECMP через чужой exit. Окно открывалось на каждой перестройке, в том
-    # числе по SIGUSR1 — то есть смена пина ОДНОГО клиента временно снимала
-    # привязку у ВСЕХ. Blackhole из v2.2.0 здесь не помогал: он живёт в таблице,
-    # а провал происходил оттого, что правила, ведущего в эту таблицу, уже нет.
-    #
-    # Теперь считаем желаемый набор, сравниваем с фактическим и трогаем только
-    # различия. Для неизменившихся пиров правило не снимается ни на мгновение.
-    local desired="" tid ptid peer peer_ip pinned idx
-    local tables_wanted=""
-
-    while IFS= read -r peer; do
-        peer_ip=$(jq -r .ip <<<"$peer")
-        pinned=$(jq -r '.pinned_exit // empty' <<<"$peer")
-        [ -z "$pinned" ] || [ "$pinned" = "null" ] && continue
-
-        idx=$(echo "$pinned" | sed 's/awg//')
-        [[ "$idx" =~ ^[0-9]+$ ]] || continue
-        ptid=$((100 + idx))
-
-        # 253/254/255 — системные таблицы default/main/local. Индекс exit'а
-        # ограничен 1..99 при добавлении, но старая запись в peers.json могла
-        # остаться от прежних версий: писать в системную таблицу нельзя.
-        if [ "$ptid" -ge 253 ]; then
-            log "PIN $peer_ip → $pinned: table $ptid пересекается с системной, пропускаю"
-            continue
-        fi
-
-        # Содержимое таблицы обновляем ВСЕГДА и ДО правила: ip route replace
-        # атомарен, поэтому пир, чьё правило уже стоит, в этот момент ничего не
-        # теряет — он просто начинает ходить по обновлённому маршруту.
-        #
-        # Интерфейс лежит — кладём blackhole, а не пропускаем пира. Пропуск не
-        # оставляет его без маршрута: он сваливается в ECMP через любой живой
-        # exit, тогда как бот обещает обратное — «выбранный exit недоступен,
-        # интернета нет». Blackhole делает обещание правдой.
-        if ip link show "$pinned" >/dev/null 2>&1; then
-            ip route replace default dev "$pinned" table "$ptid" 2>/dev/null \
-                || log "PIN $peer_ip → $pinned: ip route replace не отработал"
-        else
-            ip route replace blackhole default table "$ptid" 2>/dev/null \
-                || log "PIN $peer_ip → $pinned: blackhole не установился"
-            log "PIN $peer_ip → $pinned: интерфейс down, трафик пира заблокирован (строгая привязка)"
-        fi
-
-        desired="$desired ${peer_ip}=${ptid}"
-        case " $tables_wanted " in
-            *" $ptid "*) ;;
-            *) tables_wanted="$tables_wanted $ptid" ;;
-        esac
-    done < <(jq -c '.[]' "$PEERS_JSON" 2>/dev/null)
-
-    # ─── Фактический набор правил ────────────────────────────────────────────
-    # Строки вида "999:\tfrom 10.0.0.2 lookup 101"
-    local current
-    current=$(ip rule show priority 999 2>/dev/null \
-              | sed -n 's/^999:[[:space:]]*from \([0-9.]*\)\(\/32\)\{0,1\} lookup \([0-9]*\).*/\1=\3/p')
-
-    # 1. Лишние и устаревшие правила — удаляем поимённо, а не все подряд.
-    local rule
-    for rule in $current; do
-        case " $desired " in
-            *" $rule "*) continue ;;
-        esac
-        ip rule del from "${rule%%=*}/32" lookup "${rule##*=}" priority 999 2>/dev/null \
-            || log "PIN: не удалось снять правило $rule"
-    done
-
-    # 2. Недостающие — добавляем.
-    for rule in $desired; do
-        case " $current " in
-            *" $rule "*) continue ;;
-        esac
-        ip rule add from "${rule%%=*}/32" lookup "${rule##*=}" priority 999 2>/dev/null \
-            || log "PIN: не удалось поставить правило $rule"
-    done
-
-    # 3. Таблицы, которые мы наполняли, но которые больше не нужны.
-    for tid in $PEER_TABLES_APPLIED; do
-        case " $tables_wanted " in
-            *" $tid "*) continue ;;
-        esac
-        ip route flush table "$tid" 2>/dev/null
-    done
-    PEER_TABLES_APPLIED="$tables_wanted"
-}
-
-# Перестроить peer-routing, только если желаемое состояние изменилось.
+# Reconcile actual kernel routes every cycle. No startup table flush, no
+# success cache which could conceal external interface recreation.
 sync_peer_routing() {
-    local sig
-    sig=$(peer_routing_signature)
-    [ "$sig" = "$PEER_ROUTING_SIG" ] && return 0
-    apply_peer_routing
-    PEER_ROUTING_SIG="$sig"
+    /usr/bin/python3 -I /usr/local/sbin/awg-cascade-routing.py --peers \
+        || { log "PIN: reconciliation failed; terminal guards retained"; return 1; }
 }
-
-# Разовая уборка на старте. Инкрементальная чистка выше помнит только таблицы,
-# которые наполнил ЭТОТ процесс, поэтому после рестарта watchdog'а таблицы от
-# прошлого запуска остались бы висеть. Сами по себе они безвредны (правил на них
-# нет, значит в маршрутизации не участвуют), но пусть не копятся. Проход по
-# 101..199 стоит дорого только когда он на каждом тике — раз при старте не жалко.
-peer_routing_initial_cleanup() {
-    local tid
-    for tid in $(seq 101 199); do
-        ip route show table "$tid" 2>/dev/null | grep -q . \
-            && ip route flush table "$tid" 2>/dev/null
-    done
-}
+apply_peer_routing() { sync_peer_routing; }
+peer_routing_initial_cleanup() { :; }
 
 # Применить ECMP route в table 100 на основе текущего state
 apply_route() {
+    local route_fd
+    exec {route_fd}>/run/awg-cascade-mutation.lock
+    if ! flock -n -x "$route_fd"; then exec {route_fd}>&-; return 0; fi
     local nexthops=""
     local active=()
     while IFS= read -r row; do
@@ -384,23 +253,23 @@ apply_route() {
     if [ -n "$nexthops" ]; then
         # shellcheck disable=SC2086
         ip route replace default table 100 $nexthops 2>&1 \
-            || log "ERROR: ip route replace failed (nexthops=$nexthops)"
+            || { log "ERROR: ip route replace failed (nexthops=$nexthops)"; exec {route_fd}>&-; return 1; }
         # Каскад снова есть — следующее опустошение должно снова прозвучать.
         ECMP_EMPTY_ANNOUNCED=0
     else
-        ip route flush table 100 2>/dev/null
+        ip route replace blackhole default table 100 2>/dev/null || { log "ERROR: ECMP kill-switch route failed"; exec {route_fd}>&-; return 1; }
         # Формулировка важна. Прежняя строка «kill-switch ACTIVE» верна только
         # для клиентов: их закрывает DROP в FORWARD. Для БОТА пустая таблица
         # поиск не прекращает — RPDB идёт дальше и находит main, то есть запросы
         # к Telegram уходят напрямую с IP этой ноды. Прямой доступ здесь нужен
         # (иначе каскад нечем чинить), но он должен быть видимым режимом, а не
         # побочным эффектом, который читается как «всё заблокировано».
-        log "ECMP empty — table 100 flushed. Клиенты отрезаны (kill-switch), бот работает НАПРЯМУЮ"
+        log "ECMP empty — table 100 flushed. Клиенты отрезаны (kill-switch), бот заблокирован до восстановления exit"
         if [ "${ECMP_EMPTY_ANNOUNCED:-0}" = "0" ]; then
             ECMP_EMPTY_ANNOUNCED=1
             [ -x /usr/local/sbin/awg-cascade-alert.sh ] && /usr/local/sbin/awg-cascade-alert.sh \
                 ecmp-empty 1800 "🛑 Каскад пуст" urgent rotating_light \
-                "Живых exit'ов не осталось: клиенты отрезаны kill-switch'ем. Бот продолжает работать, но его трафик идёт НАПРЯМУЮ — Telegram видит IP этой ноды." \
+                "Живых exit'ов не осталось: клиенты отрезаны kill-switch'ем. Egress бота также заблокирован; восстановление доступно через SSH." \
                 >/dev/null 2>&1 || true
         fi
     fi
@@ -415,6 +284,7 @@ apply_route() {
     local kill_switch
     [ -z "$nexthops" ] && kill_switch=true || kill_switch=false
     update_state ".active_default_route = $active_json | .kill_switch_active = $kill_switch"
+    exec {route_fd}>&-
 }
 
 # Вес по пингу: фиксированные пороги + гистерезис на границе.
@@ -494,6 +364,7 @@ recompute_weights() {
 # ─── Alerting (A): bot egress / ресурсы / healthchecks dead-man ──────────────
 # Bot egress к Telegram через каскад (transition-алерт: state в памяти).
 check_bot_egress() {
+    [ "${BOT_ENABLED:-1}" = 1 ] || return 0
     local code
     code=$(sudo -u "$BOT_USER" curl -s -o /dev/null -w '%{http_code}' \
            --max-time 12 "$EGRESS_CHECK_URL" 2>/dev/null)
@@ -586,7 +457,8 @@ process_exit() {
     [ "$enabled" != "true" ] && return
 
     local ping_ms hs
-    ping_ms=$(smart_ping "$iface")
+    ping_ms=${PROBE_RESULT[$iface]:--2}
+    [ "$ping_ms" != -2 ] || { log "PROBE $iface: no result this cycle"; return; }
     hs=$(hs_age "$iface")
 
     # Fail-safe. smart_ping обязан вернуть число или -1, но если в момент
@@ -626,12 +498,13 @@ process_exit() {
 
     # Reconnect если handshake состарился
     # Reconnect если handshake состарился — но не чаще, чем позволяет backoff.
-    if [ "$hs" -gt "$HANDSHAKE_MAX" ]; then
+    if [ "$hs" -gt "$HANDSHAKE_MAX" ] && [ "$RECONNECTED_THIS_TICK" = 0 ] && [ ! -f /var/lib/awg-cascade/awg3-pending.json ] && [ ! -f /var/lib/awg-cascade/transaction/journal.json ]; then
         local now_ts wait_s
         now_ts=$(date +%s)
         if [ "$now_ts" -ge "${RECONNECT_NEXT[$iface]:-0}" ]; then
             wait_s=${RECONNECT_WAIT[$iface]:-$RECONNECT_BACKOFF_MIN}
             reconnect_iface "$iface" "$wait_s"
+            RECONNECTED_THIS_TICK=1
             RECONNECT_NEXT[$iface]=$(( now_ts + wait_s ))
             wait_s=$(( wait_s * 2 ))
             [ "$wait_s" -gt "$RECONNECT_BACKOFF_MAX" ] && wait_s=$RECONNECT_BACKOFF_MAX
@@ -683,10 +556,17 @@ sync_peer_routing   # первый прогон заодно инициализ�
 # SIGUSR1 = немедленно пересобрать peer-routing (когда бот меняет pin).
 # Строим безусловно и обновляем отпечаток: бот шлёт сигнал именно потому, что
 # уже изменил peers.json, а ждать следующего тика незачем.
-trap 'apply_peer_routing; PEER_ROUTING_SIG=$(peer_routing_signature); log "SIGUSR1: peer routing reapplied"' SIGUSR1
+trap 'sync_peer_routing && log "SIGUSR1: peer routing reconciled"' SIGUSR1
 
 while true; do
     TICK_COUNT=$(( TICK_COUNT + 1 ))
+
+    declare -A PROBE_RESULT=()
+    while read -r probe_iface probe_ms; do
+        [[ "$probe_iface" =~ ^awg[1-9][0-9]?$ ]] || continue
+        PROBE_RESULT[$probe_iface]=$probe_ms
+    done < <(/usr/bin/python3 -I /usr/local/sbin/awg-cascade-probe.py)
+    RECONNECTED_THIS_TICK=0
 
     # Status flips счётчик для apply_route
     status_changed=false

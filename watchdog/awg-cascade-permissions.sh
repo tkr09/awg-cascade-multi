@@ -1,0 +1,51 @@
+#!/bin/bash
+# One-time migration and repeated enforcement of the privileged file boundary.
+set -euo pipefail
+[ "$EUID" -eq 0 ] || exit 1
+. /usr/local/sbin/awg-cascade-cfg.sh
+awgc_load_config
+[[ "$BOT_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ && "$BOT_USER" != root ]] || exit 1
+BASE=/etc/awg-cascade
+BOT=/opt/awg-cascade-bot
+for dir in "$BASE" "$BASE/peers" "$BASE/exits" "$BASE/ssh" "$BOT" "$BOT/scripts"; do
+    [ ! -L "$dir" ] || { echo "Отказ: каталог $dir — симлинк" >&2; exit 1; }
+done
+install -d -m 750 -o root -g "$BOT_USER" "$BASE" "$BASE/peers"
+install -d -m 700 -o root -g root "$BASE/exits"
+install -d -m 700 -o "$BOT_USER" -g "$BOT_USER" "$BASE/ssh"
+if [ -f "$BASE/known_hosts" ] && [ ! -e "$BASE/ssh/known_hosts" ]; then
+    install -m 600 -o "$BOT_USER" -g "$BOT_USER" "$BASE/known_hosts" "$BASE/ssh/known_hosts"
+fi
+for file in config state.json peers.json awg2_params version installed-version active-version activation-pending; do
+    [ ! -L "$BASE/$file" ] || { echo "Отказ: $file — симлинк" >&2; exit 1; }
+    if [ -f "$BASE/$file" ]; then
+        chown "root:$BOT_USER" "$BASE/$file"
+        chmod 640 "$BASE/$file"
+    fi
+done
+for file in "$BASE/peers/"*.conf; do
+    [ -e "$file" ] || continue
+    [ ! -L "$file" ] || exit 1
+    chown "root:$BOT_USER" "$file"; chmod 640 "$file"
+done
+[ ! -L "$BASE/state.lock" ] || exit 1
+touch "$BASE/state.lock"; chown root:root "$BASE/state.lock"; chmod 600 "$BASE/state.lock"
+if [ -d "$BOT" ]; then
+    # A writable parent could replace an otherwise root-owned provisioning script.
+    chown root:root "$BOT"; chmod 755 "$BOT"
+    for dir in "$BOT/scripts" "$BOT/handlers"; do
+        [ ! -L "$dir" ] || exit 1
+        if [ -d "$dir" ]; then
+            [ -z "$(find "$dir" -type l -print -quit)" ] || exit 1
+            chown -R root:root "$dir"
+            find "$dir" -type d -exec chmod 755 {} +
+            find "$dir" -type f -exec chmod 644 {} +
+            [ "$dir" != "$BOT/scripts" ] || find "$dir" -name '*.sh' -exec chmod 755 {} +
+        fi
+    done
+    for file in "$BOT/"*.py "$BOT/"*.txt; do
+        [ -f "$file" ] || continue
+        [ ! -L "$file" ] || exit 1
+        chown root:root "$file"; chmod 644 "$file"
+    done
+fi
