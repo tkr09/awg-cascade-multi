@@ -258,6 +258,7 @@ $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-add-ru.sh
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-remove.sh
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-reserve.sh
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-authkey.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-password.sh
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-provision.sh
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-interclient.sh
 $BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-iptables.sh

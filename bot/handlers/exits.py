@@ -88,6 +88,7 @@ def exit_menu_kb(iface: str, warp: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✏️ Имя",     callback_data=f"exit:rename:{iface}"),
         ],
         [InlineKeyboardButton(text="🔑 Ключ другой RU", callback_data=f"exit:authkey:{iface}")],
+        [InlineKeyboardButton(text="🔓 Вход по паролю", callback_data=f"exit:pwauth:{iface}")],
         [InlineKeyboardButton(text="🔄 Reboot exit",  callback_data=f"exit:reboot:{iface}")],
         [InlineKeyboardButton(text="🗑 Удалить exit", callback_data=f"exit:rm:{iface}")],
         [InlineKeyboardButton(text="◀️ К списку",    callback_data="exits:list")],
@@ -298,6 +299,113 @@ async def fsm_note_text(message: Message, state: FSMContext) -> None:
 
 
 # ─── Rename ──────────────────────────────────────────────────────────────────
+
+PW_HELPER = "/usr/local/sbin/awg-cascade-exit-password.sh"
+PW_WINDOW_MIN = 30
+
+
+def _pwauth_kb(iface: str, on: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if on:
+        rows.append([InlineKeyboardButton(text="🔒 Закрыть сейчас",
+                                          callback_data=f"exit:pwauth-off:{iface}")])
+    else:
+        rows.append([InlineKeyboardButton(text=f"🔓 Открыть на {PW_WINDOW_MIN} мин",
+                                          callback_data=f"exit:pwauth-on:{iface}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"exit:menu:{iface}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _pwauth_call(iface: str, action: str, minutes: int | None = None):
+    args = [PW_HELPER, iface, action] + ([str(minutes)] if minutes else [])
+    out, err, rc = await sudo_run(*args, timeout=60)
+    if rc != 0:
+        try:
+            reason = json.loads((err or out).strip().splitlines()[-1]).get("error", "")
+        except Exception:
+            reason = (err or out)[:300]
+        return None, reason
+    return json.loads(out), ""
+
+
+@router.callback_query(F.data.startswith("exit:pwauth:"))
+@admin_only
+async def cb_pwauth(call: CallbackQuery) -> None:
+    """
+    Временное окно входа по паролю на exit'е.
+
+    Зачем. Новая RU не может подключить уже работающий exit: вход по паролю там
+    выключен, а её ключа в authorized_keys нет. Положить ключ можно только из
+    бота — но бот новой ноды в этот момент нем, потому что без exit'а у него нет
+    пути к Telegram. Круг размыкается отсюда: этот бот на exit ходит по ключу и
+    может открыть окно, после чего провижининг с новой ноды пройдёт по паролю и
+    сам же выключит его обратно.
+    """
+    await call.answer("🔍 Опрашиваю exit…")
+    iface = call.data[len("exit:pwauth:"):]
+    e = _get_exit(state_load(), iface)
+    if not e:
+        return
+    st, reason = await _pwauth_call(iface, "status")
+    if st is None:
+        await safe_edit_text(
+            call.message,
+            "❌ Не удалось опросить exit.\n<pre>" + html_escape(reason) + "</pre>",
+            parse_mode="HTML", reply_markup=_pwauth_kb(iface, False))
+        return
+    on = st.get("password_auth") == "yes"
+    head = f"🔑 <b>Вход по паролю: {html_escape(st['exit'])}</b>\n\n"
+    if on:
+        body = ("Сейчас: <b>открыт</b> 🔓\n"
+                f"Закроется сам: <code>{html_escape(str(st.get('deadline') or 'по таймеру'))}</code>\n\n"
+                "Пока окно открыто, на exit можно зайти root-паролем от хостера.")
+    else:
+        body = (
+            "Сейчас: <b>закрыт</b> 🔒 — вход только по ключу.\n\n"
+            f"Открыть окно нужно, чтобы <b>новая RU</b> смогла подключить этот exit: "
+            f"её ключа здесь ещё нет, а её бот молчит, пока у неё нет ни одного exit'а.\n\n"
+            f"Порядок: открыть окно → на новой ноде выполнить\n"
+            f"<code>awg-cascade-bootstrap-exit.sh {html_escape(st['ip'])} {html_escape(st['exit'])}</code>\n"
+            f"→ провижининг закроет вход по паролю сам.\n\n"
+            f"<i>Окно закрывается автоматически через {PW_WINDOW_MIN} мин, даже если "
+            f"подключение не состоялось и даже если exit за это время перезагрузится.</i>"
+        )
+    await safe_edit_text(call.message, head + body, parse_mode="HTML",
+                         reply_markup=_pwauth_kb(iface, on))
+
+
+@router.callback_query(F.data.startswith("exit:pwauth-on:"))
+@router.callback_query(F.data.startswith("exit:pwauth-off:"))
+@admin_only
+async def cb_pwauth_set(call: CallbackQuery) -> None:
+    turn_on = call.data.startswith("exit:pwauth-on:")
+    await call.answer("⏳ Меняю настройку sshd…")
+    iface = call.data.split(":", 2)[2]
+    e = _get_exit(state_load(), iface)
+    if not e:
+        return
+    res, reason = await _pwauth_call(iface, "on" if turn_on else "off",
+                                     PW_WINDOW_MIN if turn_on else None)
+    if res is None:
+        await safe_edit_text(
+            call.message,
+            "❌ Не вышло.\n<pre>" + html_escape(reason) + "</pre>",
+            parse_mode="HTML", reply_markup=_pwauth_kb(iface, not turn_on))
+        return
+    LOG.warning("password window %s on %s (%s)", "opened" if turn_on else "closed",
+                res["exit"], res["ip"])
+    if turn_on:
+        text = (f"🔓 <b>Окно открыто: {html_escape(res['exit'])}</b>\n\n"
+                f"Закроется само: <code>{html_escape(str(res.get('deadline')))}</code>\n\n"
+                f"Теперь на новой RU:\n"
+                f"<code>awg-cascade-bootstrap-exit.sh {html_escape(res['ip'])} "
+                f"{html_escape(res['exit'])}</code>")
+    else:
+        text = (f"🔒 <b>Окно закрыто: {html_escape(res['exit'])}</b>\n\n"
+                "Вход снова только по ключу.")
+    await safe_edit_text(call.message, text, parse_mode="HTML",
+                         reply_markup=_pwauth_kb(iface, turn_on))
+
 
 class AuthKeyFSM(StatesGroup):
     waiting = State()
