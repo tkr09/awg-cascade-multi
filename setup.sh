@@ -550,7 +550,7 @@ fi
 # Важно: этот блок ДОЛЖЕН совпадать с каноном в awg-cascade-sync.sh — синк
 # приводит файл к своему варианту и стирает всё лишнее.
 cat > /etc/sudoers.d/$BOT_USER <<SUDOEOF
-# AWG Cascade Multi — bot privileges
+# AWG Cascade Multi — $BOT_USER privileges
 # Чтение состояния туннелей (awg show <iface> dump).
 $BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg show *
 # Разбудить watchdog после смены pin/веса.

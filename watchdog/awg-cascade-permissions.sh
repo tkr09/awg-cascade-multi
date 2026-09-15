@@ -40,7 +40,12 @@ if [ -d "$BOT" ]; then
             chown -R root:root "$dir"
             find "$dir" -type d -exec chmod 755 {} +
             find "$dir" -type f -exec chmod 644 {} +
-            [ "$dir" != "$BOT/scripts" ] || find "$dir" -name '*.sh' -exec chmod 755 {} +
+            # В scripts/ лежит комплект провижининга, и он весь исполняемый.
+            # Возврат 755 только для *.sh оставлял awg-cascade-reboot.py с 644:
+            # проверка комплекта в setup.sh требует -x, а sync на каждой свежей
+            # ноде вечно показывал дрейф прав.
+            [ "$dir" != "$BOT/scripts" ] || \
+                find "$dir" \( -name '*.sh' -o -name '*.py' \) -exec chmod 755 {} +
         fi
     done
     for file in "$BOT/"*.py "$BOT/"*.txt; do

@@ -42,6 +42,19 @@ def sudoers_rules(text: str) -> list[str]:
     )
 
 
+def sudoers_text(text: str, start: str) -> str | None:
+    """
+    Тело heredoc'а sudoers целиком, вместе с комментариями.
+
+    sudoers_rules() сравнивает только строки правил, и этого оказалось мало:
+    заголовки различались одним словом («bot privileges» против
+    «$BOT_USER privileges»), из-за чего sync на КАЖДОЙ свежей ноде вечно
+    показывал дрейф sudoers. Файл переписывается целиком, значит и сравнивать
+    надо целиком.
+    """
+    m = re.search(re.escape(start) + r"[^\n]*<<\'?(\w+)\'?\n(.*?)\n\1\n", text, re.S)
+    return m.group(2) if m else None
+
 def upgrade_block(text: str) -> str | None:
     m = re.search(
         r"# ─── Привести образ к актуальному состоянию.*?\nfi\n", text, re.S
@@ -129,7 +142,17 @@ def main() -> int:
         print("  setup.sh:", a)
         print("  sync.sh: ", b)
         bad = 1
-    elif not a:
+    # Правила совпали — теперь весь текст, включая комментарии.
+    x, y = (sudoers_text(setup, "cat > /etc/sudoers.d/$BOT_USER "),
+            sudoers_text(sync, 'cat > "$TMP/sud" '))
+    if x is None or y is None:
+        missing = [n for n, v in (("setup.sh", x), ("awg-cascade-sync.sh", y)) if v is None]
+        fail("тело sudoers не найдено в: " + ", ".join(missing))
+        bad = 1
+    elif x != y:
+        fail("текст sudoers (с комментариями) в setup.sh и sync.sh разошёлся — sync будет вечно показывать дрейф на свежей ноде")
+        bad = 1
+    if not a:
         fail("канон sudoers не найден ни в одном из файлов — проверка ослепла")
         bad = 1
 
