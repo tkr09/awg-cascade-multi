@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -23,6 +24,39 @@ def run(args, data=None, timeout=45):
     result=subprocess.run(args,input=data,capture_output=True,timeout=timeout)
     if result.returncode: raise RuntimeError('operation failed: '+Path(args[0]).name)
     return result.stdout.decode().strip()
+
+
+def write_version_stamp(ssh):
+    """
+    Записать version-stamp на свежий exit.
+
+    До сих пор его писал только awg-cascade-exit-update.sh, то есть ПОСЛЕ
+    первого обновления. Свежепровизиненный exit оставался без файла, и вся
+    диагностика каскада — та, что читает /etc/awg-cascade/version — числила
+    новую ноду как unknown. Версия у неё при этом ровно та, которой её ставили:
+    комплект скриптов приехал с этой RU.
+
+    Не фатально: exit работает и без штампа. Поэтому неудача не роняет
+    провижининг, но и не молчит — уходит в stderr и в поле результата.
+    """
+    try:
+        parts=(BASE/'version').read_text().split()
+    except OSError:
+        return 'skipped: у самой RU нет version-stamp'
+    if not parts:
+        return 'skipped: version-stamp RU пуст'
+    version=parts[0]
+    commit=parts[1] if len(parts)>1 else '?'
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,64}',version) or not re.fullmatch(r'[A-Za-z0-9._-]{1,64}',commit):
+        return 'skipped: version-stamp RU не похож на версию'
+    try:
+        run(ssh+['mkdir -p /etc/awg-cascade && printf "%s %s %s\\n" '
+                 +shlex.quote(version)+' '+shlex.quote(commit)+' "$(date -Iseconds)"'
+                 +' > /etc/awg-cascade/version'])
+    except Exception as exc:
+        print('version-stamp на exit не записан: '+type(exc).__name__,file=sys.stderr)
+        return 'failed: не записан'
+    return version+' '+commit
 
 
 def exit_reboot(ssh, record):
@@ -131,8 +165,9 @@ def main():
         if re.fullmatch(r'/root/awgc-provision\.[A-Za-z0-9]+',record.get('stage','')):
             run(ssh+['rm -rf -- '+record['stage']])
         record_path.unlink()
+        stamp=write_version_stamp(ssh)
         reboot=exit_reboot(ssh,record)
-        print(json.dumps({'ok':True,'index':record['exit_index'],'interface':'awg'+str(record['exit_index']),'reboot':reboot}))
+        print(json.dumps({'ok':True,'index':record['exit_index'],'interface':'awg'+str(record['exit_index']),'reboot':reboot,'version_stamp':stamp}))
         # Код 2, а не 1: exit добавлен и работает, не завершилась только
         # перезагрузка. Повторять провижининг не нужно и вредно — вызывающая
         # сторона обязана различать эти два исхода.
