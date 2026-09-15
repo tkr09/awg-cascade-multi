@@ -94,6 +94,57 @@ if [ -f "$STATE" ]; then
     done < <(jq -c '.exits[]' "$STATE" 2>/dev/null)
 fi
 
+# ─── Управление exit'ами по SSH — глазами БОТА, а не root ────────────────────
+#
+# Заведено по дефекту, прожившему с установки незамеченным: /etc/awg-cascade/
+# ssh/known_hosts принадлежал root:root 600 в каталоге бота. Файл создаёт ssh,
+# запущенный от root (bootstrap-exit.sh вызывается из setup.sh), а владельца
+# никто не выравнивал. Бот терял разом ВСЕ операции с exit'ами по SSH — статус,
+# WARP, удаление, обновление, добавление нового exit'а, — и падал с
+# PermissionError прямо посреди диалога.
+#
+# Незаметно было потому, что снаружи это выглядело как зависший экран в
+# Telegram, а здесь всё горело зелёным: проверки выше ходят от root и через
+# curl. Отсюда правило этой секции — проверять ИМЕННО от имени бота и ИМЕННО
+# тем способом, которым он работает.
+KH=/etc/awg-cascade/ssh/known_hosts
+if [ ! -f "$KH" ]; then
+    emit OK "Реестр host-ключей" "пуст — exit'ов ещё не было"
+elif ! runuser -u "$BOT_USER" -- test -r "$KH" 2>/dev/null; then
+    emit FAIL "Реестр host-ключей" "бот не читает ($(stat -c '%U:%G %a' "$KH"))"
+elif ! runuser -u "$BOT_USER" -- test -w "$KH" 2>/dev/null; then
+    emit FAIL "Реестр host-ключей" "бот не пишет ($(stat -c '%U:%G %a' "$KH")) — TOFU сломан"
+else
+    emit OK "Реестр host-ключей" "бот читает и пишет"
+fi
+
+# Фактический вход на каждый exit от имени бота. Права выше могут быть в
+# порядке, а вход всё равно не пройдёт: сменился host-ключ после переустановки
+# exit'а или пропал ключ бота в authorized_keys. Для бота это одинаково
+# означает «управлять exit'ом не могу», и знать об этом надо ДО того, как
+# понадобится что-то с ним сделать.
+if [ -f "$STATE" ] && [ -f /etc/awg-cascade/ssh/id_ed25519 ]; then
+    ssh_bad=""; ssh_ok=0
+    while IFS= read -r row; do
+        [ "$(jq -r .enabled <<<"$row")" = "true" ] || continue
+        eip=$(jq -r .ip <<<"$row"); ename=$(jq -r .name <<<"$row")
+        if runuser -u "$BOT_USER" -- ssh -F /dev/null \
+                -i /etc/awg-cascade/ssh/id_ed25519 -o IdentitiesOnly=yes \
+                -o IdentityAgent=none -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KH" \
+                -o ConnectTimeout=8 "root@$eip" true >/dev/null 2>&1; then
+            ssh_ok=$((ssh_ok + 1))
+        else
+            ssh_bad="$ssh_bad $ename"
+        fi
+    done < <(jq -c '.exits[]' "$STATE" 2>/dev/null)
+    if [ -n "$ssh_bad" ]; then
+        emit FAIL "SSH бота → exits" "не заходит:$ssh_bad (управление ими недоступно)"
+    elif [ "$ssh_ok" -gt 0 ]; then
+        emit OK "SSH бота → exits" "$ssh_ok из $ssh_ok"
+    fi
+fi
+
 # ─── Egress бота → Telegram (и ПУТЬ, а не только доступность) ────────────────
 #
 # Один только HTTP-код ничего не говорит о маршруте: при пустой таблице 100
