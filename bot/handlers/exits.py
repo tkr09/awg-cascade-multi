@@ -522,6 +522,9 @@ async def cb_warp_toggle(call: CallbackQuery) -> None:
 
 # ─── Reboot exit ─────────────────────────────────────────────────────────────
 
+REBOOT_GUARD = "python3 -I /usr/local/sbin/awg-cascade-reboot.py"
+
+
 @router.callback_query(F.data.startswith("exit:reboot:"))
 @admin_only
 async def cb_exit_reboot(call: CallbackQuery) -> None:
@@ -532,54 +535,83 @@ async def cb_exit_reboot(call: CallbackQuery) -> None:
         return
     flag = name_to_flag(e.get("name", ""))
 
-    # Живые данные с exit'а. КРИТИЧНО: без собранного DKMS под новое ядро
-    # туннели после ребута не поднимутся — проверяем ДО, а не после.
+    # Готовность ядра проверяет ОБЩИЙ guard на самом exit'е, а не самодельный
+    # подсчёт строк здесь.
+    #
+    # Раньше экран считал совпадения версии ядра во всём выводе `dkms status`.
+    # Совпасть могла строка другого модуля или состояние built — и владелец
+    # видел «всё готово» там, где модуля для целевого ядра нет. После загрузки
+    # туннель бы не поднялся (A05 аудита v2.7.6).
+    #
+    # awg-cascade-reboot.py проверяет фактическую первую запись grub.cfg, статус
+    # installed именно для amneziawg и наличие файла модуля под это ядро, а при
+    # нестандартном GRUB_DEFAULT или одноразовом next_entry отказывается вовсе.
     probe = (
-        "run=$(uname -r); "
-        "new=$(dpkg -l 'linux-image-[0-9]*' 2>/dev/null | awk '/^ii/{print $2}' "
-        "| sed 's/linux-image-//' | sort -V | tail -1); "
-        "echo \"run=$run\"; echo \"new=$new\"; "
         "echo \"up=$(uptime -p | sed 's/^up //')\"; "
+        "echo \"run=$(uname -r)\"; "
         "echo \"pending=$([ -f /var/run/reboot-required ] && echo yes || echo no)\"; "
-        "echo \"dkms=$(dkms status 2>/dev/null | grep -cF \"$new\")\""
+        "echo \"tunnels=$(ls -1 /etc/amnezia/amneziawg/awg-in*.conf 2>/dev/null | wc -l)\"; "
+        "g=$(" + REBOOT_GUARD + " 2>&1); rc=$?; "
+        "echo \"guard_rc=$rc\"; echo \"guard=$(echo \"$g\" | tr '\\n' ' ')\""
     )
-    out, _, rc = await ssh_exec(e["ip"], probe, username="root", key_path=SSH_KEY, timeout=25)
+    out, _, rc = await ssh_exec(e["ip"], probe, username="root", key_path=SSH_KEY, timeout=30)
     info = dict(
         l.split("=", 1) for l in out.strip().splitlines() if "=" in l
     ) if rc == 0 else {}
 
+    approved = False
     if not info:
         body = "⚠️ <i>Не удалось опросить exit по SSH — состояние неизвестно.</i>"
-        dkms_warn = ""
+        guard_line = ""
     else:
-        run, new = info.get("run", "?"), info.get("new", "?")
-        kern = (f"<code>{html_escape(run)}</code>" if run == new
-                else f"<code>{html_escape(run)}</code> → <code>{html_escape(new)}</code>")
         pend = "🔴 да" if info.get("pending") == "yes" else "✅ нет"
         body = (
-            f"Ядро:      {kern}\n"
-            f"Uptime:    <code>{html_escape(info.get('up', '?'))}</code>\n"
+            f"Ядро сейчас: <code>{html_escape(info.get('run', '?'))}</code>\n"
+            f"Uptime:      <code>{html_escape(info.get('up', '?'))}</code>\n"
             f"Ждёт ребута: {pend}"
         )
-        dkms_warn = ("\n\n🔴 <b>ОПАСНО: DKMS-модуль amneziawg НЕ собран под "
-                     f"<code>{html_escape(new)}</code></b> — после ребута туннели "
-                     "могут не подняться!") if info.get("dkms", "0") == "0" else ""
+        approved = info.get("guard_rc") == "0"
+        if approved:
+            try:
+                target = json.loads(info.get("guard", "{}")).get("boot_kernel", "?")
+            except Exception:
+                target = "?"
+            guard_line = ("\n\n✅ <b>Проверено:</b> загрузится "
+                          f"<code>{html_escape(str(target))}</code>, "
+                          "модуль amneziawg для него установлен.")
+        else:
+            guard_line = ("\n\n🔴 <b>Проверка готовности НЕ пройдена:</b>\n"
+                          f"<pre>{html_escape(info.get('guard', 'нет ответа')[:300])}</pre>"
+                          "После такой перезагрузки туннель может не подняться.")
 
-    # Кто пострадает: пиры, запиненные на этот exit
+    # Shared exit: на сервере живёт туннель ещё одной RU, и её клиентов мы
+    # уроним заодно. Владелец этой RU про них ничего не знает.
+    others = max(0, int(info.get("tunnels", "1") or 1) - 1) if info else 0
+    shared_line = (
+        f"\n\n⚠️ <b>Exit общий:</b> на нём ещё {others} туннель(я) другой RU — "
+        "перезагрузка оборвёт и их."
+    ) if others else ""
+
     pinned = [p["name"] for p in peers_list() if p.get("pinned_exit") == iface]
     pinned_line = (
         f"\n\n📌 Потеряют интернет на время ребута (pinned): "
         f"<b>{html_escape(', '.join(pinned))}</b>"
     ) if pinned else ""
 
+    if approved:
+        action = InlineKeyboardButton(text="🔄 Перезагрузить",
+                                      callback_data=f"exit:reboot-yes:{iface}")
+    else:
+        action = InlineKeyboardButton(text="⚠️ Перезагрузить без проверки",
+                                      callback_data=f"exit:reboot-force:{iface}")
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Перезагрузить", callback_data=f"exit:reboot-yes:{iface}"),
-        InlineKeyboardButton(text="❌ Отмена",        callback_data=f"exit:menu:{iface}"),
+        action,
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"exit:menu:{iface}"),
     ]])
     await safe_edit_text(
         call.message,
         f"<b>🔄 Reboot: {flag} {e['name']}</b>  <code>{e['ip']}</code>\n\n"
-        f"{body}{dkms_warn}\n\n"
+        f"{body}{guard_line}{shared_line}\n\n"
         f"Exit выпадет из ECMP на ~1 мин. Остальные пиры (Auto) переключатся "
         f"на живые exits автоматически, watchdog вернёт этот в строй после загрузки."
         f"{pinned_line}",
@@ -588,14 +620,38 @@ async def cb_exit_reboot(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("exit:reboot-yes:"))
+@router.callback_query(F.data.startswith("exit:reboot-force:"))
 @admin_only
 async def cb_exit_reboot_yes(call: CallbackQuery) -> None:
+    forced = call.data.startswith("exit:reboot-force:")
     await call.answer("⏳ Перезагружаю…")
-    iface = call.data[len("exit:reboot-yes:"):]
+    iface = call.data.split(":", 2)[2]
     e = _get_exit(state_load(), iface)
     if not e:
         return
     flag = name_to_flag(e.get("name", ""))
+
+    # Проверяем ПОВТОРНО, прямо перед командой: между экраном подтверждения и
+    # нажатием могло пройти сколько угодно времени, а состояние ноды за это
+    # время меняется — например, приехало новое ядро.
+    if not forced:
+        out, err, rc = await ssh_exec(e["ip"], REBOOT_GUARD,
+                                      username="root", key_path=SSH_KEY, timeout=30)
+        if rc != 0:
+            await safe_edit_text(
+                call.message,
+                f"🔴 <b>Перезагрузка отменена:</b> проверка готовности не пройдена.\n"
+                f"<pre>{html_escape((err or out)[:400])}</pre>\n"
+                "Можно перезагрузить вручную, но туннель после этого может не подняться.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="⚠️ Всё равно перезагрузить",
+                                         callback_data=f"exit:reboot-force:{iface}"),
+                    InlineKeyboardButton(text="❌ Отмена",
+                                         callback_data=f"exit:menu:{iface}"),
+                ]]),
+            )
+            return
 
     # Отложенный ребут: обычный `reboot` по SSH не срабатывает — sshd убивается
     # раньше, чем systemd выполнит команду. Таймер переживает разрыв сессии.
@@ -613,9 +669,11 @@ async def cb_exit_reboot_yes(call: CallbackQuery) -> None:
         )
         return
 
+    LOG.warning("reboot %s (%s) forced=%s", e["name"], e["ip"], forced)
+    head = ("⚠️ <b>Перезагрузка БЕЗ проверки готовности</b>\n\n" if forced else "")
     await safe_edit_text(
         call.message,
-        f"🔄 <b>{flag} {e['name']}</b> уходит в перезагрузку…\n\n"
+        f"{head}🔄 <b>{flag} {e['name']}</b> уходит в перезагрузку…\n\n"
         f"Обычно возвращается за ~60–90 сек. Watchdog сам вернёт его в ECMP "
         f"после появления handshake.\n\n"
         f"<i>Проверить: 📊 Статус или 🩺 Диагностика через минуту.</i>",
