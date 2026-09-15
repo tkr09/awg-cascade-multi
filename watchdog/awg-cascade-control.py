@@ -183,6 +183,38 @@ def read_payload(stream=sys.stdin, *, single=True):
     return json.loads(line)
 
 
+def read_request(timeout=30, limit=MAX_PAYLOAD):
+    """
+    Прочитать запрос ЦЕЛИКОМ под общим дедлайном.
+
+    Прежний порядок — select() на 30 секунд, затем readline() — ограничивал
+    только ожидание ПЕРВЫХ данных. Клиент, отправивший часть строки и не
+    закрывший поток, удерживал state.lock неограниченно, и все остальные
+    операции с состоянием начинали отваливаться по таймауту (A07 аудита
+    v2.7.6). Причиной мог быть и просто зависший локальный клиент.
+
+    Здесь дедлайн ОБЩИЙ на всё сообщение, есть предел размера и обработка EOF:
+    нарушение протокола — это отказ, после которого блокировка освобождается.
+    """
+    import select
+    fd = sys.stdin.fileno()
+    deadline = time.monotonic() + timeout
+    buffer = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise TimeoutError('запрос не получен целиком за отведённое время')
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            raise ValueError('поток закрыт до конца запроса')
+        buffer += chunk
+        if len(buffer) > limit:
+            raise ValueError('запрос превышает допустимый размер')
+        if b'\n' in buffer:
+            break
+    return json.loads(buffer.split(b'\n', 1)[0].decode())
+
+
 def bot_gid():
     import grp
     cfg = (BASE / 'config').read_text()
@@ -218,9 +250,7 @@ def edit_data(kind):
         current = json.loads(path.read_text())
         validate(current)
         print(json.dumps(current, separators=(',', ':')), flush=True)
-        if not select.select([sys.stdin], [], [], 30)[0]:
-            raise TimeoutError('client did not commit data')
-        updated = read_payload()
+        updated = read_request(30)
         validate(updated)
         # Data broker exposes metadata only; identities/keys require a transaction.
         allowed = {'name', 'note', 'enabled', 'weight', 'warp_state', 'warp_exit_ip', 'warp_exit_geo'} if kind == 'state' else {'note', 'pinned_exit', 'lan_allow'}
