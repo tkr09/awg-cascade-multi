@@ -19,7 +19,7 @@ emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
 
 # ─── Сервисы ──────────────────────────────────────────────────────────────────
 svc_bad=""
-for s in awg-cascade-bot awg-cascade-watchdog awg-quick@awg0 ${CLIENT3_IFACE:+awg-quick@$CLIENT3_IFACE}; do
+for s in $([ "${BOT_ENABLED:-1}" = 1 ] && echo awg-cascade-bot) awg-cascade-watchdog awg-quick@awg0 ${CLIENT3_IFACE:+awg-quick@$CLIENT3_IFACE}; do
     systemctl is-active --quiet "$s" 2>/dev/null || svc_bad="$svc_bad $s"
 done
 [ -z "$svc_bad" ] && emit OK "Сервисы" "bot/watchdog/awg0${CLIENT3_IFACE:+/$CLIENT3_IFACE} active" \
@@ -42,26 +42,26 @@ nh=$(ip route show table 100 2>/dev/null | grep -c nexthop)
 ifs=$(ip route show table 100 2>/dev/null | grep -oE 'dev awg[0-9]+' | awk '{print $2}' | tr '\n' ' ')
 if [ "$nh" -gt 0 ]; then
     emit OK "ECMP (table 100)" "$nh exits: $ifs"
+# blackhole default ставит watchdog, когда живых exit нет вообще. Это ровно
+# kill-switch, и раньше он проходил как «OK single:» — `grep -q default` ловит
+# и blackhole тоже. Зелёная строка при полностью отрезанных клиентах.
+elif ip route show table 100 2>/dev/null | grep -q "^blackhole default"; then
+    emit FAIL "ECMP (table 100)" "blackhole — kill-switch активен, живых exit нет"
 elif ip route show table 100 2>/dev/null | grep -q default; then
     emit OK "ECMP (table 100)" "single: $ifs"
 else
     emit FAIL "ECMP (table 100)" "ПУСТА — kill-switch активен (нет exits)"
 fi
 
-# ─── Kill-switch + MASQUERADE ────────────────────────────────────────────────
-iptables -S FORWARD 2>/dev/null | grep -q "awg-cascade-killsw" \
-    && emit OK "Kill-switch" "FORWARD-правило на месте" \
-    || emit WARN "Kill-switch" "правило не найдено"
-
-m1=$(iptables -t nat -S POSTROUTING 2>/dev/null | grep -c "awg-cascade-masq")
-m2=$(iptables -t nat -S POSTROUTING 2>/dev/null | grep -c "tunnel-masq")
-if [ "$m1" -gt 0 ] && [ "$m2" -gt 0 ]; then
-    emit OK "MASQUERADE" "client + tunnel"
-elif [ "$m1" -gt 0 ]; then
-    emit WARN "MASQUERADE" "tunnel-masq отсутствует — egress может флапать"
-else
-    emit FAIL "MASQUERADE" "правила отсутствуют"
-fi
+# Managed chains and the complete default-deny policy.
+if iptables -C FORWARD -m comment --comment awg-cascade-managed -j AWGC-FORWARD 2>/dev/null &&
+   iptables -C AWGC-FORWARD -i awg0 -j DROP 2>/dev/null; then
+    emit OK "Kill-switch" "managed chain + default deny"
+else emit FAIL "Kill-switch" "managed policy missing"; fi
+if iptables -t nat -S AWGC-NAT 2>/dev/null | grep -q MASQUERADE; then
+    emit OK "MASQUERADE" "managed NAT chain"
+else emit FAIL "MASQUERADE" "managed NAT missing"; fi
+if [ -e /etc/awg-cascade/activation-pending ]; then emit WARN "Activation" "installed files are pending runtime activation"; fi
 
 # ─── Интерфейсы: клиентские + exits из state ─────────────────────────────────
 ip link show awg0 >/dev/null 2>&1 && emit OK "awg0 (клиенты 2.0)" "up" || emit FAIL "awg0 (клиенты 2.0)" "DOWN"

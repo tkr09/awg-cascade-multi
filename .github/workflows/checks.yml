@@ -42,6 +42,11 @@ jobs:
           echo "--- warning-уровень (не блокирует) ---"
           git ls-files '*.sh' | xargs shellcheck -S warning -e SC1091,SC2086 || true
 
+      - name: regression tests (isolated kernel routing and firewall)
+        run: |
+          sudo apt-get install -y -qq iproute2 iptables
+          sudo unshare --net env AWGC_NETNS_TEST=1 python3 tests/test_stability.py
+
       - name: продублированные блоки не разошлись
         run: python3 .github/check-duplication.py
 
@@ -53,8 +58,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: bot SSH and asynchronous IO regression tests
+        run: |
+          python -m pip install -r bot/requirements.txt
+          python tests/test_bot_stability.py
+
       - name: компиляция файлов бота
-        run: python -m compileall -q bot
+        run: python -m compileall -q bot watchdog tests
 
       - name: встроенные в shell python-блоки компилируются
         run: |

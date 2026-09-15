@@ -61,6 +61,12 @@ def dkms_verify_block(text: str) -> str | None:
     return m.group(0) if m else None
 
 
+def netconflict_block(text: str) -> str | None:
+    """Снятие конфликта ifupdown/netplan — тоже в двух установщиках."""
+    m = re.search(r"# ─── Двойное управление сетью.*?\nfi\n", text, re.S)
+    return m.group(0) if m else None
+
+
 def check_config_before_helpers() -> int:
     """
     config должен записываться РАНЬШЕ, чем запускается что-либо его читающее.
@@ -141,6 +147,7 @@ def main() -> int:
     # Разойдутся — и одна из ролей начнёт собирать модуль только под текущее
     # ядро. Заметно это станет после первой перезагрузки: нода без amneziawg.
     for what, fn in (("секция ядра", kernel_block),
+                     ("снятие конфликта ifupdown/netplan", netconflict_block),
                      ("проверка DKMS под новейшее ядро", dkms_verify_block)):
         u, v = fn(setup), fn(setup_exit)
         if u is None or v is None:
@@ -160,6 +167,9 @@ def main() -> int:
         "awg-cascade-exit-warp.sh",
         "awg-cascade-ssh-harden.sh",
         "awg-cascade-fail2ban.sh",
+        "awg-cascade-cfg.sh",
+        "awg-cascade-autoreboot.sh",
+        "awg-cascade-reboot.py",
     }
     for name, text in (("setup.sh", setup), ("awg-cascade-sync.sh", sync)):
         missing = sorted(n for n in want if "/scripts/" + n not in text)
@@ -168,7 +178,7 @@ def main() -> int:
             bad = 1
 
     if not bad:
-        print("сошлось: sudoers, apt upgrade, ядро+DKMS, комплект provisioning, "
+        print("сошлось: sudoers, apt upgrade, ядро+DKMS, сеть, комплект provisioning, "
               "порядок «config раньше helper'ов»")
     return bad
 

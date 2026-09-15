@@ -51,7 +51,9 @@ fi
 # Клон или обновление
 if [ -d "$SRC/.git" ]; then
     echo -e "${YELLOW}[i]${NC} Источник уже есть в $SRC — обновляю..."
-    git -C "$SRC" fetch --tags --quiet
+    [ -z "$(git -C "$SRC" status --porcelain)" ] || { echo "В исходниках есть незакоммиченные правки — обновление отменено" >&2; exit 1; }
+    git -C "$SRC" fetch --tags --prune --quiet origin
+    git -C "$SRC" remote set-head origin --auto >/dev/null
 else
     echo -e "${YELLOW}[i]${NC} Клонирую репо..."
     git clone --quiet "$REPO_URL" "$SRC"
@@ -59,14 +61,14 @@ fi
 
 # Последний тег определяем ПОСЛЕ клона: до него репозитория ещё нет.
 if [ -z "$REF" ]; then
-    REF=$(git -C "$SRC" describe --tags --abbrev=0 2>/dev/null || echo main)
+    REF=$(git -C "$SRC" describe --tags --abbrev=0 refs/remotes/origin/HEAD) || { echo "Тегов релиза нет — задай REF явно" >&2; exit 1; }
     echo -e "${YELLOW}[i]${NC} REF не задан — беру последний тег: ${BOLD}$REF${NC}"
 fi
 git -C "$SRC" checkout --quiet "$REF" || {
     echo -e "${RED}[✗]${NC} версия '$REF' не найдена в репозитории"; exit 1; }
 # Если REF — ветка, её ещё надо подтянуть. Для тега pull не нужен и вреден.
 if git -C "$SRC" symbolic-ref -q HEAD >/dev/null 2>&1; then
-    git -C "$SRC" pull --ff-only --quiet 2>/dev/null || true
+    git -C "$SRC" pull --ff-only --quiet || { echo "Не удалось обновить ветку" >&2; exit 1; }
 fi
 
 # Permissions для исполняемых скриптов

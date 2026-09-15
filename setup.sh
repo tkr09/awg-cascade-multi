@@ -19,11 +19,17 @@
 # =============================================================================
 
 set -e
+umask 077
 sed -i 's/\r//' "$0" 2>/dev/null || true
 
 # ─── Цвета ────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# Цвета задаём через ANSI-C quoting ($'...'), а не обычными кавычками.
+# С обычными в переменной лежит ТЕКСТ [1m, и он превращается в escape только
+# у `echo -e`. В heredoc'ах и у простого `echo` он печатался буквально — владелец
+# видел в выводе установки строки вида [1mбот может не отвечать[0m.
+# С $'...' в переменной сразу настоящий байт, и вывод одинаков везде.
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 
 ok()     { echo -e "${GREEN}[✓]${NC} $1"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $1"; }
@@ -63,12 +69,18 @@ BOT_USER=awgbot
 # Валидация содержимого (наличие watchdog/, bot/, systemd/) осталась в Phase 8b.
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 
+. "$REPO_DIR/watchdog/awg-cascade-cfg.sh"
+
 # AmneziaWG v2.0 параметры — генерируем через awg2-params.sh (sourced ниже).
 # Каждая установка получает уникальные H-ranges + случайные S1-S4.
 # Совместимо с amnezia-client v2.0 (формат idential to реальному client config).
 
 # ─── Баннер ───────────────────────────────────────────────────────────────────
-clear
+# `clear` без TERM возвращает ненулевой код, а здесь set -e: голый вызов
+# обрывал установку прямо на баннере, и всё, что оставалось от запуска, —
+# строка «TERM environment variable not set». Любой прогон без терминала
+# (nohup, cron, вызов из бота) умирал именно так.
+clear 2>/dev/null || true
 echo -e "${BOLD}${CYAN}"
 cat << 'BANNER'
     ╔══════════════════════════════════════════════════════════╗
@@ -110,7 +122,7 @@ header "1. Параметры установки"
 # Загружаем предыдущие если есть
 # Прошлый config читаем разбором, а не source: он принадлежит боту.
 if [ -f "$CONFIG_FILE" ]; then
-    . "$REPO_DIR/watchdog/awg-cascade-cfg.sh" && awgc_load_config "$CONFIG_FILE" || . "$CONFIG_FILE"
+    . "$REPO_DIR/watchdog/awg-cascade-cfg.sh" && awgc_load_config "$CONFIG_FILE" || err "Config не прошёл разбор"
 fi
 
 # Public IP (для endpoint в клиентских конфигах)
@@ -133,23 +145,19 @@ prompt "Подсеть клиентов [${CLIENT_NET}]: "; read_tty inp; [ -n "
     SERVER_IP=$(echo "$CLIENT_NET" | sed 's|0/24$|1|')
 }
 
-# Telegram
-if [ -z "$TG_TOKEN" ]; then
-    prompt "Telegram bot token (от @BotFather): "; read_tty TG_TOKEN
+# BOT_ENABLED=0 supports a headless installation/test stand with no messages.
+BOT_ENABLED=${BOT_ENABLED:-1}
+if [ "$BOT_ENABLED" = 1 ]; then
+    if [ -z "${TG_TOKEN:-}" ]; then prompt "Telegram bot token: "; read_tty TG_TOKEN; fi
+    [ -n "$TG_TOKEN" ] || err "TG_TOKEN required"
+    if [ -z "${TG_CHAT_ID:-}" ]; then prompt "Telegram chat ID: "; read_tty TG_CHAT_ID; fi
+    [ -n "$TG_CHAT_ID" ] || err "TG_CHAT_ID required"
+    if [ -z "${NTFY_TOPIC:-}" ]; then prompt "ntfy topic (optional): "; read_tty NTFY_TOPIC; fi
+else
+    TG_TOKEN=""; TG_CHAT_ID=0; NTFY_TOPIC=""
 fi
-[ -z "$TG_TOKEN" ] && err "Token обязателен (можно env: TG_TOKEN=... bash setup.sh)"
-
-if [ -z "$TG_CHAT_ID" ]; then
-    prompt "Telegram chat_id (твой ID, узнать у @userinfobot): "; read_tty TG_CHAT_ID
-fi
-[ -z "$TG_CHAT_ID" ] && err "Chat ID обязателен"
-
-# ntfy
-if [ -z "$NTFY_TOPIC" ]; then
-    prompt "ntfy.sh topic (для emergency alerts, можно создать любое имя): "; read_tty NTFY_TOPIC
-fi
-[ -z "$NTFY_TOPIC" ] && err "ntfy topic обязателен"
-NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
+NTFY_URL=""
+[ -z "${NTFY_TOPIC:-}" ] || NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
 
 # ─── Версии протокола ───────────────────────────────────────────────────────
 #
@@ -191,43 +199,40 @@ header "2. Установка пакетов"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# На fresh Ubuntu cloud-init запускает unattended-upgrades сразу после boot.
-# Это держит /var/lib/dpkg/lock-frontend 5-10 минут и валит setup.sh
-# с "Could not get lock". Гасим apt-сервисы перед нашими apt-операциями.
-info "Останавливаю cloud-init apt-сервисы (если работают)..."
-systemctl stop unattended-upgrades.service \
-               apt-daily.service apt-daily-upgrade.service \
-               apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-pkill -9 unattended-upgr 2>/dev/null || true
-
-# Ждём освобождения ВСЕХ четырёх apt-локов. ВАЖНО: /var/cache/apt/archives/lock
-# тоже надо проверять — иначе apt-get падает на нём даже когда остальные свободны
-# (apt-daily-upgrade на first-boot держит именно archives/lock при скачивании).
-# После grace-периода держателей убиваем принудительно (provisioning, сервер наш).
+# Pause timers only; never kill dpkg/apt or stop an in-flight package job.
+AWGC_APT_TIMERS=()
+awgc_restore_apt() {
+    local t
+    for t in "${AWGC_APT_TIMERS[@]}"; do systemctl start "$t" || return 1; done
+    AWGC_APT_TIMERS=()
+}
+awgc_install_exit() {
+    local rc=$?
+    trap - EXIT
+    awgc_restore_apt || rc=1
+    exit "$rc"
+}
+trap awgc_install_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+for t in apt-daily.timer apt-daily-upgrade.timer; do
+    if systemctl is-active --quiet "$t"; then
+        AWGC_APT_TIMERS+=("$t")
+        systemctl stop "$t" || err "Не удалось остановить таймер $t"
+    fi
+done
 APT_LOCKS="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
 wait_apt_lock() {
-    local max=600 elapsed=0 grace=120
+    local elapsed=0
     while fuser $APT_LOCKS >/dev/null 2>&1; do
-        if [ $elapsed -ge $max ]; then
-            err "apt lock не освободился за 10 минут (что-то странное на сервере)"
-        fi
-        if [ $elapsed -ge $grace ]; then
-            warn "apt lock держится >${grace}s — убиваю держателей принудительно"
-            fuser -k $APT_LOCKS 2>/dev/null || true
-            sleep 3
-            dpkg --configure -a 2>/dev/null || true
-        fi
-        [ $((elapsed % 30)) -eq 0 ] && info "apt lock занят, жду... (${elapsed}s/$max)"
-        sleep 5
-        elapsed=$((elapsed + 5))
+        [ "$elapsed" -lt 600 ] || err "apt занят дольше 600 с — пакетные процессы оставлены работать"
+        sleep 5; elapsed=$((elapsed + 5))
     done
 }
 wait_apt_lock
+dpkg --configure -a || err "dpkg --configure -a не отработал"
+[ -z "$(dpkg --audit)" ] || err "dpkg --audit нашёл недонастроенные пакеты"
 
-# Восстановление после прерванной установки (dpkg half-configured). Идемпотентно.
-dpkg --configure -a 2>/dev/null || true
-
-info "apt update..."
 apt-get update -qq
 
 # ─── Привести образ к актуальному состоянию ──────────────────────────────────
@@ -273,7 +278,14 @@ if [ "${AWGC_SKIP_UPGRADE:-0}" = "1" ]; then
     warn "apt upgrade пропущен (AWGC_SKIP_UPGRADE=1)"
 else
     # Чистая нода — та, где нашего каскада нет ни в одной из двух ролей.
-    if [ -f /etc/awg-cascade/version ] || [ -f /etc/awg-cascade-exit/info.json ]; then
+    #
+    # Признак снимается ЗДЕСЬ и живёт до конца скрипта. Ниже установка сама
+    # создаст /etc/awg-cascade/version, и повторная проверка в конце сочла бы
+    # ноду действующей. От признака зависит не только режим apt, но и право на
+    # автоматическую перезагрузку в конце: на действующей ноде её быть не должно.
+    AWGC_FRESH=1
+    if [ -f /etc/awg-cascade/version ] || [ -f /etc/awg-cascade-exit/info.json ]; then AWGC_FRESH=0; fi
+    if [ "$AWGC_FRESH" = 0 ]; then
         _upg_mode="upgrade";      _upg_what="пакеты образа (нода действующая — ядро не трогаю)"
     else
         _upg_mode="dist-upgrade"; _upg_what="пакеты образа вместе с ядром"
@@ -317,9 +329,11 @@ NRCONF
             # настроен. Валить из-за этого установку нельзя, но и молча
             # считать успехом тоже.
             warn "apt upgrade вернул ошибку — до-настраиваю пакеты"
-            dpkg --configure -a 2>&1 | tail -5 | sed 's/^/    /' || true
+            dpkg --configure -a || err "dpkg --configure -a не отработал при восстановлении"
+            [ -z "$(dpkg --audit)" ] || err "dpkg --audit нашёл недонастроенные пакеты после восстановления"
             if apt-get -s -q -y check >/dev/null 2>&1; then
-                ok "Пакеты настроены; ошибка была в запуске сервиса, не в установке"
+                warn "Зависимости пакетов целы, но upgrade не прошёл — нужен повтор"
+                exit 1
             else
                 err "apt остался в нерабочем состоянии. Почини вручную и повтори:
      apt-get -f install; dpkg --configure -a"
@@ -345,19 +359,31 @@ AWGC_KERNEL_NEWEST="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' 
 
 # Собрать модуль под все установленные ядра. Вызывается сразу после установки
 # amneziawg-dkms: к этому моменту исходники модуля на месте.
+awgc_kernel_ready() {
+    local k="$1" module
+    module=$(modinfo -k "$k" -n amneziawg 2>/dev/null) || return 1
+    [ -f "$module" ] || return 1
+    if command -v dkms >/dev/null 2>&1 && dkms status -m amneziawg -k "$k" 2>/dev/null | grep -q .; then
+        dkms status -m amneziawg -k "$k" 2>/dev/null | awk -F', ' -v k="$k" '
+            $2 == k && $3 ~ /: installed$/ {ok=1} END {exit !ok}' || return 1
+    fi
+}
 awgc_dkms_all_kernels() {
     local k built=""
-    command -v dkms >/dev/null 2>&1 || { echo ""; return 0; }
-    for k in $(ls -1 /lib/modules 2>/dev/null | sort -V); do
-        [ -e "/boot/vmlinuz-$k" ] || continue          # не ядро, а мусор в /lib/modules
-        if [ ! -d "/lib/modules/$k/build" ]; then
-            wait_apt_lock
-            apt-get install -y -qq "linux-headers-$k" >/dev/null 2>&1 || true
+    for k in $(ls -1 /lib/modules | sort -V); do
+        [ -e "/boot/vmlinuz-$k" ] || continue
+        if ! awgc_kernel_ready "$k"; then
+            command -v dkms >/dev/null 2>&1 || { warn "Для ядра $k нет ни модуля, ни dkms"; return 1; }
+            if [ ! -d "/lib/modules/$k/build" ]; then
+                wait_apt_lock
+                apt-get install -y -qq "linux-headers-$k" >/dev/null || return 1
+            fi
+            dkms autoinstall -k "$k" || return 1
+            awgc_kernel_ready "$k" || { warn "Модуль не установлен для ядра $k"; return 1; }
         fi
-        [ -d "/lib/modules/$k/build" ] || { warn "нет заголовков для ядра $k"; continue; }
-        dkms autoinstall -k "$k" >/dev/null 2>&1 || true
-        dkms status amneziawg 2>/dev/null | grep -q "$k" && built="$built $k"
+        built="$built $k"
     done
+    awgc_kernel_ready "$AWGC_KERNEL_RUNNING" || return 1
     echo "${built# }"
 }
 
@@ -383,6 +409,41 @@ if systemd-detect-virt --quiet 2>/dev/null; then
         systemctl reset-failed fwupd.service >/dev/null 2>&1 || true
         ok "fwupd замаскирован (виртуалка: $(systemd-detect-virt 2>/dev/null), прошивок нет)"
     fi
+fi
+
+# ─── Двойное управление сетью в образе хостера ───────────────────────────────
+#
+# Наблюдалось на HOSTKEY: SolusVM кладёт в /etc/network/interfaces статику для
+# eth0, а cloud-init — netplan с DHCP. Адрес выдаёт networkd, после чего
+# ifupdown пытается присвоить тот же адрес второй раз и падает с «Address
+# already assigned». Каждую загрузку в systemctl --failed висят
+# networking.service и ifup@<iface>. Сеть при этом работает.
+#
+# Чиним по той же причине, что и fwupd выше: постоянный красный список — это
+# то, из-за чего перестают замечать настоящие аварии.
+#
+# Трогаем ТОЛЬКО когда доказано, что ifupdown здесь лишний:
+#   • интерфейс сейчас настроен systemd-networkd из netplan-файла;
+#   • маршрут по умолчанию идёт через него и получен по DHCP, то есть не от
+#     ifupdown;
+#   • юнит ifupdown для этого интерфейса действительно в failed.
+# Не совпало хоть одно — не делаем НИЧЕГО. Остаться с красным юнитом лучше,
+# чем с недоступной нодой, до которой ехать через консоль хостера.
+#
+# disable недостаточно: ifup@<iface> запускает udev при появлении интерфейса,
+# поэтому именно mask. Проверено перезагрузкой: после disable юнит вернулся в
+# failed, после mask — нет.
+_net_if=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+if [ -n "${_net_if:-}" ] \
+   && command -v networkctl >/dev/null 2>&1 \
+   && networkctl status "$_net_if" 2>/dev/null | grep -q '/run/systemd/network/.*netplan' \
+   && ip route show default 2>/dev/null | grep -q 'proto dhcp' \
+   && systemctl is-failed --quiet "ifup@${_net_if}.service" 2>/dev/null; then
+    [ -f /etc/network/interfaces ] && cp -a /etc/network/interfaces /etc/network/interfaces.bak-awgc
+    systemctl mask "ifup@${_net_if}.service" >/dev/null 2>&1 || true
+    systemctl disable --now networking.service >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+    ok "Сеть: снят конфликт ifupdown/netplan на $_net_if (адрес держит networkd)"
 fi
 
 info "Базовые утилиты..."
@@ -453,10 +514,9 @@ ok "Модуль amneziawg загружен"
 # приехало новое, после перезагрузки нода поднимется без amneziawg — то есть без
 # каскада вообще, и чинить это придётся с консоли хостера. Поэтому собираем под
 # каждое установленное ядро и ОТДЕЛЬНО проверяем новейшее: именно оно стартует.
-_dkms_built="$(awgc_dkms_all_kernels)"
+_dkms_built="$(awgc_dkms_all_kernels)" || err "Проверка модуля ядра не прошла — перезагрузка запрещена"
 ok "Модуль amneziawg собран под ядра: ${_dkms_built:-—}"
-if command -v dkms >/dev/null 2>&1 && \
-   ! dkms status amneziawg 2>/dev/null | grep -q "$AWGC_KERNEL_NEWEST"; then
+if ! awgc_kernel_ready "$AWGC_KERNEL_NEWEST"; then
     err "нет модуля amneziawg под ядро $AWGC_KERNEL_NEWEST, а именно оно запустится
      после перезагрузки. Собрать вручную и повторить установку:
        apt-get install -y linux-headers-$AWGC_KERNEL_NEWEST
@@ -497,7 +557,25 @@ $BOT_USER ALL=(root) NOPASSWD: /usr/bin/awg show *
 $BOT_USER ALL=(root) NOPASSWD: /usr/bin/systemctl kill -s SIGUSR1 awg-cascade-watchdog
 # Helper'ы каскада. Wildcard по имени — чтобы не ловить рассинхрон при
 # добавлении нового helper'а; аргументы проверяет сам helper.
-$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-*.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-add.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-remove.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-peer-rotate.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-add-ru.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-remove.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-exit-reserve.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-provision.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-interclient.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-iptables.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-iprule.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-client3.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-client3-fw.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-awg3.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-state.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-selftest.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-doctor.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-alert.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-autoreboot.sh
+$BOT_USER ALL=(root) NOPASSWD: /usr/local/sbin/awg-cascade-kernel-check.sh
 SUDOEOF
 chmod 440 /etc/sudoers.d/$BOT_USER
 visudo -c -f /etc/sudoers.d/$BOT_USER >/dev/null || err "sudoers syntax error"
@@ -539,8 +617,10 @@ if systemctl is-active --quiet systemd-networkd && ls /etc/netplan/*.yaml >/dev/
 fi
 
 mkdir -p "$CONFIG_DIR" "$PEERS_DIR" "$EXITS_DIR" "$SSH_DIR" "$WG_DIR"
-chown -R "$BOT_USER:$BOT_USER" "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR" "$PEERS_DIR" "$EXITS_DIR" "$SSH_DIR"
+chown root:"$BOT_USER" "$CONFIG_DIR" "$PEERS_DIR" "$EXITS_DIR"
+chown "$BOT_USER:$BOT_USER" "$SSH_DIR"
+chmod 750 "$CONFIG_DIR" "$PEERS_DIR"
+chmod 700 "$EXITS_DIR" "$SSH_DIR"
 ok "Директории созданы"
 
 # SSH key пары для бота (для коннекта к exits)
@@ -592,7 +672,7 @@ EOF
     chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/awg2_params"
     ok "Сгенерированы v2.0 params: S=$S1/$S2/$S3/$S4  H1=$H1  I1-профиль=$I1_PROFILE"
 else
-    . "$CONFIG_DIR/awg2_params"
+    awgc_load_config "$CONFIG_DIR/awg2_params" || err "Invalid AWG parameters"
     ok "v2.0 params подгружены из $CONFIG_DIR/awg2_params"
 fi
 JC_VAL=5; JMIN_VAL=10; JMAX_VAL=50
@@ -712,7 +792,7 @@ header "6. iptables (kill-switch + MARK)"
 # Detect main interface
 MAIN_IFACE=$(ip route show default 0.0.0.0/0 | head -1 | awk '/dev/ {for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
 [ -z "$MAIN_IFACE" ] && MAIN_IFACE="eth0"
-ok "Main interface: $MAIN_IFACE"
+ok "Основной интерфейс: $MAIN_IFACE"
 
 # ─── Config пишется ЗДЕСЬ, до первого запуска зависимых helper'ов ────────────
 #
@@ -750,6 +830,7 @@ CLIENT_NET="$CLIENT_NET"
 CLIENT_NET_PREFIX="$CLIENT_NET_PREFIX"
 SERVER_IP="$SERVER_IP"
 MAIN_IFACE="$MAIN_IFACE"
+BOT_ENABLED="$BOT_ENABLED"
 TG_TOKEN="$TG_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 NTFY_URL="$NTFY_URL"
@@ -777,7 +858,7 @@ TRAFFIC_RETENTION_DAYS=${TRAFFIC_RETENTION_DAYS:-3}
 # AUTO_REBOOT_HOUR (UTC) должен быть УНИКАЛЕН на каждой ноде каскада — иначе
 # несколько exits перезагрузятся одновременно → пустая ECMP → kill-switch.
 # Применяется через awg-cascade-autoreboot.sh (вызывается из sync.sh guards).
-AUTO_REBOOT=${AUTO_REBOOT:-1}
+AUTO_REBOOT=${AUTO_REBOOT:-0}
 AUTO_REBOOT_HOUR="${AUTO_REBOOT_HOUR:-03}"
 EOF
 
@@ -811,7 +892,8 @@ if [ -f "$CONFIG_FILE.prev" ]; then
 fi
 
 chmod 600 "$CONFIG_FILE"
-chown "$BOT_USER:$BOT_USER" "$CONFIG_FILE"
+chown "root:$BOT_USER" "$CONFIG_FILE"
+chmod 640 "$CONFIG_FILE"
 ok "Config файл сохранён: $CONFIG_FILE"
 
 
@@ -823,6 +905,7 @@ ok "Config файл сохранён: $CONFIG_FILE"
 # Ставим прямо тут, до первого запуска: общий список helper'ов идёт позже, в
 # Phase 8, а правила нужны уже сейчас. Повторная установка там безвредна.
 install -m 755 "$REPO_DIR/watchdog/awg-cascade-cfg.sh"      /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/*.py /usr/local/sbin/
 install -m 755 "$REPO_DIR/watchdog/awg-cascade-iptables.sh" /usr/local/sbin/
 install -m 755 "$REPO_DIR/watchdog/awg-cascade-client3-fw.sh"  /usr/local/sbin/ 2>/dev/null || true
 install -m 755 "$REPO_DIR/watchdog/awg-cascade-interclient.sh" /usr/local/sbin/ 2>/dev/null || true
@@ -836,33 +919,8 @@ ok "iptables правила применены"
 # uidrange awgbot → table 100 (бот'трафик к Telegram через NL)
 # Всё остальное (включая ntfy через --interface $MAIN_IFACE) → main table
 
-BOT_UID=$(id -u $BOT_USER)
-ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
-ip rule del fwmark 0x2 lookup 100 2>/dev/null || true
-ip rule del uidrange $BOT_UID-$BOT_UID 2>/dev/null || true
-ip rule del ipproto tcp dport 22 uidrange $BOT_UID-$BOT_UID 2>/dev/null || true
-# 998: бот SSH-outbound → eth0 (в обход cascade, на случай если exit-hoster блокирует :22)
-ip rule add ipproto tcp dport 22 uidrange $BOT_UID-$BOT_UID lookup main priority 998
-# 1000: клиенты awg0 → ECMP table 100
-ip rule add fwmark 0x1 lookup 100 priority 1000
-# 1001: бот (остальной outbound) → table 100 (Telegram через NL)
-ip rule add uidrange $BOT_UID-$BOT_UID lookup 100 priority 1001
-
-# Скрипт чтобы это пережило ребут
-cat > /usr/local/sbin/awg-cascade-iprule.sh <<RULEEOF
-#!/bin/bash
-# Idempotent: удаляем по priority (все правила в этих "слотах"), потом ставим.
-BOT_UID=\$(id -u $BOT_USER 2>/dev/null || echo 999)
-for prio in 998 1000 1001; do
-    while ip rule show priority \$prio 2>/dev/null | grep -q "^\$prio:"; do
-        ip rule del priority \$prio 2>/dev/null || break
-    done
-done
-ip rule add ipproto tcp dport 22 uidrange \$BOT_UID-\$BOT_UID lookup main priority 998
-ip rule add fwmark 0x1 lookup 100 priority 1000
-ip rule add uidrange \$BOT_UID-\$BOT_UID lookup 100 priority 1001
-RULEEOF
-chmod +x /usr/local/sbin/awg-cascade-iprule.sh
+install -m 755 "$REPO_DIR/watchdog/awg-cascade-iprule.sh" /usr/local/sbin/
+/usr/local/sbin/awg-cascade-iprule.sh
 
 # systemd-юнит — применяет ip rules после network-online (иначе они теряются после ребута)
 cat > /etc/systemd/system/awg-cascade-iprule.service <<EOF
@@ -881,7 +939,7 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload >/dev/null 2>&1
 systemctl enable awg-cascade-iprule.service >/dev/null 2>&1
-ok "ip rule: SSH→eth0 (998), clients→ECMP (1000), bot→ECMP (1001) + systemd persist"
+ok "ip rule: SSH→eth0 (998), клиенты→ECMP (1000), бот→ECMP (1001) + сохранение в systemd"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 7: state.json + helper-скрипты
@@ -901,8 +959,8 @@ if [ ! -f "$STATE_FILE" ]; then
   "last_update": "$(date -Iseconds)"
 }
 EOF
-    chown "$BOT_USER:$BOT_USER" "$STATE_FILE"
-    chmod 644 "$STATE_FILE"
+    chown "root:$BOT_USER" "$STATE_FILE"
+    chmod 640 "$STATE_FILE"
     ok "state.json создан (пустой, без exits)"
 fi
 
@@ -911,9 +969,9 @@ fi
 # создаст root-owned 644 — другой пользователь не сможет open() и получит
 # PermissionError. Pre-создаём 0666 owned by awgbot.
 touch "$CONFIG_DIR/state.lock"
-chown "$BOT_USER:$BOT_USER" "$CONFIG_DIR/state.lock"
-chmod 666 "$CONFIG_DIR/state.lock"
-ok "state.lock pre-created с 0666 (shared между bot и root)"
+chown root:root "$CONFIG_DIR/state.lock"
+chmod 600 "$CONFIG_DIR/state.lock"
+ok "state.lock root-only; bot uses data broker"
 
 
 # version-stamp — какой ref/commit развёрнут (для drift-guard и бота)
@@ -970,6 +1028,12 @@ header "8b. Deploy watchdog + helper-скрипты"
 [ -d "$REPO_DIR/systemd" ]  || err "Не найдена директория $REPO_DIR/systemd"
 
 # Копируем все helper-скрипты в /usr/local/sbin (перетирая stub'ы и старые версии)
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-control.py /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-state.sh /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-permissions.sh /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-recover.sh /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/*.sh /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/*.py /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-cfg.sh               /usr/local/sbin/
 install -m 755 "$REPO_DIR"/awg2-params.sh                            /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-iptables.sh          /usr/local/sbin/
@@ -984,6 +1048,7 @@ install -m 755 "$REPO_DIR"/watchdog/awg-cascade-sync.sh             /usr/local/s
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-traffic-sample.sh    /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-backup.sh            /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-autoreboot.sh        /usr/local/sbin/
+install -m 755 "$REPO_DIR"/watchdog/awg-cascade-reboot.py           /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-fail2ban.sh         /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-awg3.sh              /usr/local/sbin/
 install -m 755 "$REPO_DIR"/watchdog/awg-cascade-kernel-check.sh      /usr/local/sbin/
@@ -1003,7 +1068,7 @@ ok "Helper-скрипты установлены в /usr/local/sbin/"
 # Авто-ребут после unattended-upgrades (окно AUTO_REBOOT_HOUR из config).
 # ВАЖНО: час должен быть уникален на каждой ноде каскада — см. комментарий в config.
 /usr/local/sbin/awg-cascade-autoreboot.sh >/dev/null 2>&1 \
-    && ok "Авто-ребут: $(/usr/local/sbin/awg-cascade-autoreboot.sh --show | awk -F= '/Reboot-Time/{print $2}')" \
+    && ok "Авто-ребут: $(/usr/local/sbin/awg-cascade-autoreboot.sh --show)" \
     || warn "Авто-ребут не настроен (проверь: awg-cascade-autoreboot.sh --show)"
 
 # fail2ban: не защита от подбора (вход по паролю отключён), а способ перестать
@@ -1040,26 +1105,31 @@ install -m 755 "$REPO_DIR/awg2-params.sh"                     "$BOT_DIR/scripts/
 install -m 755 "$REPO_DIR/exit-side/awg-cascade-exit-warp.sh" "$BOT_DIR/scripts/awg-cascade-exit-warp.sh"
 install -m 755 "$REPO_DIR/watchdog/awg-cascade-ssh-harden.sh" "$BOT_DIR/scripts/awg-cascade-ssh-harden.sh"
 install -m 755 "$REPO_DIR/watchdog/awg-cascade-fail2ban.sh"   "$BOT_DIR/scripts/awg-cascade-fail2ban.sh"
+install -m 755 "$REPO_DIR/watchdog/awg-cascade-cfg.sh" "$BOT_DIR/scripts/awg-cascade-cfg.sh"
+install -m 755 "$REPO_DIR/watchdog/awg-cascade-autoreboot.sh" "$BOT_DIR/scripts/awg-cascade-autoreboot.sh"
+install -m 755 "$REPO_DIR/watchdog/awg-cascade-reboot.py" "$BOT_DIR/scripts/awg-cascade-reboot.py"
 # Комплект неполон -> новый exit получит не то, что задумано. Это не warn.
 for _f in setup-exit.sh awg2-params.sh awg-cascade-exit-warp.sh           awg-cascade-ssh-harden.sh awg-cascade-fail2ban.sh; do
     [ -x "$BOT_DIR/scripts/$_f" ] || err "provisioning-комплект неполон: нет $_f"
 done
 ok "Exit-provisioning комплект в $BOT_DIR/scripts/ (5 скриптов, проверен)"
 
-chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
+/usr/local/sbin/awg-cascade-permissions.sh
 
-# Python venv + зависимости
-if [ ! -d "$BOT_DIR/venv" ]; then
-    info "Создаю venv и ставлю зависимости (aiogram, asyncssh, qrcode)..."
-    sudo -u "$BOT_USER" python3 -m venv "$BOT_DIR/venv"
-    sudo -u "$BOT_USER" "$BOT_DIR/venv/bin/pip" install --quiet --upgrade pip
-    sudo -u "$BOT_USER" "$BOT_DIR/venv/bin/pip" install --quiet -r "$BOT_DIR/requirements.txt"
-    ok "venv готов: $BOT_DIR/venv"
-else
-    info "venv уже есть, обновляю зависимости..."
-    sudo -u "$BOT_USER" "$BOT_DIR/venv/bin/pip" install --quiet --upgrade -r "$BOT_DIR/requirements.txt"
-    ok "venv обновлён"
-fi
+# Build a fresh root-owned environment; never execute a legacy bot-owned venv.
+VENV_NEW=$(mktemp -d "$BOT_DIR/.venv.XXXXXX")
+python3 -m venv "$VENV_NEW"
+"$VENV_NEW/bin/pip" install --quiet -r "$BOT_DIR/requirements.txt"
+"$VENV_NEW/bin/pip" check
+"$VENV_NEW/bin/python" -c 'import aiogram, asyncssh, qrcode'
+systemctl stop awg-cascade-bot 2>/dev/null || true
+if [ -e "$BOT_DIR/venv" ]; then mv "$BOT_DIR/venv" "$BOT_DIR/venv.previous.$(date +%s)"; fi
+chmod -R a+rX "$VENV_NEW"
+mv "$VENV_NEW" "$BOT_DIR/venv"
+# Relocated venv scripts embed the old path: regenerate them through interpreter.
+"$BOT_DIR/venv/bin/python" -m pip install --quiet --force-reinstall pip
+ok "venv пересоздан заново под root"
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 8d: systemd units (watchdog, postboot, bot) + старт
@@ -1089,6 +1159,9 @@ if [ -f "$REPO_DIR/systemd/awg-cascade.logrotate" ]; then
 fi
 
 systemctl daemon-reload
+
+systemctl enable awg-cascade-recover.service >/dev/null
+/usr/local/sbin/awg-cascade-recover.sh
 
 # Watchdog — постоянный сервис
 systemctl enable --now awg-cascade-watchdog.service >/dev/null 2>&1
@@ -1128,6 +1201,17 @@ fi
 # Phase 9: финал — выводим QR первого peer'а
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Stamps describe completed installation and verified runtime only.
+systemctl is-active --quiet awg-cascade-watchdog || err "Watchdog не запустился"
+if [ "${BOT_ENABLED:-1}" = 1 ]; then systemctl is-active --quiet awg-cascade-bot || err "Бот не запустился"; fi
+/usr/local/sbin/awg-cascade-iprule.sh
+/usr/local/sbin/awg-cascade-iptables.sh
+for _stamp in installed-version active-version; do
+    install -m 640 -o root -g "$BOT_USER" "$CONFIG_DIR/version" "$CONFIG_DIR/.$_stamp.new"
+    mv "$CONFIG_DIR/.$_stamp.new" "$CONFIG_DIR/$_stamp"
+done
+rm -f "$CONFIG_DIR/activation-pending"
+
 # ─── Вернуть остановленные apt-таймеры ───────────────────────────────────────
 #
 # В начале установки они останавливаются, чтобы не драться за apt-lock. Обратно
@@ -1136,14 +1220,7 @@ fi
 # которая после установки долго не перезагружается, автоматические обновления
 # так и оставались выключенными — то есть ровно то, ради чего они и ставились,
 # молча не работало.
-for _t in apt-daily.timer apt-daily-upgrade.timer; do
-    systemctl start "$_t" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$_t"; then
-        ok "таймер возвращён: $_t"
-    else
-        warn "таймер $_t не запустился — автообновления не будут срабатывать"
-    fi
-done
+awgc_restore_apt || err "Не удалось вернуть apt-таймеры на место"
 
 header "9. Готово! QR первого peer'а"
 
@@ -1168,7 +1245,7 @@ if [ -n "${CLIENT_CONF:-}" ] && [ -f "${CLIENT_CONF:-}" ]; then
     echo "  Desktop: открой app → 'Импорт конфига' → 'Из файла' → загрузи $CLIENT_CONF"
     echo ""
     info "Endpoint: ${BOLD}$RU_PUBLIC_IP:$AWG0_PORT${NC}"
-    info "Server pubkey: ${BOLD}$SERVER_PUBKEY${NC}"
+    info "Публичный ключ сервера: ${BOLD}$SERVER_PUBKEY${NC}"
     echo ""
 else
     info "Phase 5 была пропущена (нода уже настроена) — QR первого peer'а не выводим."
@@ -1319,28 +1396,48 @@ ok "Setup завершён. Файлы в $CONFIG_DIR/"
 
 # ─── Перезагрузка в новое ядро ───────────────────────────────────────────────
 #
-# Нода ставилась на ядре образа, а работать должна на новом: образы хостеров
-# отстают на сотню ABI-ревизий, и dist-upgrade выше это исправил. Модуль под
-# новое ядро уже собран и проверен, сервисы включены в автозапуск, firewall
-# после загрузки восстанавливает awg-cascade-watchdog-postboot.sh.
+# Нода ставилась на ядре образа, а работать должна на новом: dist-upgrade выше
+# это исправил, но включается новое ядро только перезагрузкой. Перезагружаемся
+# сами — «не забудьте перезагрузиться» в конце инструкции это не инструкция,
+# а отложенный дефект.
 #
-# Перезагружаемся САМИ и намеренно. Ручной шаг «не забудьте перезагрузиться»
-# — это не инструкция, а отложенный дефект: нода месяцами работает на старом
-# ядре, а при первой же случайной перезагрузке оказывается, что проверить
-# новое ядро было некому. Лучше пройти этот переход сейчас, на пустой ноде и
-# под наблюдением, чем когда-нибудь под нагрузкой.
+# И ровно три ограничения, каждое по разобранному сценарию аудита v2.5.2:
 #
-# AWGC_NO_REBOOT=1 — отложить (например, если ноду ставят в чужом окне).
+#   • ТОЛЬКО на чистой ноде. Признак снят в начале установки, до того как она
+#     сама создала version-stamp. Без него повторный запуск setup.sh на
+#     ДЕЙСТВУЮЩЕЙ ноде с висящим reboot-required перезагружал бы её через
+#     20 секунд — вместе с клиентами (F21).
+#
+#   • ТОЛЬКО после проверки цели загрузки. awg-cascade-reboot.py читает
+#     фактическую первую запись grub.cfg, требует статус installed (а не
+#     built) и наличие файла модуля именно для этого ядра, и отказывается при
+#     нестандартном GRUB_DEFAULT или одноразовом next_entry. Прежнее сравнение
+#     имён файлов в /boot проверяло не то, что загрузится (F20).
+#
+#   • отказ проверки НЕ перезагружает. Нода на старом ядре — это неприятно и
+#     чинится одной командой; нода, загрузившаяся без модуля, чинится только
+#     консолью хостера.
+#
+# AWGC_NO_REBOOT=1 — отложить (например, когда ноду ставят в чужом окне).
 if [ "$AWGC_KERNEL_NEWEST" != "$AWGC_KERNEL_RUNNING" ] || [ -f /var/run/reboot-required ]; then
     echo ""
-    if [ "${AWGC_NO_REBOOT:-0}" = "1" ]; then
-        warn "Нужна перезагрузка в ядро $AWGC_KERNEL_NEWEST — отложена (AWGC_NO_REBOOT=1)"
-        warn "Пока она не сделана, нода работает на $AWGC_KERNEL_RUNNING"
-    else
-        warn "Перезагрузка в ядро ${BOLD}$AWGC_KERNEL_NEWEST${NC} через 20 секунд"
-        warn "SSH оборвётся, нода поднимется сама. Отменить — Ctrl-C"
+    if [ "${AWGC_FRESH:-0}" != "1" ]; then
+        warn "Нужна перезагрузка, но нода не чистая — сам не перезагружаю"
+        warn "Планово: awg-cascade-autoreboot.sh <час>; либо вручную в своё окно"
+    elif [ "${AWGC_NO_REBOOT:-0}" = "1" ]; then
+        warn "Перезагрузка отложена (AWGC_NO_REBOOT=1)"
+        warn "До неё нода работает на старом ядре $AWGC_KERNEL_RUNNING"
+    elif _rb_out=$(python3 -I /usr/local/sbin/awg-cascade-reboot.py 2>&1); then
+        _rb_k=$(printf '%s' "$_rb_out" | jq -r '.boot_kernel // empty' 2>/dev/null)
+        ok "Цель загрузки проверена: ядро ${_rb_k:-$AWGC_KERNEL_NEWEST}, модуль installed"
+        warn "Перезагрузка через 20 секунд. SSH оборвётся, нода поднимется сама"
+        warn "Отменить — Ctrl-C"
         sleep 20
         info "Перезагружаюсь"
         systemctl reboot
+    else
+        warn "Перезагрузка НЕ выполнена — проверка цели загрузки не прошла:"
+        printf '%s\n' "$_rb_out" | sed 's/^/    /' >&2
+        warn "Нода осталась на ядре $AWGC_KERNEL_RUNNING. Разберись и перезагрузи вручную."
     fi
 fi

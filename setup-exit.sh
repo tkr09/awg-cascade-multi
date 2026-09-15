@@ -91,6 +91,14 @@ RU_TUNNEL_IP="10.99.${EXIT_INDEX}.2"
 # WARP опционально
 WARP_ENABLE="${WARP_ENABLE:-0}"
 
+# Persist the operation identity; retries reuse the original interface and keys.
+exec 8>/run/awg-cascade-provision.lock
+flock -w 30 -x 8 || err "На этом exit уже идёт другая операция провижининга"
+OP_ID=$(printf '%s' "$RU_PUBLIC_IP:$RU_PUBKEY" | sha256sum | awk '{print $1}')
+OP_DIR=/etc/awg-cascade-exit/operations
+install -d -m 700 "$OP_DIR"
+if [ -f "$OP_DIR/$OP_ID.done" ]; then cat "$OP_DIR/$OP_ID.done"; exit 0; fi
+
 # ─── SHARED_MODE detection ────────────────────────────────────────────────────
 # Если на сервере уже стоит amneziawg и есть primary awg-in.conf — значит этот
 # exit уже принадлежит другому RU. Тогда мы НЕ переустанавливаем пакеты, НЕ
@@ -114,15 +122,22 @@ if command -v awg >/dev/null 2>&1 && [ -f /etc/amnezia/amneziawg/awg-in.conf ]; 
     # На стороне exit сканируем вверх от предпочитаемого до первого свободного
     # (на случай если другой RU уже занял этот октет на этом же exit).
     TUNNEL_OCTET="${RU_TUNNEL_OCTET:-$((100 + SHARED_N))}"
-    while ip -br addr show 2>/dev/null | grep -qE "[[:space:]]10\.99\.${TUNNEL_OCTET}\."; do
+    while ip -br addr show 2>/dev/null | grep -qE "[[:space:]]10\.99\.${TUNNEL_OCTET}\." || \
+        grep -Fq "10.99.${TUNNEL_OCTET}.0/30" <<<"${RU_USED_TUNNELS:-}"; do
         TUNNEL_OCTET=$((TUNNEL_OCTET + 1))
-        [ "$TUNNEL_OCTET" -gt 250 ] && err "Нет свободных tunnel-октетов 10.99.X на exit"
+        [ "$TUNNEL_OCTET" -le 250 ] || err "Нет свободной подсети туннеля, общей для обеих сторон"
     done
     TUNNEL_NET="10.99.${TUNNEL_OCTET}.0/30"
     EXIT_TUNNEL_IP="10.99.${TUNNEL_OCTET}.1"
     RU_TUNNEL_IP="10.99.${TUNNEL_OCTET}.2"
     warn "SHARED MODE — exit уже занят другим RU."
     info "Создаю изолированный интерфейс $IFACE_NAME на порту $EXIT_PORT, tunnel $TUNNEL_NET"
+fi
+
+if [ -f "$OP_DIR/$OP_ID.plan" ]; then
+    read -r IFACE_NAME EXIT_PORT TUNNEL_NET EXIT_TUNNEL_IP RU_TUNNEL_IP SHARED_MODE < "$OP_DIR/$OP_ID.plan"
+else
+    printf '%s %s %s %s %s %s\n' "$IFACE_NAME" "$EXIT_PORT" "$TUNNEL_NET" "$EXIT_TUNNEL_IP" "$RU_TUNNEL_IP" "$SHARED_MODE" > "$OP_DIR/$OP_ID.plan"
 fi
 
 info "EXIT_INDEX=$EXIT_INDEX  iface=$IFACE_NAME  port=$EXIT_PORT  tunnel=$TUNNEL_NET  shared=$SHARED_MODE"
@@ -137,41 +152,39 @@ header "Установка пакетов"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# На fresh Ubuntu cloud-init запускает unattended-upgrades сразу после boot.
-# Это держит /var/lib/dpkg/lock-frontend 5-10 минут и валит setup-exit.sh
-# с "Could not get lock". Гасим apt-сервисы перед нашими apt-операциями.
-systemctl stop unattended-upgrades.service \
-               apt-daily.service apt-daily-upgrade.service \
-               apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-pkill -9 unattended-upgr 2>/dev/null || true
-
-# Ждём освобождения ВСЕХ четырёх apt-локов. ВАЖНО: /var/cache/apt/archives/lock
-# тоже надо проверять — иначе apt-get падает на нём даже когда остальные свободны
-# (apt-daily-upgrade на first-boot держит именно archives/lock при скачивании).
-# После grace-периода держателей убиваем принудительно (provisioning, сервер наш).
+# Pause timers only; never kill dpkg/apt or stop an in-flight package job.
+AWGC_APT_TIMERS=()
+awgc_restore_apt() {
+    local t
+    for t in "${AWGC_APT_TIMERS[@]}"; do systemctl start "$t" || return 1; done
+    AWGC_APT_TIMERS=()
+}
+awgc_install_exit() {
+    local rc=$?
+    trap - EXIT
+    awgc_restore_apt || rc=1
+    exit "$rc"
+}
+trap awgc_install_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+for t in apt-daily.timer apt-daily-upgrade.timer; do
+    if systemctl is-active --quiet "$t"; then
+        AWGC_APT_TIMERS+=("$t")
+        systemctl stop "$t" || err "Не удалось остановить таймер $t"
+    fi
+done
 APT_LOCKS="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
 wait_apt_lock() {
-    local max=600 elapsed=0 grace=120
+    local elapsed=0
     while fuser $APT_LOCKS >/dev/null 2>&1; do
-        if [ $elapsed -ge $max ]; then
-            err "apt lock не освободился за 10 минут (что-то странное на сервере)"
-        fi
-        if [ $elapsed -ge $grace ]; then
-            warn "apt lock держится >${grace}s — убиваю держателей принудительно"
-            fuser -k $APT_LOCKS 2>/dev/null || true
-            sleep 3
-            dpkg --configure -a 2>/dev/null || true
-        fi
-        [ $((elapsed % 30)) -eq 0 ] && info "apt lock занят, жду... (${elapsed}s/$max)"
-        sleep 5
-        elapsed=$((elapsed + 5))
+        [ "$elapsed" -lt 600 ] || err "apt занят дольше 600 с — пакетные процессы оставлены работать"
+        sleep 5; elapsed=$((elapsed + 5))
     done
 }
 wait_apt_lock
-
-# Восстановление после прерванной установки (например SSH-обрыв в прошлый раз):
-# dpkg может застрять в half-configured. Идемпотентно, no-op если всё чисто.
-dpkg --configure -a 2>/dev/null || true
+dpkg --configure -a || err "dpkg --configure -a не отработал"
+[ -z "$(dpkg --audit)" ] || err "dpkg --audit нашёл недонастроенные пакеты"
 
 apt-get update -qq
 
@@ -218,7 +231,14 @@ if [ "${AWGC_SKIP_UPGRADE:-0}" = "1" ]; then
     warn "apt upgrade пропущен (AWGC_SKIP_UPGRADE=1)"
 else
     # Чистая нода — та, где нашего каскада нет ни в одной из двух ролей.
-    if [ -f /etc/awg-cascade/version ] || [ -f /etc/awg-cascade-exit/info.json ]; then
+    #
+    # Признак снимается ЗДЕСЬ и живёт до конца скрипта. Ниже установка сама
+    # создаст /etc/awg-cascade/version, и повторная проверка в конце сочла бы
+    # ноду действующей. От признака зависит не только режим apt, но и право на
+    # автоматическую перезагрузку в конце: на действующей ноде её быть не должно.
+    AWGC_FRESH=1
+    if [ -f /etc/awg-cascade/version ] || [ -f /etc/awg-cascade-exit/info.json ]; then AWGC_FRESH=0; fi
+    if [ "$AWGC_FRESH" = 0 ]; then
         _upg_mode="upgrade";      _upg_what="пакеты образа (нода действующая — ядро не трогаю)"
     else
         _upg_mode="dist-upgrade"; _upg_what="пакеты образа вместе с ядром"
@@ -262,9 +282,11 @@ NRCONF
             # настроен. Валить из-за этого установку нельзя, но и молча
             # считать успехом тоже.
             warn "apt upgrade вернул ошибку — до-настраиваю пакеты"
-            dpkg --configure -a 2>&1 | tail -5 | sed 's/^/    /' || true
+            dpkg --configure -a || err "dpkg --configure -a не отработал при восстановлении"
+            [ -z "$(dpkg --audit)" ] || err "dpkg --audit нашёл недонастроенные пакеты после восстановления"
             if apt-get -s -q -y check >/dev/null 2>&1; then
-                ok "Пакеты настроены; ошибка была в запуске сервиса, не в установке"
+                warn "Зависимости пакетов целы, но upgrade не прошёл — нужен повтор"
+                exit 1
             else
                 err "apt остался в нерабочем состоянии. Почини вручную и повтори:
      apt-get -f install; dpkg --configure -a"
@@ -290,19 +312,31 @@ AWGC_KERNEL_NEWEST="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' 
 
 # Собрать модуль под все установленные ядра. Вызывается сразу после установки
 # amneziawg-dkms: к этому моменту исходники модуля на месте.
+awgc_kernel_ready() {
+    local k="$1" module
+    module=$(modinfo -k "$k" -n amneziawg 2>/dev/null) || return 1
+    [ -f "$module" ] || return 1
+    if command -v dkms >/dev/null 2>&1 && dkms status -m amneziawg -k "$k" 2>/dev/null | grep -q .; then
+        dkms status -m amneziawg -k "$k" 2>/dev/null | awk -F', ' -v k="$k" '
+            $2 == k && $3 ~ /: installed$/ {ok=1} END {exit !ok}' || return 1
+    fi
+}
 awgc_dkms_all_kernels() {
     local k built=""
-    command -v dkms >/dev/null 2>&1 || { echo ""; return 0; }
-    for k in $(ls -1 /lib/modules 2>/dev/null | sort -V); do
-        [ -e "/boot/vmlinuz-$k" ] || continue          # не ядро, а мусор в /lib/modules
-        if [ ! -d "/lib/modules/$k/build" ]; then
-            wait_apt_lock
-            apt-get install -y -qq "linux-headers-$k" >/dev/null 2>&1 || true
+    for k in $(ls -1 /lib/modules | sort -V); do
+        [ -e "/boot/vmlinuz-$k" ] || continue
+        if ! awgc_kernel_ready "$k"; then
+            command -v dkms >/dev/null 2>&1 || { warn "Для ядра $k нет ни модуля, ни dkms"; return 1; }
+            if [ ! -d "/lib/modules/$k/build" ]; then
+                wait_apt_lock
+                apt-get install -y -qq "linux-headers-$k" >/dev/null || return 1
+            fi
+            dkms autoinstall -k "$k" || return 1
+            awgc_kernel_ready "$k" || { warn "Модуль не установлен для ядра $k"; return 1; }
         fi
-        [ -d "/lib/modules/$k/build" ] || { warn "нет заголовков для ядра $k"; continue; }
-        dkms autoinstall -k "$k" >/dev/null 2>&1 || true
-        dkms status amneziawg 2>/dev/null | grep -q "$k" && built="$built $k"
+        built="$built $k"
     done
+    awgc_kernel_ready "$AWGC_KERNEL_RUNNING" || return 1
     echo "${built# }"
 }
 
@@ -330,6 +364,41 @@ if systemd-detect-virt --quiet 2>/dev/null; then
     fi
 fi
 
+# ─── Двойное управление сетью в образе хостера ───────────────────────────────
+#
+# Наблюдалось на HOSTKEY: SolusVM кладёт в /etc/network/interfaces статику для
+# eth0, а cloud-init — netplan с DHCP. Адрес выдаёт networkd, после чего
+# ifupdown пытается присвоить тот же адрес второй раз и падает с «Address
+# already assigned». Каждую загрузку в systemctl --failed висят
+# networking.service и ifup@<iface>. Сеть при этом работает.
+#
+# Чиним по той же причине, что и fwupd выше: постоянный красный список — это
+# то, из-за чего перестают замечать настоящие аварии.
+#
+# Трогаем ТОЛЬКО когда доказано, что ifupdown здесь лишний:
+#   • интерфейс сейчас настроен systemd-networkd из netplan-файла;
+#   • маршрут по умолчанию идёт через него и получен по DHCP, то есть не от
+#     ifupdown;
+#   • юнит ifupdown для этого интерфейса действительно в failed.
+# Не совпало хоть одно — не делаем НИЧЕГО. Остаться с красным юнитом лучше,
+# чем с недоступной нодой, до которой ехать через консоль хостера.
+#
+# disable недостаточно: ifup@<iface> запускает udev при появлении интерфейса,
+# поэтому именно mask. Проверено перезагрузкой: после disable юнит вернулся в
+# failed, после mask — нет.
+_net_if=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+if [ -n "${_net_if:-}" ] \
+   && command -v networkctl >/dev/null 2>&1 \
+   && networkctl status "$_net_if" 2>/dev/null | grep -q '/run/systemd/network/.*netplan' \
+   && ip route show default 2>/dev/null | grep -q 'proto dhcp' \
+   && systemctl is-failed --quiet "ifup@${_net_if}.service" 2>/dev/null; then
+    [ -f /etc/network/interfaces ] && cp -a /etc/network/interfaces /etc/network/interfaces.bak-awgc
+    systemctl mask "ifup@${_net_if}.service" >/dev/null 2>&1 || true
+    systemctl disable --now networking.service >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
+    ok "Сеть: снят конфликт ifupdown/netplan на $_net_if (адрес держит networkd)"
+fi
+
 if ! command -v awg &>/dev/null; then
     wait_apt_lock
     apt-get install -y -qq software-properties-common >/dev/null
@@ -349,10 +418,9 @@ fi
 # приехало новое, после перезагрузки нода поднимется без amneziawg — то есть без
 # каскада вообще, и чинить это придётся с консоли хостера. Поэтому собираем под
 # каждое установленное ядро и ОТДЕЛЬНО проверяем новейшее: именно оно стартует.
-_dkms_built="$(awgc_dkms_all_kernels)"
+_dkms_built="$(awgc_dkms_all_kernels)" || err "Проверка модуля ядра не прошла — перезагрузка запрещена"
 ok "Модуль amneziawg собран под ядра: ${_dkms_built:-—}"
-if command -v dkms >/dev/null 2>&1 && \
-   ! dkms status amneziawg 2>/dev/null | grep -q "$AWGC_KERNEL_NEWEST"; then
+if ! awgc_kernel_ready "$AWGC_KERNEL_NEWEST"; then
     err "нет модуля amneziawg под ядро $AWGC_KERNEL_NEWEST, а именно оно запустится
      после перезагрузки. Собрать вручную и повторить установку:
        apt-get install -y linux-headers-$AWGC_KERNEL_NEWEST
@@ -370,27 +438,10 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-# Авто-ребут для kernel-обновлений. Opt-in через env AUTO_REBOOT=1 (default ВЫКЛ).
-# Срабатывает только при reboot-required. Минута рандомится в пределах часа
-# AUTO_REBOOT_HOUR (default 05) — чтобы exits каскада не ребутились разом.
-uu=/etc/apt/apt.conf.d/50unattended-upgrades
-if [ -f "$uu" ]; then
-    if [ "${AUTO_REBOOT:-1}" = "1" ]; then
-        rb_h="${AUTO_REBOOT_HOUR:-05}"; rb_m=$(printf '%02d' $((RANDOM % 60)))
-        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"true";|' "$uu"
-        if grep -q 'Automatic-Reboot-Time' "$uu"; then
-            sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-Time \).*;|\1"'"$rb_h:$rb_m"'";|' "$uu"
-        else
-            echo "Unattended-Upgrade::Automatic-Reboot-Time \"$rb_h:$rb_m\";" >> "$uu"
-        fi
-        grep -q 'Automatic-Reboot-WithUsers' "$uu" \
-            && sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot-WithUsers \).*;|\1"true";|' "$uu" \
-            || echo 'Unattended-Upgrade::Automatic-Reboot-WithUsers "true";' >> "$uu"
-        ok "Авто-ребут ВКЛ: окно $rb_h:$rb_m (только при kernel-обновлении)"
-    else
-        sed -i 's|/\{0,2\}\(Unattended-Upgrade::Automatic-Reboot \).*;|\1"false";|' "$uu"
-    fi
-fi
+# No unattended reboot from a provisioning side effect. A later maintenance
+# operation must verify the actual GRUB target and all attached RU owners.
+echo 'Unattended-Upgrade::Automatic-Reboot "false";' > /etc/apt/apt.conf.d/99-awg-cascade-reboot
+
 systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 
 modprobe amneziawg || err "Модуль amneziawg не загружается"
@@ -470,11 +521,8 @@ fi
 # Если уже сохранены для этого интерфейса — берём существующие (постоянство).
 if [ ! -f "$PARAMS_FILE" ]; then
     # Ищем awg2-params.sh в /tmp (положил бот) или рядом со setup-exit.sh
-    AWG2_PARAMS_FILE=""
-    for cand in /tmp/awg2-params.sh "$(dirname "$0")/awg2-params.sh"; do
-        [ -f "$cand" ] && AWG2_PARAMS_FILE="$cand" && break
-    done
-    [ -z "$AWG2_PARAMS_FILE" ] && err "awg2-params.sh не найден (положи в /tmp/ или рядом с setup-exit.sh)"
+    AWG2_PARAMS_FILE="$(dirname "$0")/awg2-params.sh"
+    [ -f "$AWG2_PARAMS_FILE" ] || err "awg2-params.sh missing from operation directory"
 
     . "$AWG2_PARAMS_FILE"
     cat > "$PARAMS_FILE" <<EOF
@@ -597,28 +645,34 @@ header "WARP helper-скрипт"
 # Сам скрипт скачивается из репо или подкладывается setup'ом.
 # Если он залит в /tmp перед запуском — копируем; иначе пользователь должен
 # залить руками (или скачать с github).
+# Provisioning carries the reboot guard and its config parser on first install.
+for helper in awg-cascade-cfg.sh awg-cascade-autoreboot.sh awg-cascade-reboot.py; do
+    if [ -f "$(dirname "$0")/$helper" ]; then
+        install -m 755 -o root -g root "$(dirname "$0")/$helper" /usr/local/sbin/
+    fi
+done
 # SSH hardening: к этому моменту ключ бота уже в authorized_keys (его кладёт
 # ssh_copy_id до запуска этого скрипта), поэтому пароли можно закрывать —
 # сам helper всё равно перепроверит наличие ключей и откажется, если их нет.
-if [ -f /tmp/awg-cascade-ssh-harden.sh ]; then
-    install -m 755 -o root -g root /tmp/awg-cascade-ssh-harden.sh \
+if [ -f "$(dirname "$0")/awg-cascade-ssh-harden.sh" ]; then
+    install -m 755 -o root -g root "$(dirname "$0")/awg-cascade-ssh-harden.sh" \
         /usr/local/sbin/awg-cascade-ssh-harden.sh
     /usr/local/sbin/awg-cascade-ssh-harden.sh 2>&1 | sed 's/^/  /' >&2
 else
     warn "ssh-harden не найден в /tmp — вход по паролю останется ВКЛЮЧЁН (брутфорс!)"
 fi
 
-if [ -f /tmp/awg-cascade-fail2ban.sh ]; then
-    install -m 755 -o root -g root /tmp/awg-cascade-fail2ban.sh \
+if [ -f "$(dirname "$0")/awg-cascade-fail2ban.sh" ]; then
+    install -m 755 -o root -g root "$(dirname "$0")/awg-cascade-fail2ban.sh" \
         /usr/local/sbin/awg-cascade-fail2ban.sh
 fi
 
-if [ -f /tmp/awg-cascade-exit-warp.sh ]; then
-    install -m 755 -o root -g root /tmp/awg-cascade-exit-warp.sh \
+if [ -f "$(dirname "$0")/awg-cascade-exit-warp.sh" ]; then
+    install -m 755 -o root -g root "$(dirname "$0")/awg-cascade-exit-warp.sh" \
         /usr/local/sbin/awg-cascade-exit-warp.sh
     ok "WARP helper установлен (/usr/local/sbin/awg-cascade-exit-warp.sh)"
 else
-    warn "WARP helper не найден в /tmp/awg-cascade-exit-warp.sh"
+    warn "WARP helper не найден в $(dirname "$0")/awg-cascade-exit-warp.sh"
     warn "(скачай руками с https://github.com/tkr09/awg-cascade-multi/blob/main/exit-side/awg-cascade-exit-warp.sh)"
 fi
 
@@ -692,17 +746,11 @@ chmod 640 "$STATE_FILE"
 # которая после установки долго не перезагружается, автоматические обновления
 # так и оставались выключенными — то есть ровно то, ради чего они и ставились,
 # молча не работало.
-for _t in apt-daily.timer apt-daily-upgrade.timer; do
-    systemctl start "$_t" >/dev/null 2>&1 || true
-    if systemctl is-active --quiet "$_t"; then
-        ok "таймер возвращён: $_t"
-    else
-        warn "таймер $_t не запустился — автообновления не будут срабатывать"
-    fi
-done
+if declare -F awgc_restore_apt >/dev/null; then awgc_restore_apt || err "Не удалось вернуть apt-таймеры на место"; fi
 
 # Вывод JSON на stdout (бот парсит)
 header "Готово. JSON для RU:"
+install -m 600 "$STATE_FILE" "$OP_DIR/$OP_ID.done"
 cat "$STATE_FILE"
 
 # fail2ban на exit-е. Ставится последним: скрипту нужны поднятые интерфейсы —

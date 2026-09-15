@@ -15,6 +15,7 @@
 #   EXIT_PASSWORD=... awg-cascade-bootstrap-exit.sh <IP> <NAME>  # всё из env
 # =============================================================================
 set -euo pipefail
+umask 077
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}[✓]${NC} $1" >&2; }
@@ -52,7 +53,7 @@ EXIT_NAME=$(echo "$EXIT_NAME" | tr -cd 'a-zA-Z0-9._-' | head -c 32)
 # Общий с ботом реестр host-ключей. accept-new: незнакомый хост принимаем и
 # запоминаем, изменившийся — отвергаем. Через этот же канал уезжают RU_PSK и
 # приватный ключ туннеля, поэтому UserKnownHostsFile=/dev/null здесь нельзя.
-KNOWN_HOSTS=/etc/awg-cascade/known_hosts
+KNOWN_HOSTS=/etc/awg-cascade/ssh/known_hosts
 mkdir -p "$(dirname "$KNOWN_HOSTS")"
 
 # ─── Способ подключения: сначала пробуем, потом спрашиваем ───────────────────
@@ -124,8 +125,8 @@ if [ "$EXIT_AUTH" = "key" ]; then
     sshx() { ssh $SSH_OPTS "root@$EXIT_IP" "$@"; }
     scpx() { scp $SSH_OPTS "$@"; }
 else
-    sshx() { sshpass -p "$EXIT_PASSWORD" ssh $SSH_OPTS "root@$EXIT_IP" "$@"; }
-    scpx() { sshpass -p "$EXIT_PASSWORD" scp $SSH_OPTS "$@"; }
+    sshx() { sshpass -d 7 ssh $SSH_OPTS "root@$EXIT_IP" "$@" 7<<<"$EXIT_PASSWORD"; }
+    scpx() { sshpass -d 7 scp $SSH_OPTS "$@" 7<<<"$EXIT_PASSWORD"; }
 fi
 
 
@@ -136,49 +137,6 @@ if [ "$EXIT_AUTH" = "password" ]; then
      вход по паролю на нём закрыт — дай доступ по ключу (EXIT_AUTH=key)."
 fi
 ok "SSH OK ($EXIT_AUTH)"
-
-# 1. Заливаем provisioning-скрипты на exit
-info "Заливаю setup-exit.sh + awg2-params.sh + warp helper..."
-scpx "$BOT_SCRIPTS/setup-exit.sh"               "root@$EXIT_IP:/root/setup-exit.sh" >/dev/null
-scpx "$BOT_SCRIPTS/awg2-params.sh"              "root@$EXIT_IP:/tmp/awg2-params.sh" >/dev/null
-scpx "$BOT_SCRIPTS/awg-cascade-exit-warp.sh"    "root@$EXIT_IP:/tmp/awg-cascade-exit-warp.sh" >/dev/null
-[ -f "$BOT_SCRIPTS/awg-cascade-fail2ban.sh" ] && \
-  scpx "$BOT_SCRIPTS/awg-cascade-fail2ban.sh"    "root@$EXIT_IP:/tmp/awg-cascade-fail2ban.sh" >/dev/null
-[ -f "$BOT_SCRIPTS/awg-cascade-ssh-harden.sh" ] && \
-  scpx "$BOT_SCRIPTS/awg-cascade-ssh-harden.sh" "root@$EXIT_IP:/tmp/awg-cascade-ssh-harden.sh" >/dev/null
-ok "Скрипты залиты"
-
-# 2. Генерим RU-ключи для этого туннеля
-RU_PRIVKEY=$(awg genkey)
-RU_PUBKEY=$(echo "$RU_PRIVKEY" | awg pubkey)
-RU_PSK=$(awg genpsk)
-
-# 3. EXIT_INDEX резервируем тем же механизмом, что и бот.
-#
-# Было `max(index)+1` из снимка state.json — без брони и без учёта того, что бот
-# в этот момент может провижить свой exit. Два источника выдавали один индекс,
-# и второй переписывал конфиг и ключи первого. Плюс max+1 оставлял дыры
-# навсегда: после удаления exit'а 2 при живом 3 следующим снова становился 4.
-RESERVE=$(/usr/local/sbin/awg-cascade-exit-reserve.sh acquire "cli:$EXIT_IP") \
-    || err "не удалось зарезервировать индекс exit'а"
-NEXT_IDX=$(echo "$RESERVE" | awk '{print $1}')
-RESERVE_TOKEN=$(echo "$RESERVE" | awk '{print $2}')
-[ -n "$NEXT_IDX" ] || err "бронь вернула пустой индекс"
-# Оборвались на provisioning — бронь не должна держать индекс до TTL.
-# Освобождение брони на выходе. Вывод НЕ глушим: прошлая версия прятала его в
-# /dev/null, и когда на реальном заведении exit'а бронь осталась висеть, понять
-# по логу было нечего — вплоть до того, отработал ли trap вообще.
-release_reserve() {
-    [ -n "${RESERVE_TOKEN:-}" ] || return 0
-    if /usr/local/sbin/awg-cascade-exit-reserve.sh release "$RESERVE_TOKEN"; then
-        info "бронь индекса освобождена"
-    else
-        warn "бронь $RESERVE_TOKEN освободить не удалось — снимется сама через TTL,"
-        warn "или вручную: awg-cascade-exit-reserve.sh release $RESERVE_TOKEN"
-    fi
-}
-trap release_reserve EXIT
-info "Локальный интерфейс будет awg${NEXT_IDX} (бронь взята)"
 
 # 4. Ключ бота ставим ДО provisioning — и проверяем, что он работает.
 #
@@ -236,8 +194,8 @@ if [ -f "$SSH_DIR/id_ed25519.pub" ]; then
     _kv_out=""
     _kv_ok=0
     for _try in 1 2 3; do
-        if _kv_out=$(ssh -i "$SSH_DIR/id_ed25519" $SSH_OPTS \
-                -o BatchMode=yes -o PasswordAuthentication=no \
+        if _kv_out=$(ssh -F /dev/null -i "$SSH_DIR/id_ed25519" $SSH_OPTS_BASE \
+                -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes -o PasswordAuthentication=no \
                 "root@$EXIT_IP" 'echo ok' 2>&1); then
             _kv_ok=1
             break
@@ -261,108 +219,21 @@ else
     warn "$SSH_DIR/id_ed25519.pub не найден — бот не сможет управлять этим exit'ом"
 fi
 
-# 5. Запускаем setup-exit.sh на exit. Он сам определит fresh/SHARED и вернёт JSON.
-info "Провижу exit (это может занять до 10 мин на свежем сервере)..."
-EXIT_RAW=$(sshx "chmod +x /root/setup-exit.sh && \
-    BATCH=1 TERM=xterm EXIT_INDEX=$NEXT_IDX RU_TUNNEL_OCTET=$((100 + NEXT_IDX)) \
-    RU_PUBLIC_IP='$RU_PUBLIC_IP' RU_PUBKEY='$RU_PUBKEY' RU_PSK='$RU_PSK' \
-    bash /root/setup-exit.sh") || err "setup-exit.sh упал на exit (см. вывод выше)"
-
-# 6. Извлекаем JSON-блок (stdout = только JSON, но подстрахуемся sed'ом)
-EXIT_JSON=$(echo "$EXIT_RAW" | sed -n '/^{/,/^}/p')
-echo "$EXIT_JSON" | jq -e . >/dev/null 2>&1 || {
-    echo "$EXIT_RAW" >&2
-    err "Не удалось распарсить JSON от setup-exit.sh"
-}
-EXIT_IFACE=$(echo "$EXIT_JSON" | jq -r '.exit_iface // "awg-in"')
-EXIT_PORT=$(echo "$EXIT_JSON" | jq -r '.exit_port')
-SHARED=$(echo "$EXIT_JSON" | jq -r '.shared_mode // 0')
-ok "Exit provisioned: iface=$EXIT_IFACE port=$EXIT_PORT shared=$SHARED"
-
-# 7. Собираем args для awg-cascade-exit-add-ru.sh и создаём awg<N> на RU
-# Приватный ключ и PSK берём через $ENV, а не через --arg: аргументы jq
-# попадают в /proc/<pid>/cmdline, который читается любым локальным
-# пользователем. Переменные окружения процесса — только владельцем и root.
-ADD_ARGS=$(RU_PRIVKEY="$RU_PRIVKEY" RU_PSK="$RU_PSK" jq -n \
-    --argjson idx "$NEXT_IDX" \
-    --arg name    "$EXIT_NAME" \
-    --arg pub     "$RU_PUBKEY" \
-    --argjson info "$EXIT_JSON" \
-    --arg tok     "$RESERVE_TOKEN" \
-    '{exit_index: $idx, reserve_token: $tok, name: $name,
-      ru_privkey: $ENV.RU_PRIVKEY, ru_pubkey: $pub, ru_psk: $ENV.RU_PSK,
-      exit_info: $info}')
-
-# Сохраняем параметры ДО последнего шага. Если он упадёт, вся проделанная на
-# exit'е работа (пакеты, ключи, интерфейс) останется валидной, и повторять её
-# незачем — достаточно повторить добавление на RU этими же данными.
-RETRY_FILE="/etc/awg-cascade/exits/.pending-${NEXT_IDX}.json"
-mkdir -p /etc/awg-cascade/exits
-printf '%s' "$ADD_ARGS" > "$RETRY_FILE"
-chmod 600 "$RETRY_FILE"
-
-info "Создаю awg${NEXT_IDX} на RU + добавляю в state.json..."
-# ADD_ARGS содержит приватный ключ и PSK — через stdin, не через argv.
-RESULT=$(printf '%s' "$ADD_ARGS" | /usr/local/sbin/awg-cascade-exit-add-ru.sh -) || {
-    echo "" >&2
-    warn "Добавление на RU не удалось, но EXIT УЖЕ НАСТРОЕН — переделывать его не нужно."
-    warn "Параметры сохранены. Повторить только последний шаг:"
-    echo "" >&2
-    echo "  sudo /usr/local/sbin/awg-cascade-exit-add-ru.sh - < $RETRY_FILE" >&2
-    echo "" >&2
-    err "awg-cascade-exit-add-ru.sh упал"
-}
-echo "$RESULT" | jq -e '.ok == true' >/dev/null 2>&1 || err "exit-add-ru вернул ошибку: $RESULT"
-ok "awg${NEXT_IDX} ($EXIT_NAME) поднят и добавлен в каскад"
-# Бронь уже снята внутри exit-add-ru.sh той же записью, что добавила exit.
-# Обнуляем токен, чтобы trap на выходе не отпустил чужую бронь.
-RESERVE_TOKEN=""
-
-# ─── 7b. Перезагрузка exit'а в новое ядро ────────────────────────────────────
+# Общий с ботом движок провижининга; вход по ключу проверен выше.
 #
-# setup-exit.sh обновил образ вместе с ядром и собрал модуль под все ядра, но
-# работает exit до сих пор на старом. Перезагрузка делается ЗДЕСЬ, а не внутри
-# setup-exit.sh: тот запускается по SSH и обязан вернуть JSON — ребут оборвал бы
-# его вывод на полуслове, и провижининг выглядел бы как упавший.
-#
-# Момент выбран намеренно: туннель уже поднят, клиентов на нём ещё нет, и
-# возвращение проверяется по handshake'у. Отложить — значит отдать первую
-# перезагрузку ноде с трафиком, без наблюдения.
-#
-# Ходим ключом, а не паролем: setup-exit.sh к этому моменту уже отключил вход
-# по паролю, и sshx (он мог быть парольным) здесь больше не работает.
-_ssh_key_exit() {
-    ssh -i "$SSH_DIR/id_ed25519" $SSH_OPTS_BASE \
-        -o BatchMode=yes -o PasswordAuthentication=no "root@$EXIT_IP" "$@"
-}
-if _ssh_key_exit 'test -f /var/run/reboot-required' 2>/dev/null; then
-    _knew=$(_ssh_key_exit 'ls -1 /boot/vmlinuz-* | sed "s|.*/vmlinuz-||" | sort -V | tail -1' 2>/dev/null)
-    info "На exit'е новое ядро (${_knew:-?}) — перезагружаю его"
-    _ssh_key_exit 'systemctl reboot' >/dev/null 2>&1 || true
-    sleep 20
-    _back=0
-    for _i in $(seq 1 24); do            # до ~4 минут
-        _ssh_key_exit 'test -d /etc/awg-cascade-exit' >/dev/null 2>&1 && { _back=1; break; }
-        sleep 10
-    done
-    if [ "$_back" = 1 ]; then
-        ok "Exit вернулся, ядро: $(_ssh_key_exit 'uname -r' 2>/dev/null)"
-        # Ждём handshake: интерфейс на RU остался поднятым, но пира не было.
-        _hs_ok=0
-        for _i in $(seq 1 12); do
-            _hs=$(awg show "awg${NEXT_IDX}" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
-            if [ -n "$_hs" ] && [ "$_hs" != "0" ] && [ $(( $(date +%s) - _hs )) -lt 180 ]; then
-                _hs_ok=1; break
-            fi
-            sleep 10
-        done
-        [ "$_hs_ok" = 1 ] \
-            && ok "Туннель до $EXIT_NAME восстановился после перезагрузки" \
-            || warn "Туннель до $EXIT_NAME пока без handshake'а — watchdog дожмёт, но проверь"
-    else
-        warn "Exit не ответил за 4 минуты после перезагрузки — проверь его в панели хостера"
-    fi
-fi
+# Код возврата 2 — особый: exit настроен, добавлен и работает, не подтвердилась
+# только его перезагрузка в новое ядро. Повторять провижининг в этом случае
+# нельзя — он уже сделан, и повтор пошёл бы по чужому индексу.
+_prov_rc=0
+_prov_out=$(/usr/local/sbin/awg-cascade-provision.sh "$EXIT_IP" "$EXIT_NAME") || _prov_rc=$?
+_prov_reboot=$(printf %s "$_prov_out" | jq -r '.reboot // "-"' 2>/dev/null || echo "-")
+case "$_prov_rc" in
+    0) ok "Exit провижинен (перезагрузка: $_prov_reboot)" ;;
+    2) warn "Exit добавлен и работает, но перезагрузка не подтверждена:"
+       warn "  $_prov_reboot"
+       warn "  Провижининг НЕ повторять. Проверь сам exit: uptime, awg show" ;;
+    *) err "Провижининг не завершён — повтори с тем же IP и именем" ;;
+esac
 
 # 8. Перезапускаем бота — теперь у него есть egress через этот exit
 info "Перезапускаю бота (теперь будет egress через $EXIT_NAME)..."
