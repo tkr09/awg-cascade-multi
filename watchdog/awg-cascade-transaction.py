@@ -21,6 +21,10 @@ c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
 JOURNAL = Path('/var/lib/awg-cascade/transaction')
 HELPERS = {'peer-add', 'peer-remove', 'peer-rotate', 'exit-add-ru', 'exit-remove', 'client3'}
+# Операции, меняющие СОСТАВ exit'ов. Только они переиспользуют индексы, и
+# только им опасен незавершённый AWG3.
+EXIT_COMPOSITION = {'exit-add-ru', 'exit-remove'}
+AWG3_PENDING = Path('/var/lib/awg-cascade/awg3-pending.json')
 WG = Path('/etc/amnezia/amneziawg')
 BASE = Path('/etc/awg-cascade')
 
@@ -119,6 +123,16 @@ def main():
     with c.locked('/run/awg-cascade-mutation.lock', timeout=30) as mutation_fd, c.locked(BASE / 'state.lock', timeout=30) as state_fd:
         recover()
         if operation == 'recover': return 0
+        # Незавершённый AWG3 запрещает менять состав exit'ов.
+        #
+        # Его журнал привязан к интерфейсу, а индексы переиспользуются: удалить
+        # exit и завести новый с тем же индексом — значит подставить под чужое
+        # восстановление свежий туннель. Свой журнал движок восстанавливает сам,
+        # а этот — чужой, и раньше он просто не учитывался (A02 аудита v2.7.6).
+        if operation in EXIT_COMPOSITION and AWG3_PENDING.exists():
+            raise RuntimeError(
+                'незавершённая операция AWG3 — менять состав exit’ов нельзя. '
+                'Сначала: awg-cascade-awg3.sh <iface> recover')
         c.validate_state(json.loads((BASE / 'state.json').read_text()))
         c.validate_peers(json.loads((BASE / 'peers.json').read_text()))
         manifest = snapshot(operation)
@@ -157,5 +171,16 @@ if __name__ == '__main__':
     try: sys.exit(main())
     except BaseException as exc:
         if isinstance(exc, SystemExit): raise
-        print('Mutation failed: ' + type(exc).__name__ + '; inspect transaction journal/status before retry', file=sys.stderr)
+        # Текст показываем только для СВОИХ отказов: их формулируем мы, и
+        # секретов в них нет. У прочих исключений сообщение способно тащить
+        # пути и данные библиотек, поэтому остаётся только тип.
+        #
+        # Раньше тип печатался всегда, и отказ «сначала заверши AWG3» доходил
+        # до оператора как «Mutation failed: RuntimeError» — узнать из этого,
+        # что делать, было неоткуда.
+        ours = isinstance(exc, (ValueError, RuntimeError, PermissionError))
+        detail = str(exc) if ours and str(exc) else ''
+        print('Мутация не выполнена: ' + (detail or type(exc).__name__)
+              + ('' if detail else '; проверьте журнал транзакции перед повтором'),
+              file=sys.stderr)
         sys.exit(1)

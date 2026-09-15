@@ -108,9 +108,32 @@ def call(node, mode, remote):
         raise RuntimeError(('exit' if remote else 'RU') + ': ' + mode + ' failed')
 
 
+def iface_identity(iface):
+    """Публичный ключ интерфейса — устойчивый признак «это тот же туннель»."""
+    result = subprocess.run(['awg','show',iface,'public-key'],capture_output=True,text=True,timeout=10)
+    return result.stdout.strip() if result.returncode == 0 else ''
+
+
 def recovery():
     if not JOURNAL.exists(): return
     node = json.loads(JOURNAL.read_text())
+    # Сверяем ИДЕНТИЧНОСТЬ, а не имя интерфейса.
+    #
+    # Индексы exit'ов переиспользуются: awg2 после удаления одного exit'а и
+    # добавления другого — это уже иной туннель с другими ключами. Восстановление
+    # по имени накатило бы сохранённый конфиг поверх чужого интерфейса и
+    # разрушило бы связь с новым exit'ом (A02 аудита v2.7.6).
+    #
+    # Журнал при этом не удаляем молча: откладываем в сторону как улику и
+    # перестаём блокировать им дальнейшую работу — операция, которую он
+    # описывает, применять уже не к чему.
+    expected = node.get('iface_pubkey')
+    if expected and iface_identity(node['iface']) != expected:
+        stale = JOURNAL.with_name('awg3-stale-%d.json' % int(time.time()))
+        JOURNAL.rename(stale)
+        print('awg3: журнал описывает другой туннель (%s пересоздан) — не трогаю, '
+              'сохранён как %s' % (node['iface'], stale), file=sys.stderr)
+        return
     action = 'commit' if node.get('committed') else 'rollback'
     # If SSH fails the journal stays. A subsequent command retries recovery.
     call(node, action, True)
@@ -149,7 +172,8 @@ def main():
             import base64
             changes.update(dict(zip(extras, [base64.b64encode(secrets.token_bytes(32)).decode(), '50-100','100-140','4-7','170-200','8-13','15-20'])))
         record = {'operation': secrets.token_hex(16), 'iface': iface, 'remote_iface': node.get('exit_iface','awg-in'),
-                  'ip': node['ip'], 'changes': changes, 'restart': action == 'off'}
+                  'ip': node['ip'], 'changes': changes, 'restart': action == 'off',
+                  'iface_pubkey': iface_identity(iface)}
         JOURNAL.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         c.atomic_write(JOURNAL,json.dumps(record),mode=0o600)
         try:
