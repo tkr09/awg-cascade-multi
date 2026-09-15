@@ -869,10 +869,15 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
         return
     provision = json.loads(out)
     EXIT_INDEX = provision["index"]
+    notes = []
+    if provision.get("proto", "").startswith("failed"):
+        notes.append("протокол 3.1 не включён, туннель остался на 2.0")
+    if provision.get("reboot", "").startswith("failed"):
+        notes.append("перезагрузка exit'а не подтверждена: "
+                     + html_escape(str(provision["reboot"])))
     reboot_note = ""
-    if rc == 2:
-        reboot_note = ("\n\n⚠️ Перезагрузка exit не подтверждена: "
-                       + html_escape(str(provision.get("reboot", "?")))
+    if notes:
+        reboot_note = ("\n\n⚠️ " + "; ".join(notes)
                        + "\nПровижининг НЕ повторять — проверьте сам сервер.")
 
     flag2 = name_to_flag(name)

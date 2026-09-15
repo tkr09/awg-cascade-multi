@@ -1307,27 +1307,10 @@ if [ -n "$BOOTSTRAP_EXIT_IP" ]; then
         fi
     fi
 
-    # ─── Протокол 3.1 на туннеле до exit'а ───────────────────────────────────
-    # Включается ПОСЛЕ поднятия туннеля: awg3.sh правит конфиги обеих сторон и
-    # применяет их через syncconf, то есть туннель уже должен существовать.
-    if [ "$BOOTSTRAP_OK" = "1" ] && [ "$EXIT_PROTO" = "3" ]; then
-        EXIT_IFACE_NEW=$(jq -r '.exits[-1].interface // empty' "$STATE_FILE" 2>/dev/null)
-        if [ -n "$EXIT_IFACE_NEW" ]; then
-            info "Включаю протокол 3.1 на $EXIT_IFACE_NEW..."
-            # Через файл, а не через конвейер: `cmd | sed && ok || warn` проверял бы
-            # код sed, то есть всегда печатал успех. Ровно та ошибка, за которую
-            # аудит цеплял awg3.sh.
-            _a3=$(mktemp)
-            if /usr/local/sbin/awg-cascade-awg3.sh "$EXIT_IFACE_NEW" on --fix-s >"$_a3" 2>&1; then
-                sed "s/^/  /" "$_a3"; ok "Туннель до exit'а работает на 3.1"
-            else
-                sed "s/^/  /" "$_a3"
-                warn "3.1 не включился — туннель остался на 2.0. Позже:"
-                warn "  awg-cascade-awg3.sh $EXIT_IFACE_NEW on --fix-s"
-            fi
-            rm -f "$_a3"
-        fi
-    fi
+    # Протокол 3.1 здесь больше не включается: это делает общий движок
+    # провижининга (awg-cascade-provision.py) по EXIT_PROTO из config.
+    # Раньше вызов жил ТОЛЬКО тут, и любой следующий exit — через бота или
+    # через bootstrap-exit.sh — молча оставался на 2.0.
 else
     info "Exit не подключён. Добавь позже: ${BOLD}awg-cascade-bootstrap-exit.sh${NC} или через бота."
 fi

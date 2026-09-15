@@ -227,10 +227,12 @@ fi
 _prov_rc=0
 _prov_out=$(/usr/local/sbin/awg-cascade-provision.sh "$EXIT_IP" "$EXIT_NAME") || _prov_rc=$?
 _prov_reboot=$(printf %s "$_prov_out" | jq -r '.reboot // "-"' 2>/dev/null || echo "-")
+_prov_proto=$(printf %s "$_prov_out" | jq -r '.proto // "-"' 2>/dev/null || echo "-")
 case "$_prov_rc" in
-    0) ok "Exit провижинен (перезагрузка: $_prov_reboot)" ;;
-    2) warn "Exit добавлен и работает, но перезагрузка не подтверждена:"
-       warn "  $_prov_reboot"
+    0) ok "Exit провижинен (протокол: $_prov_proto, перезагрузка: $_prov_reboot)" ;;
+    2) warn "Exit добавлен и работает, но не всё обещанное сложилось:"
+       warn "  протокол:     $_prov_proto"
+       warn "  перезагрузка: $_prov_reboot"
        warn "  Провижининг НЕ повторять. Проверь сам exit: uptime, awg show" ;;
     *) err "Провижининг не завершён — повтори с тем же IP и именем" ;;
 esac

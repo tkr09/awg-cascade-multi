@@ -26,6 +26,37 @@ def run(args, data=None, timeout=45):
     return result.stdout.decode().strip()
 
 
+def apply_exit_proto(iface):
+    """
+    Включить 3.1 на туннеле до exit'а, если так выбрано при установке.
+
+    До сих пор это делалось РОВНО в одном месте — в блоке первого exit'а внутри
+    setup.sh. Любой следующий exit, добавленный через бота или через
+    bootstrap-exit.sh, молча оставался на 2.0 при EXIT_PROTO=3 в config.
+    Незаметно полностью: туннель поднимается, трафик идёт, в интерфейсе просто
+    нет ни защиты заголовков, ни набивки. Владелец при этом уверен, что они есть.
+
+    Отсюда — сюда, в общий движок: бот и CLI обязаны идти одним путём, иначе
+    расхождение повторится при следующей правке.
+    """
+    try:
+        values={l.partition('=')[0].strip():l.partition('=')[2].strip().strip('"\'')
+                for l in (BASE/'config').read_text().splitlines()
+                if '=' in l and not l.lstrip().startswith('#')}
+    except OSError:
+        return 'skipped: config не прочитан'
+    if values.get('EXIT_PROTO')!='3':
+        return 'off: выбран 2.0 при установке'
+    result=subprocess.run(['/usr/local/sbin/awg-cascade-awg3.sh',iface,'on','--fix-s'],
+                          capture_output=True,timeout=600)
+    if result.returncode:
+        # Туннель остаётся рабочим на 2.0, поэтому не роняем провижининг. Но и
+        # не молчим: молчание здесь означало бы ровно ту ошибку, которую чиним.
+        print('3.1 на '+iface+' не включён: '+result.stderr.decode()[-300:],file=sys.stderr)
+        return 'failed: остался на 2.0'
+    return 'on'
+
+
 def write_version_stamp(ssh):
     """
     Записать version-stamp на свежий exit.
@@ -165,13 +196,19 @@ def main():
         if re.fullmatch(r'/root/awgc-provision\.[A-Za-z0-9]+',record.get('stage','')):
             run(ssh+['rm -rf -- '+record['stage']])
         record_path.unlink()
+        iface='awg'+str(record['exit_index'])
+        # 3.1 включаем ДО перезагрузки exit'а: так проверка возвращения
+        # подтверждает handshake уже на том протоколе, на котором туннель
+        # будет работать дальше.
+        proto=apply_exit_proto(iface)
         stamp=write_version_stamp(ssh)
         reboot=exit_reboot(ssh,record)
-        print(json.dumps({'ok':True,'index':record['exit_index'],'interface':'awg'+str(record['exit_index']),'reboot':reboot,'version_stamp':stamp}))
-        # Код 2, а не 1: exit добавлен и работает, не завершилась только
-        # перезагрузка. Повторять провижининг не нужно и вредно — вызывающая
-        # сторона обязана различать эти два исхода.
-        if reboot.startswith('failed'): sys.exit(2)
+        print(json.dumps({'ok':True,'index':record['exit_index'],'interface':iface,
+                          'proto':proto,'reboot':reboot,'version_stamp':stamp}))
+        # Код 2, а не 1: exit добавлен и работает, не сложилось только что-то
+        # из обещанного — перезагрузка или протокол. Повторять провижининг не
+        # нужно и вредно; вызывающая сторона обязана различать эти исходы.
+        if reboot.startswith('failed') or proto.startswith('failed'): sys.exit(2)
 
 
 if __name__=='__main__':
