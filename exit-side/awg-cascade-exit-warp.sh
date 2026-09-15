@@ -209,9 +209,49 @@ cmd_on() {
 cmd_off() {
     warp_guard
 
-    # Убираем routing ТОЛЬКО для этого iface
-    ip rule del fwmark $MARK lookup $TABLE 2>/dev/null || true
-    iptables -t mangle -D PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null || true
+    # ─── Снимаем routing ТОЛЬКО для этого iface ──────────────────────────────
+    #
+    # Раньше обе команды глушились через `2>/dev/null || true`, после чего
+    # безусловно писалось running:false и возвращался успех. «Правила нет» и
+    # «команда не отработала» — разные исходы, а считались одинаково удачными.
+    #
+    # Цена ошибки несимметрична: если MARK уцелел, трафик интерфейса продолжает
+    # уходить в table $TABLE, то есть через WARP, — при том что состояние уже
+    # объявлено выключенным. Владелец видит «off» и не понимает, почему адрес
+    # чужой (A09 аудита v2.7.6).
+    # Циклы ОГРАНИЧЕНЫ числом попыток. Дубликаты правил возможны, поэтому
+    # удаляем «пока есть», но команда может вернуть ноль и не удалить ничего —
+    # тогда условие цикла истинно вечно. Поймано тестом с подставным iptables:
+    # первая версия этой правки уходила в бесконечный цикл ровно на том
+    # сценарии, ради которого писалась.
+    local errs="" tries
+    tries=0
+    while ip rule show priority "$RULE_PRIO" 2>/dev/null | grep -q "fwmark $MARK.*lookup $TABLE"; do
+        tries=$((tries + 1))
+        [ "$tries" -le 8 ] || { errs="$errs ip-rule-не-снимается"; break; }
+        ip rule del fwmark $MARK lookup $TABLE || { errs="$errs ip-rule"; break; }
+    done
+    tries=0
+    while iptables -w 30 -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 8 ] || { errs="$errs mangle-mark-не-снимается"; break; }
+        iptables -w 30 -t mangle -D PREROUTING -i "$IFACE" -j MARK --set-mark $MARK \
+            || { errs="$errs mangle-mark"; break; }
+    done
+
+    # Проверяем ФАКТ, а не то, что команды вернули ноль: селекторов быть не
+    # должно ни одного.
+    ip rule show priority "$RULE_PRIO" 2>/dev/null | grep -q "fwmark $MARK.*lookup $TABLE" \
+        && errs="$errs правило-осталось"
+    iptables -w 30 -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null \
+        && errs="$errs маркировка-осталась"
+
+    if [ -n "$errs" ]; then
+        # Guard НЕ снимаем и состояние НЕ переписываем: WARP фактически остался
+        # включённым, и объявлять обратное нельзя.
+        log "OFF FAILED:${errs}"
+        die "WARP не выключен, осталось:${errs} — состояние не менял"
+    fi
 
     # Если больше НИ ОДИН iface не маркируется — опускаем общий warp0
     local remain
