@@ -109,13 +109,49 @@ def call(node, mode, remote):
 
 
 def iface_identity(iface):
-    """Публичный ключ интерфейса — устойчивый признак «это тот же туннель»."""
+    """
+    Публичный ключ интерфейса — устойчивый признак «это тот же туннель».
+
+    Возвращает ПАРУ (источник, ключ): 'runtime', 'conf' либо (None, '') —
+    идентичность установить не удалось.
+
+    Источников два намеренно. Первая версия этой проверки спрашивала только
+    работающий интерфейс и при любой ошибке отдавала пустую строку — а вызывающая
+    сторона считала пустоту доказательством того, что туннель ПЕРЕСОЗДАН.
+    Получалось наоборот: интерфейс отсутствовал именно потому, что операция
+    не доигралась (`awg-quick down` прошёл, `up` упал), и восстановление
+    отменялось ровно тогда, когда было нужнее всего (R02 аудита v2.8.5).
+
+    Конфиг годится как второй источник, потому что `PrivateKey` не входит в
+    список изменяемых параметров: наша собственная правка его не трогает, а вот
+    переиспользование индекса под другой exit заменяет файл целиком вместе с
+    ключом — то есть подмену туннеля этот источник всё так же ловит.
+    """
     result = subprocess.run(['awg','show',iface,'public-key'],capture_output=True,text=True,timeout=10)
-    return result.stdout.strip() if result.returncode == 0 else ''
+    key = result.stdout.strip()
+    if result.returncode == 0 and key:
+        return 'runtime', key
+    try: lines = (WG / (iface + '.conf')).read_text().splitlines()
+    except OSError: return None, ''
+    for line in lines:
+        name, sep, value = line.partition('=')
+        if not sep or name.strip() != 'PrivateKey': continue
+        derived = subprocess.run(['awg','pubkey'],input=value.strip(),capture_output=True,text=True,timeout=10)
+        if derived.returncode == 0 and derived.stdout.strip():
+            return 'conf', derived.stdout.strip()
+        break
+    return None, ''
 
 
 def recovery():
-    if not JOURNAL.exists(): return
+    """
+    Доиграть прерванную операцию. Возвращает 'done', 'stale' или 'unknown'.
+
+    Исход обязан быть различим вызывающей стороной: 'stale' и 'unknown' значат,
+    что на ДАЛЬНЕЙ стороне могли остаться незавершённые изменения, и объявлять
+    операцию восстановленной нельзя.
+    """
+    if not JOURNAL.exists(): return 'done'
     node = json.loads(JOURNAL.read_text())
     # Сверяем ИДЕНТИЧНОСТЬ, а не имя интерфейса.
     #
@@ -124,21 +160,38 @@ def recovery():
     # по имени накатило бы сохранённый конфиг поверх чужого интерфейса и
     # разрушило бы связь с новым exit'ом (A02 аудита v2.7.6).
     #
-    # Журнал при этом не удаляем молча: откладываем в сторону как улику и
-    # перестаём блокировать им дальнейшую работу — операция, которую он
-    # описывает, применять уже не к чему.
+    # Но «ключ не совпал» и «ключ не удалось узнать» — РАЗНЫЕ исходы, и раньше
+    # они сходились в один (R02 аудита v2.8.5). Отсюда три ветки, а не две.
     expected = node.get('iface_pubkey')
-    if expected and iface_identity(node['iface']) != expected:
+    source, current = iface_identity(node['iface'])
+    if source is None:
+        # Ни интерфейса, ни читаемого конфига. Журнал НЕ откладываем: он и есть
+        # то, что блокирует дальнейшие мутации состава exit'ов, а операция
+        # осталась недоигранной. Следующий вызов повторит попытку.
+        print('awg3: идентичность %s не установлена (нет ни интерфейса, ни конфига) — '
+              'журнал оставляю, восстановление не выполнено' % node['iface'], file=sys.stderr)
+        return 'unknown'
+    if not expected:
+        # Журнал старого формата. Проверять не с чем, но и промолчать нельзя.
+        print('awg3: журнал без iface_pubkey — восстанавливаю по имени %s, '
+              'подмену туннеля здесь проверить нечем' % node['iface'], file=sys.stderr)
+    elif current != expected:
+        # Журнал при этом не удаляем молча: откладываем в сторону как улику и
+        # перестаём блокировать им дальнейшую работу — операция, которую он
+        # описывает, применять уже не к чему.
         stale = JOURNAL.with_name('awg3-stale-%d.json' % int(time.time()))
         JOURNAL.rename(stale)
-        print('awg3: журнал описывает другой туннель (%s пересоздан) — не трогаю, '
-              'сохранён как %s' % (node['iface'], stale), file=sys.stderr)
-        return
+        print('awg3: журнал описывает другой туннель (%s пересоздан, ключ взят из %s) — '
+              'не трогаю, сохранён как %s. На %s могли остаться незавершённые '
+              'изменения — разберите вручную' % (node['iface'], source, stale, node['ip']),
+              file=sys.stderr)
+        return 'stale'
     action = 'commit' if node.get('committed') else 'rollback'
     # If SSH fails the journal stays. A subsequent command retries recovery.
     call(node, action, True)
     call(node, action, False)
     JOURNAL.unlink()
+    return 'done'
 
 
 def main():
@@ -155,8 +208,15 @@ def main():
         return
     if iface == 'all': raise ValueError('one interface per mutation')
     with c.locked('/run/awg-cascade-mutation.lock'), c.locked('/run/awg-cascade-awg3.lock'):
-        recovery()
-        if action == 'recover': return
+        outcome = recovery()
+        if action == 'recover':
+            print(json.dumps({'ok': outcome == 'done', 'recovery': outcome}))
+            if outcome != 'done': sys.exit(1)
+            return
+        # 'stale' пропускаем намеренно: журнал отложен, блокировать им нечего.
+        # А вот 'unknown' — непроигранная операция, и записывать поверх неё
+        # новый журнал нельзя: это стёрло бы единственный след незавершённого.
+        if outcome == 'unknown': raise RuntimeError('есть незавершённая операция — сначала `recover`')
         node = next(n for n in state['exits'] if n['interface'] == iface)
         cfg = (WG / (iface + '.conf')).read_text()
         params = {l.partition('=')[0].strip(): l.partition('=')[2].strip() for l in cfg.splitlines() if '=' in l}
@@ -171,9 +231,15 @@ def main():
         if action == 'on':
             import base64
             changes.update(dict(zip(extras, [base64.b64encode(secrets.token_bytes(32)).decode(), '50-100','100-140','4-7','170-200','8-13','15-20'])))
+        # Идентичность фиксируем ДО начала операции. Если установить её нечем,
+        # операцию не начинаем вовсе: без неё восстановление после сбоя не
+        # сможет отличить «тот же туннель» от «на этом индексе теперь другой
+        # exit» и будет вынуждено гадать.
+        source, pubkey = iface_identity(iface)
+        if source is None: raise RuntimeError('идентичность ' + iface + ' не установлена — операцию не начинаю')
         record = {'operation': secrets.token_hex(16), 'iface': iface, 'remote_iface': node.get('exit_iface','awg-in'),
                   'ip': node['ip'], 'changes': changes, 'restart': action == 'off',
-                  'iface_pubkey': iface_identity(iface)}
+                  'iface_pubkey': pubkey}
         JOURNAL.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         c.atomic_write(JOURNAL,json.dumps(record),mode=0o600)
         try:
@@ -191,10 +257,14 @@ def main():
             else: raise TimeoutError('no fresh handshake and data-plane response')
             record['committed'] = True
             c.atomic_write(JOURNAL,json.dumps(record),mode=0o600)
-            recovery()
+            # Исход commit'а больше не игнорируется: журнал, оставшийся после
+            # него, значит, что дальняя сторона не подтвердила завершение.
+            outcome = recovery()
+            if outcome != 'done': raise RuntimeError('commit не завершён (' + outcome + ') — журнал остался')
             print(json.dumps({'ok':True,'interface':iface,'mode':action,'traffic_verified':True}))
         except BaseException:
-            recovery()
+            if recovery() != 'done':
+                print('awg3: автоматическое восстановление не завершено — см. сообщение выше',file=sys.stderr)
             raise
 
 

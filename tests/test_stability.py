@@ -1,6 +1,7 @@
 """Regression tests; kernel tests run in a disposable network namespace."""
 import base64
 import importlib.util
+import json
 import os
 import signal
 from pathlib import Path
@@ -56,6 +57,52 @@ class Validation(unittest.TestCase):
         text=fw.build_rules([('awg0','10.20.0.0/24'),('wgc3','10.21.0.0/24')],[],1001,True)
         for iface in ('awg0','wgc3'):
             for direction in ('-i','-o'): self.assertIn(f'{direction} {iface} -j DROP',text)
+class Awg3Recovery(unittest.TestCase):
+    """Три исхода сверки идентичности туннеля (R02 аудита v2.8.5).
+
+    Отсутствующий интерфейс — не то же самое, что подменённый: в первом случае
+    откат обязан состояться, во втором он разрушил бы чужой туннель.
+    """
+    def setUp(self):
+        self.awg3=module('awg3')
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        self.root=Path(tmp.name)
+        self.awg3.WG=self.root;self.awg3.JOURNAL=self.root/'awg3-pending.json'
+        self.calls=[]
+        self.awg3.call=lambda node,action,remote:self.calls.append((action,remote))
+        self.awg3.JOURNAL.write_text(json.dumps({'iface':'awg2','ip':'198.51.100.7','iface_pubkey':'SAVED',
+                                                 'operation':'a'*32,'changes':{},'restart':True,'remote_iface':'awg-in'}))
+    def probe(self,runtime=None,derived=None):
+        def run(args,**kw):
+            if list(args[:2])==['awg','show']: return subprocess.CompletedProcess(args,0 if runtime else 1,runtime or '','')
+            if list(args[:2])==['awg','pubkey']: return subprocess.CompletedProcess(args,0 if derived else 1,derived or '','')
+            raise AssertionError(args)
+        return patch.object(subprocess,'run',side_effect=run)
+    def conf(self,key='PRIV'):
+        (self.root/'awg2.conf').write_text('[Interface]\nPrivateKey = '+key+'\nListenPort = 51820\n')
+    def test_runtime_match_rolls_back(self):
+        with self.probe(runtime='SAVED'): self.assertEqual(self.awg3.recovery(),'done')
+        self.assertEqual(self.calls,[('rollback',True),('rollback',False)])
+        self.assertFalse(self.awg3.JOURNAL.exists())
+    def test_missing_iface_falls_back_to_conf(self):
+        # down прошёл, up не удался: интерфейса нет именно из-за нашей операции.
+        self.conf()
+        with self.probe(derived='SAVED'): self.assertEqual(self.awg3.recovery(),'done')
+        self.assertEqual(self.calls,[('rollback',True),('rollback',False)])
+    def test_replaced_iface_is_stale(self):
+        with self.probe(runtime='OTHER'): self.assertEqual(self.awg3.recovery(),'stale')
+        self.assertEqual(self.calls,[])
+        self.assertFalse(self.awg3.JOURNAL.exists())
+        self.assertTrue(list(self.root.glob('awg3-stale-*.json')))
+    def test_reused_index_detected_while_down(self):
+        # Индекс переиспользован под другой exit: конфиг заменён вместе с ключом.
+        self.conf()
+        with self.probe(derived='OTHER'): self.assertEqual(self.awg3.recovery(),'stale')
+        self.assertEqual(self.calls,[])
+    def test_unknown_identity_keeps_journal(self):
+        with self.probe(): self.assertEqual(self.awg3.recovery(),'unknown')
+        self.assertEqual(self.calls,[])
+        self.assertTrue(self.awg3.JOURNAL.exists(),'журнал обязан остаться блокировать мутации')
 @unittest.skipUnless(os.environ.get('AWGC_NETNS_TEST')=='1','requires disposable network namespace')
 class Kernel(unittest.TestCase):
     @classmethod
