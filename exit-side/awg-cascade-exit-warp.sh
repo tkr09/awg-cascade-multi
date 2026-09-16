@@ -65,11 +65,60 @@ MARK=$(printf '0x%x' $((0x10 + IDX - 1)))
 RULE_PRIO=$((990 + IDX - 1))
 WARP_STATE="$WARP_DIR/warp-$IFACE.state"
 
-# Сколько cascade-интерфейсов сейчас маркируются в warp (т.е. WARP on)
-count_active_marks() {
-    iptables -t mangle -S PREROUTING 2>/dev/null \
-        | grep -cE '\-i awg-in(-[0-9]+)? .*MARK' || true
+# ─── Наблюдение за селекторами WARP ──────────────────────────────────────────
+#
+# «Правила нет» и «прочитать не удалось» — РАЗНЫЕ ответы (R04 аудита v2.8.5).
+#
+# Прежние проверки строились на коде возврата `ip rule show | grep -q` и
+# `iptables -C`. Упади команда — grep получит пустой ввод, -C вернёт ненулевое,
+# и то и другое читалось как «правила нет». Выключение WARP тогда шло дальше
+# и объявляло off при уцелевших селекторах, а подсчёт пользователей общего
+# warp0 давал ложный ноль — и мы опускали WARP ДРУГОЙ RU на shared exit'е.
+#
+# Поэтому сначала снимаем полный список, требуя успеха самой команды, и лишь
+# потом разбираем его. Функции печатают число и возвращают НЕ НОЛЬ, когда
+# число неизвестно; вызывающая сторона обязана это различать.
+
+# Любая WARP-маркировка любого cascade-интерфейса — то есть пользователь warp0.
+ANY_MARK_RE='^-A PREROUTING -i awg-in(-[0-9]+)? .*-j MARK'
+
+# Наша маркировка в том виде, в каком её печатает `iptables -S` (nft-бэкенд
+# превращает --set-mark в --set-xmark с полной маской). Сравниваем строку
+# целиком: подстрока совпала бы и с awg-in-2 при поиске awg-in.
+own_mark_line() { printf -- '-A PREROUTING -i %s -j MARK --set-xmark %s/0xffffffff' "$IFACE" "$MARK"; }
+
+mangle_snapshot() { iptables -w 30 -t mangle -S PREROUTING; }
+
+# grep -c, для которого «ноль совпадений» — ответ, а не ошибка.
+count_in() {
+    local snap="$1" n; shift
+    n=$(printf '%s\n' "$snap" | grep -c "$@") || [ "$n" = 0 ] || return 1
+    printf '%s\n' "$n"
 }
+
+# Наши ip rule: точное совпадение приоритета, марки и таблицы. Правило
+# ставится без маски, и iproute2 поле fwmask тогда не выводит вовсе.
+count_warp_rules() {
+    local snap
+    snap=$(ip -j rule show) || return 1
+    printf '%s' "$snap" | jq -e --argjson p "$RULE_PRIO" --arg m "$MARK" --arg t "$TABLE" \
+        '[.[] | select(.priority == $p and .fwmark == $m and .table == $t
+                       and (.fwmask // "0xffffffff") == "0xffffffff")] | length'
+}
+
+count_own_marks() {
+    local snap
+    snap=$(mangle_snapshot) || return 1
+    count_in "$snap" -xF -- "$(own_mark_line)"
+}
+
+# Сколько cascade-интерфейсов сейчас маркируются в warp (т.е. WARP on).
+count_active_marks() {
+    local snap
+    snap=$(mangle_snapshot) || return 1
+    count_in "$snap" -E "$ANY_MARK_RE"
+}
+# ─── конец наблюдения ────────────────────────────────────────────────────────
 
 # Получаем внешний IP через warp0
 detect_warp_ip() {
@@ -207,56 +256,69 @@ cmd_on() {
 # ─── off ──────────────────────────────────────────────────────────────────────
 
 cmd_off() {
-    warp_guard
+    warp_guard || die "cannot guard WARP transition"
 
     # ─── Снимаем routing ТОЛЬКО для этого iface ──────────────────────────────
     #
     # Раньше обе команды глушились через `2>/dev/null || true`, после чего
-    # безусловно писалось running:false и возвращался успех. «Правила нет» и
-    # «команда не отработала» — разные исходы, а считались одинаково удачными.
+    # безусловно писалось running:false и возвращался успех (A09 аудита
+    # v2.7.6). Затем удаление стало учитываться, но наличие правил всё ещё
+    # проверялось по коду возврата — и ошибка чтения выдавала себя за их
+    # отсутствие (R04 аудита v2.8.5). Теперь каждое «правил нет» — это
+    # прочитанный список, в котором их действительно нет.
     #
     # Цена ошибки несимметрична: если MARK уцелел, трафик интерфейса продолжает
     # уходить в table $TABLE, то есть через WARP, — при том что состояние уже
-    # объявлено выключенным. Владелец видит «off» и не понимает, почему адрес
-    # чужой (A09 аудита v2.7.6).
-    # Циклы ОГРАНИЧЕНЫ числом попыток. Дубликаты правил возможны, поэтому
-    # удаляем «пока есть», но команда может вернуть ноль и не удалить ничего —
-    # тогда условие цикла истинно вечно. Поймано тестом с подставным iptables:
-    # первая версия этой правки уходила в бесконечный цикл ровно на том
-    # сценарии, ради которого писалась.
-    local errs="" tries
+    # объявлено выключенным.
+    #
+    # Циклы ОГРАНИЧЕНЫ числом попыток: дубликаты правил возможны, поэтому
+    # удаляем «пока есть», но команда может вернуть ноль и не удалить ничего.
+    local errs="" tries n
     tries=0
-    while ip rule show priority "$RULE_PRIO" 2>/dev/null | grep -q "fwmark $MARK.*lookup $TABLE"; do
+    while :; do
+        n=$(count_warp_rules) || { errs="$errs ip-rule-не-читается"; break; }
+        [ "$n" -gt 0 ] || break
         tries=$((tries + 1))
         [ "$tries" -le 8 ] || { errs="$errs ip-rule-не-снимается"; break; }
-        ip rule del fwmark $MARK lookup $TABLE || { errs="$errs ip-rule"; break; }
+        ip rule del fwmark "$MARK" lookup "$TABLE" priority "$RULE_PRIO" || { errs="$errs ip-rule"; break; }
     done
     tries=0
-    while iptables -w 30 -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null; do
+    while :; do
+        n=$(count_own_marks) || { errs="$errs маркировка-не-читается"; break; }
+        [ "$n" -gt 0 ] || break
         tries=$((tries + 1))
         [ "$tries" -le 8 ] || { errs="$errs mangle-mark-не-снимается"; break; }
-        iptables -w 30 -t mangle -D PREROUTING -i "$IFACE" -j MARK --set-mark $MARK \
+        iptables -w 30 -t mangle -D PREROUTING -i "$IFACE" -j MARK --set-mark "$MARK" \
             || { errs="$errs mangle-mark"; break; }
     done
 
-    # Проверяем ФАКТ, а не то, что команды вернули ноль: селекторов быть не
-    # должно ни одного.
-    ip rule show priority "$RULE_PRIO" 2>/dev/null | grep -q "fwmark $MARK.*lookup $TABLE" \
-        && errs="$errs правило-осталось"
-    iptables -w 30 -t mangle -C PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null \
-        && errs="$errs маркировка-осталась"
+    # Проверяем ФАКТ по свежим снимкам, а не то, что команды вернули ноль.
+    # Нашу маркировку и остальных пользователей warp0 считаем по ОДНОМУ снимку:
+    # иначе проверка и решение об общем интерфейсе описывали бы разные моменты.
+    local left snap own remain
+    if left=$(count_warp_rules); then
+        [ "$left" -eq 0 ] || errs="$errs правило-осталось"
+    else
+        errs="$errs правила-не-проверены"
+    fi
+    if snap=$(mangle_snapshot) \
+       && own=$(count_in "$snap" -xF -- "$(own_mark_line)") \
+       && remain=$(count_in "$snap" -E "$ANY_MARK_RE"); then
+        [ "$own" -eq 0 ] || errs="$errs маркировка-осталась"
+    else
+        errs="$errs маркировки-не-проверены"
+    fi
 
     if [ -n "$errs" ]; then
-        # Guard НЕ снимаем и состояние НЕ переписываем: WARP фактически остался
-        # включённым, и объявлять обратное нельзя.
+        # Guard НЕ снимаем и состояние НЕ переписываем: выключение не доказано,
+        # и объявлять обратное нельзя. warp0 тоже не трогаем — при неизвестном
+        # числе пользователей он может быть нужен другой RU.
         log "OFF FAILED:${errs}"
-        die "WARP не выключен, осталось:${errs} — состояние не менял"
+        die "WARP не выключен или это не удалось проверить:${errs} — состояние не менял"
     fi
 
     # Если больше НИ ОДИН iface не маркируется — опускаем общий warp0
-    local remain
-    remain=$(count_active_marks)
-    if [ "${remain:-0}" -eq 0 ]; then
+    if [ "$remain" -eq 0 ]; then
         awg-quick down warp0 2>/dev/null || true
         ip route flush table $TABLE 2>/dev/null || true
         log "OFF — warp0 down (никто больше не использует)"
@@ -340,14 +402,20 @@ cmd_rekey() {
 # ─── uninstall (per-iface; полный снос если iface не осталось) ─────────────────
 
 cmd_uninstall() {
-    cmd_off >/dev/null
+    # cmd_off умеет отказывать, и его JSON — единственное объяснение причины.
+    # Раньше вывод уходил в /dev/null, и uninstall при отказе молча выходил с
+    # кодом 1. В подоболочке die завершает только её, а ответ мы передаём дальше.
+    local off
+    off=$(cmd_off) || { printf '%s\n' "$off"; exit 1; }
     ip rule del fwmark $MARK lookup $TABLE 2>/dev/null || true
     iptables -t mangle -D PREROUTING -i "$IFACE" -j MARK --set-mark $MARK 2>/dev/null || true
     rm -f "$WARP_STATE"
 
+    # Полный снос удаляет и аккаунт WARP — при ложном нуле мы уничтожили бы
+    # WARP другой RU безвозвратно. Неизвестное число пользователей — отказ.
     local remain
-    remain=$(count_active_marks)
-    if [ "${remain:-0}" -eq 0 ]; then
+    remain=$(count_active_marks) || die "не удалось прочитать маркировки — общий warp0 не трогаю"
+    if [ "$remain" -eq 0 ]; then
         awg-quick down warp0 2>/dev/null || true
         ip route flush table $TABLE 2>/dev/null || true
         iptables -t nat -D POSTROUTING -o warp0 -j MASQUERADE 2>/dev/null || true
