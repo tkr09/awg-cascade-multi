@@ -170,19 +170,27 @@ def finish(ssh, record, record_path, resumed=False):
     признак того, что RU commit прошёл и переделывать его нельзя.
     """
     iface = 'awg' + str(record['exit_index'])
-    proto = apply_exit_proto(iface)
-    stamp = write_version_stamp(ssh)
-    reboot = exit_reboot(ssh, record)
+    steps = {'proto': apply_exit_proto(iface),
+             'version_stamp': write_version_stamp(ssh),
+             'reboot': exit_reboot(ssh, record)}
     record_path.unlink(missing_ok=True)
+    # Незавершённые шаги перечисляем ОТДЕЛЬНЫМ полем, а не оставляем вызывающей
+    # стороне разбирать префиксы трёх произвольных строк. Раньше она разбирала
+    # их сама и про version_stamp просто не знала: ошибка записи версии уезжала
+    # в отчёт под ok:true и кодом 0 (R06 аудита v2.8.5).
+    incomplete = sorted(name for name, text in steps.items() if text.startswith('failed'))
     result = {'ok': True, 'index': record['exit_index'], 'interface': iface,
-              'proto': proto, 'reboot': reboot, 'version_stamp': stamp}
+              'incomplete': incomplete, **steps}
     if resumed:
         result['resumed'] = True
     print(json.dumps(result))
     # Код 2, а не 1: exit добавлен и работает, не сложилось только что-то из
-    # обещанного — протокол, перезагрузка или целевое ядро. Повторять
-    # провижининг не нужно; вызывающая сторона обязана различать эти исходы.
-    if reboot.startswith('failed') or proto.startswith('failed'):
+    # обещанного. Повторять провижининг не нужно; вызывающая сторона обязана
+    # различать эти исходы.
+    #
+    # 'skipped' отказом не считается: там делать было нечего (например, у самой
+    # RU нет version-stamp, чтобы его скопировать).
+    if incomplete:
         sys.exit(2)
 
 

@@ -1116,15 +1116,29 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
         return
     provision = json.loads(out)
     EXIT_INDEX = provision["index"]
+    # Список незавершённых шагов приходит готовым полем: разбирать префиксы
+    # строк здесь означало бы молча пропускать всё, о чём этот экран не знает —
+    # ровно так и терялась ошибка version-stamp (R06 аудита v2.8.5).
+    explain = {
+        "proto": "протокол 3.1 не включён, туннель остался на 2.0",
+        "reboot": "перезагрузка exit'а не подтверждена",
+        "version_stamp": "версия на exit не записана — диагностика будет "
+                         "числить его как unknown. Лечится обновлением exit'а, "
+                         "туннель для этого трогать не нужно",
+    }
+    # Если ответил движок старее этого экрана, поля ещё нет — не теряем
+    # предупреждения, а собираем список сами.
+    incomplete = provision.get("incomplete")
+    if incomplete is None:
+        incomplete = [s for s in explain if str(provision.get(s, "")).startswith("failed")]
     notes = []
-    if provision.get("proto", "").startswith("failed"):
-        notes.append("протокол 3.1 не включён, туннель остался на 2.0")
-    if provision.get("reboot", "").startswith("failed"):
-        notes.append("перезагрузка exit'а не подтверждена: "
-                     + html_escape(str(provision["reboot"])))
-    reboot_note = ""
+    for step in incomplete:
+        detail = str(provision.get(step, "")).partition("failed:")[2].strip()
+        notes.append(explain.get(step, step)
+                     + (" (" + html_escape(detail) + ")" if detail else ""))
+    issues_note = ""
     if notes:
-        reboot_note = ("\n\n⚠️ " + "; ".join(notes)
+        issues_note = ("\n\n⚠️ " + "; ".join(notes)
                        + "\nПровижининг НЕ повторять — проверьте сам сервер.")
 
     flag2 = name_to_flag(name)
@@ -1136,7 +1150,7 @@ async def _do_provision(message, state: FSMContext, edit_target=None) -> None:
         f"5/6 ✓ awg{EXIT_INDEX} up на RU\n"
         f"6/6 ✓ Добавлен в state.json\n\n"
         f"✅ {flag2} <b>{name}</b> готов!\n"
-        f"Через ~5 сек watchdog подхватит и добавит в ECMP." + reboot_note
+        f"Через ~5 сек watchdog подхватит и добавит в ECMP." + issues_note
     )
 
     # Финальное отдельное сообщение со списком (не edit чтобы tracker остался виден)

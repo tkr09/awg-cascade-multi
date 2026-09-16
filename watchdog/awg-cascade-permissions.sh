@@ -44,7 +44,12 @@ import sys
 
 path, user = sys.argv[1], sys.argv[2]
 try:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    # O_NONBLOCK — не оптимизация, а защита от подвисания. Без него open на FIFO
+    # ЖДЁТ писателя, и проверка типа файла ниже до выполнения просто не доходит:
+    # каталог принадлежит боту, так что подставить туда FIFO вместо known_hosts
+    # достаточно, чтобы намертво повесить и permissions, и вызывающую его
+    # активацию (R05 аудита v2.8.5). Для обычного файла флаг ничего не меняет.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
 except FileNotFoundError:
     sys.exit(0)                      # файла ещё нет — чинить нечего
 except OSError as exc:

@@ -1,11 +1,15 @@
 """Regression tests; kernel tests run in a disposable network namespace."""
 import base64
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import signal
 from pathlib import Path
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -103,6 +107,75 @@ class Awg3Recovery(unittest.TestCase):
         with self.probe(): self.assertEqual(self.awg3.recovery(),'unknown')
         self.assertEqual(self.calls,[])
         self.assertTrue(self.awg3.JOURNAL.exists(),'журнал обязан остаться блокировать мутации')
+@unittest.skipUnless(hasattr(os,'mkfifo'),'POSIX filesystem semantics')
+class PermissionsKnownHosts(unittest.TestCase):
+    """Приёмка R05 аудита v2.8.5: обычный файл чиним, всё прочее отвергаем БЫСТРО.
+
+    Тест исполняет не копию, а сам фрагмент из permissions.sh — иначе он
+    доказывал бы свойства текста, которого на ноде нет.
+    """
+    def setUp(self):
+        src=(ROOT/'watchdog'/'awg-cascade-permissions.sh').read_text(encoding='utf-8').splitlines()
+        start=next(i for i,l in enumerate(src) if l.startswith('python3 - ') and 'known_hosts' in l)
+        end=next(i for i,l in enumerate(src[start:],start) if l.strip()=='PYEOF')
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        self.dir=Path(tmp.name)
+        self.script=self.dir/'snippet.py'
+        self.script.write_text('\n'.join(src[start+1:end]),encoding='utf-8')
+    def probe(self,path):
+        import getpass
+        # Таймаут здесь — и есть проверка: до фикса FIFO вешал open навсегда.
+        return subprocess.run([sys.executable,str(self.script),str(path),getpass.getuser()],
+                              capture_output=True,text=True,timeout=10)
+    def test_regular_file_is_fixed(self):
+        target=self.dir/'known_hosts';target.write_text('host key\n');os.chmod(target,0o644)
+        self.assertEqual(self.probe(target).returncode,0)
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode),0o600)
+    def test_fifo_is_refused_without_hanging(self):
+        target=self.dir/'fifo';os.mkfifo(target)
+        result=self.probe(target)      # TimeoutExpired здесь = возврат дефекта
+        self.assertEqual(result.returncode,1)
+        self.assertIn('не обычный файл',result.stderr)
+    def test_symlink_is_refused(self):
+        victim=self.dir/'victim';victim.write_text('x');os.chmod(victim,0o644)
+        target=self.dir/'link';os.symlink(victim,target)
+        self.assertEqual(self.probe(target).returncode,1)
+        self.assertEqual(stat.S_IMODE(os.stat(victim).st_mode),0o644,'цель ссылки не трогаем')
+    def test_hardlink_is_refused(self):
+        victim=self.dir/'victim';victim.write_text('x')
+        target=self.dir/'hard';os.link(victim,target)
+        result=self.probe(target)
+        self.assertEqual(result.returncode,1)
+        self.assertIn('жёстких ссылок',result.stderr)
+class ProvisionFinish(unittest.TestCase):
+    """Завершающие шаги provisioning не выдаются за полный успех (R06 аудита v2.8.5)."""
+    def run_finish(self,proto,stamp,reboot):
+        pr=module('provision')
+        pr.apply_exit_proto=lambda iface:proto
+        pr.write_version_stamp=lambda ssh:stamp
+        pr.exit_reboot=lambda ssh,record:reboot
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        path=Path(tmp.name)/'record.json';path.write_text('{}')
+        code=0;out=io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try: pr.finish([],{'exit_index':2},path)
+            except SystemExit as exc: code=exc.code
+        return json.loads(out.getvalue()),code,path.exists()
+    def test_version_stamp_failure_is_not_success(self):
+        result,code,record=self.run_finish('on','failed: не записан','not-needed')
+        self.assertEqual(code,2,result)
+        self.assertEqual(result['incomplete'],['version_stamp'])
+        self.assertFalse(record,'журнал операции всё равно удаляется: exit добавлен')
+    def test_skipped_is_not_a_failure(self):
+        result,code,_=self.run_finish('on','skipped: у самой RU нет version-stamp','not-needed')
+        self.assertEqual(code,0);self.assertEqual(result['incomplete'],[])
+    def test_all_steps_reported(self):
+        result,code,_=self.run_finish('failed: остался на 2.0','failed: не записан','failed: не поднялся')
+        self.assertEqual(code,2)
+        self.assertEqual(result['incomplete'],['proto','reboot','version_stamp'])
+    def test_clean_run_stays_quiet(self):
+        result,code,_=self.run_finish('on','v2.8.6 abc123','done: ядро 6.8.0-139-generic')
+        self.assertEqual(code,0);self.assertEqual(result['incomplete'],[]);self.assertTrue(result['ok'])
 @unittest.skipUnless(os.environ.get('AWGC_NETNS_TEST')=='1','requires disposable network namespace')
 class Kernel(unittest.TestCase):
     @classmethod
